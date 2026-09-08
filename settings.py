@@ -88,7 +88,15 @@ DEFAULT_SETTINGS = {
     "mesh_viewer_line_width": 1.5,
     "mesh_viewer_ambient": 0.35,
     "mesh_viewer_diffuse": 0.65,
+    "scene_preview_exposure": 1.0,
+    "scene_preview_gamma": 2.2,
+    "scene_preview_tone_revision": 1,
     "mesh_viewer_show_bones": False,
+    "motion_preview_show_bone_names": False,
+    "motion_preview_lighting_mode": "off",
+    "motion_preview_ambient": 0.7,
+    "motion_preview_diffuse": 0.8,
+    "scene_background_color": "",
 }
 
 
@@ -101,7 +109,11 @@ def normalize_settings(settings=None):
     if "renderer_texture_quality" not in settings and settings.get("mesh_viewer_prefer_streaming_tex"):
         normalized["renderer_texture_quality"] = "high"
 
+    legacy_preview_tone = "scene_preview_tone_revision" not in settings
+
     for key, value in settings.items():
+        if legacy_preview_tone and key == "scene_preview_gamma":
+            continue
         if key == "dark_mode":
             continue
         if key == "wwise_install_paths":

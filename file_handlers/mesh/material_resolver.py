@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -23,6 +23,9 @@ PREFERRED_ALBEDO_TEXTURE_TYPES: tuple[str, ...] = (
     "BaseDielectricMapBase",
     "BaseAlphaMap",
     "BaseShiftMap",
+    # WOTS face templates use the first wrinkle set as their neutral base.
+    "Wrinkle_ALBMap01",
+    "WrinkleBlend_ALBDMap",
 )
 
 
@@ -43,6 +46,7 @@ class MdfSurfaceProfile:
     texture_path: str = ""
     textures: tuple[MdfTextureProfile, ...] = ()
     parameter_names: tuple[str, ...] = ()
+    parameters: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -95,6 +99,7 @@ def _extract_surface_profiles(
                 for parameter in material.parameters
                 if parameter.name
             ),
+            parameters=MeshMaterialResolver.parameter_values(material),
         )
     return resolved
 
@@ -348,6 +353,19 @@ class MeshMaterialResolver:
         return (1.0, 1.0, 1.0, 1.0)
 
     @staticmethod
+    def parameter_values(material: MatData) -> dict[str, tuple[float, ...]]:
+        """Return the semantic MDF values without the parser's padding lanes."""
+
+        return {
+            parameter.name: tuple(
+                float(value)
+                for value in parameter.parameter[: max(0, int(parameter.component_count))]
+            )
+            for parameter in material.parameters
+            if parameter.name and int(parameter.component_count) > 0
+        }
+
+    @staticmethod
     def pick_primary_texture(material: MatData) -> TexHeader | None:
         first_preferred_non_null: TexHeader | None = None
         first_preferred: TexHeader | None = None
@@ -441,11 +459,25 @@ class MeshMaterialResolver:
         if not mesh_filepath:
             return
         normalized = mesh_filepath.replace("\\", "/")
-        idx = normalized.lower().rfind(".mesh")
+        lower = normalized.lower()
+        stmesh_idx = lower.rfind(".stmesh")
+        if stmesh_idx != -1:
+            base = normalized[:stmesh_idx]
+            # WOTS SpeedTree resources use an explicit _A material companion.
+            yield f"{base}_A.mdf2.51"
+            yield f"{base}_A.mdf2"
+            yield f"{base}.mdf2.51"
+            yield f"{base}.mdf2"
+            return
+        idx = lower.rfind(".mesh")
         if idx == -1:
             return
         base = normalized[:idx]
         yield f"{base}.mdf2"
+        # WOTS character parts commonly keep their material in an event
+        # companion rather than beside the mesh under the plain base name.
+        yield f"{base}_event_00.mdf2.51"
+        yield f"{base}_event_00.mdf2"
         yield f"{base}_Mat.mdf2"
         yield f"{base}_00.mdf2"
 

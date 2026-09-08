@@ -12,6 +12,7 @@ class MotionFormatCodec(Protocol):
     """A complete MOTLIST format family over shared semantic models."""
 
     profile: MotionFormatProfile
+    supports_writing: bool
 
     def matches(self, data: bytes | bytearray | memoryview) -> bool: ...
 

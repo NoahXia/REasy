@@ -40,6 +40,7 @@ from .profiles import (
     DMC5_POSE_COMPOSITION_POLICY,
     DMC5_SAMPLING_POLICY,
     DMC5_SOURCE_PREVIEW_SCALE,
+    WOTS_EVALUATION_PROFILE,
     MotionEvaluationProfile,
 )
 from .source_adapter import rig_from_motion_skeleton
@@ -61,6 +62,7 @@ __all__ = [
     "DMC5_POSE_COMPOSITION_POLICY",
     "DMC5_SAMPLING_POLICY",
     "DMC5_SOURCE_PREVIEW_SCALE",
+    "WOTS_EVALUATION_PROFILE",
     "DiagnosticSeverity",
     "DeformationTarget",
     "DeformationWeightEvaluator",

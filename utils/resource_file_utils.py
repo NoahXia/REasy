@@ -234,15 +234,44 @@ def _find_resource_in_root(
     prefix = path_prefix.strip("/").lower()
     full_path = normalized_resource if normalized_resource.startswith(prefix + "/") else f"{prefix}/{normalized_resource}"
 
-    base_file_path = os.path.join(root_dir, full_path.replace("/", os.sep))
-    dir_path = os.path.dirname(base_file_path)
-    base_name = os.path.basename(base_file_path)
-    if not os.path.isdir(dir_path):
+    parts = tuple(part for part in full_path.split("/") if part not in ("", "."))
+    if not parts or any(part == ".." for part in parts):
         return None
 
-    entries = _get_dir_entries(dir_path) if cache_entries else os.listdir(dir_path)
+    current = os.path.abspath(root_dir)
+    for part in parts[:-1]:
+        direct = os.path.join(current, part)
+        if os.path.isdir(direct):
+            current = direct
+            continue
+        if not os.path.isdir(current):
+            return None
+        entries = _get_dir_entries(current) if cache_entries else tuple(os.listdir(current))
+        matched = next(
+            (
+                entry
+                for entry in entries
+                if entry.casefold() == part.casefold()
+                and os.path.isdir(os.path.join(current, entry))
+            ),
+            None,
+        )
+        if matched is None:
+            return None
+        current = os.path.join(current, matched)
+
+    if not os.path.isdir(current):
+        return None
+    base_name = parts[-1]
+    target_name = base_name.casefold()
+    entries = _get_dir_entries(current) if cache_entries else tuple(os.listdir(current))
     target_file = next(
-        (os.path.join(dir_path, f) for f in entries if f == base_name or f.startswith(base_name + ".")),
+        (
+            os.path.join(current, entry)
+            for entry in entries
+            if entry.casefold() == target_name
+            or entry.casefold().startswith(target_name + ".")
+        ),
         None,
     )
     if not target_file:

@@ -20,7 +20,11 @@ class MotListHandler(BaseFileHandler):
         return MotListFile.can_handle(data)
 
     def supports_editing(self) -> bool:
-        return True
+        return bool(
+            self.motlist_file is not None
+            and self.motlist_file.codec is not None
+            and self.motlist_file.codec.supports_writing
+        )
 
     def read(self, data: bytes) -> None:
         facade = MotListFile(require_motion_format(data))

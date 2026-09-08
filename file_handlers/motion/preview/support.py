@@ -16,5 +16,5 @@ class EntityMotionSupport:
     format_codec: MotionFormatCodec
     evaluation: MotionEvaluationProfile
     tree_references: TreeMotionReferenceStrategy
-    backend: EntityMotionBackend
+    backend: EntityMotionBackend | None
     catalog_reader: MotionListCatalogReader | None = None

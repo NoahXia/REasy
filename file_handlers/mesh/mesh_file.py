@@ -26,6 +26,10 @@ MESH_MAGIC = 0x4853454D
 MPLY_MAGIC = 0x594C504D
 
 
+class MeshDependencyMissingError(ValueError):
+    """A valid mesh references data stored in a companion resource."""
+
+
 class MeshMainVersion(IntEnum):
     UNKNOWN = 0
     RE7 = 1
@@ -41,6 +45,7 @@ class MeshMainVersion(IntEnum):
     MHWILDS = 11
     PRAGMATA = 13
     RE9 = 14
+    ONIMUSHA_WOTS_1010 = 15
 
 
 MESH_VERSION_PAIRS = {
@@ -69,6 +74,8 @@ MESH_VERSION_PAIRS = {
     (250707828, 250925211): MeshMainVersion.PRAGMATA,
     (250707828, 251121828): MeshMainVersion.PRAGMATA,
     (250904410, 250925211): MeshMainVersion.RE9,
+    # Onimusha: Way of the Sword 1.0.1.0 uses the post-Pragmata mesh layout.
+    (250203152, 260209350): MeshMainVersion.ONIMUSHA_WOTS_1010,
 }
 
 
@@ -327,6 +334,7 @@ def _skin_weight_influence_count(version: MeshMainVersion) -> int:
         MeshMainVersion.SF6,
         MeshMainVersion.MHWILDS,
         MeshMainVersion.PRAGMATA,
+        MeshMainVersion.ONIMUSHA_WOTS_1010,
     } else 8
 
 
@@ -334,6 +342,8 @@ def _decode_skin_weights(
     data: memoryview,
     vertex_count: int,
     version: MeshMainVersion,
+    *,
+    deform_limit: int | None = None,
 ) -> SkinWeightBuffer:
     influence_count = _skin_weight_influence_count(version)
     expected_size = vertex_count * 16
@@ -342,10 +352,22 @@ def _decode_skin_weights(
             f"Skin-weight stream has {len(data)} bytes; expected {expected_size}"
         )
     records = np.frombuffer(data, dtype=np.uint8).reshape(vertex_count, 16)
-    if influence_count == 8:
+    packed = records[:, :8].copy().view("<u4").reshape(vertex_count, 2)
+    # WOTS can mix both encodings in one MESH. Ordinary/body and hair streams
+    # use six packed 10-bit indices. Facial streams retain eight byte-sized
+    # indices. They are identified by both active final weight lanes and the
+    # 0b11 marker pairs. The marker alone is insufficient because real packed
+    # hair streams set those high pairs as well.
+    wots_eight_influence = (
+        version == MeshMainVersion.ONIMUSHA_WOTS_1010
+        and vertex_count > 0
+        and np.any(records[:, 14:16])
+        and np.all((packed >> 30) == 0x3)
+    )
+    if influence_count == 8 or wots_eight_influence:
+        influence_count = 8
         decoded_indices = records[:, :8].astype(np.uint16)
     else:
-        packed = records[:, :8].copy().view("<u4").reshape(vertex_count, 2)
         decoded_indices = np.empty((vertex_count, 6), dtype=np.uint16)
         decoded_indices[:, 0] = packed[:, 0] & 0x3FF
         decoded_indices[:, 1] = (packed[:, 0] >> 10) & 0x3FF
@@ -358,14 +380,73 @@ def _decode_skin_weights(
     decoded_weights = (
         records[:, 8 : 8 + influence_count].astype(np.float32) / 255.0
     )
-    if influence_count == 6:
-        # Six-index formats repurpose the two remaining bytes as a scale for
-        # the six usable weights.
-        scale = 1.0 + (records[:, 14].astype(np.float32) + records[:, 15]) / 255.0
-        decoded_weights *= scale[:, np.newaxis]
+    if influence_count == 6 and np.any(records[:, 14:16]):
+        raise ValueError(
+            "Unsupported non-zero tail bytes in six-influence skin-weight stream"
+        )
+    if deform_limit is not None and deform_limit > 0:
+        active = decoded_weights > 0.0
+        invalid = active & (decoded_indices >= deform_limit)
+        # An eight-byte stream can legitimately leave its final two lanes
+        # unused. If the default packed interpretation is impossible, accept
+        # the byte layout only when all of its active indices fit the remap.
+        if (
+            np.any(invalid)
+            and version == MeshMainVersion.ONIMUSHA_WOTS_1010
+            and influence_count == 6
+        ):
+            byte_indices = records[:, :8].astype(np.uint16)
+            byte_weights = records[:, 8:16].astype(np.float32) / 255.0
+            byte_active = byte_weights > 0.0
+            if not np.any(byte_active & (byte_indices >= deform_limit)):
+                influence_count = 8
+                decoded_indices = byte_indices
+                decoded_weights = byte_weights
+                invalid = np.zeros_like(byte_active, dtype=bool)
+        if np.any(invalid):
+            bad = int(decoded_indices[invalid][0])
+            raise ValueError(
+                f"Skin-weight deform index {bad} exceeds remap count "
+                f"{deform_limit}"
+            )
     weights = array("f")
     weights.frombytes(decoded_weights.astype("<f4", copy=False).tobytes())
     return SkinWeightBuffer(influence_count, deform_indices, weights)
+
+
+def _resolve_wots_skin_weight_layout(
+    payload: MeshBufferPayload,
+    deform_limit: int,
+    version: MeshMainVersion,
+) -> None:
+    """Re-decode WOTS weights once the bone-remap bounds are available."""
+
+    if version != MeshMainVersion.ONIMUSHA_WOTS_1010 or deform_limit <= 0:
+        return
+    vertex_count = len(payload.positions) // 3
+    for index, header in enumerate(payload.buffer_headers):
+        attribute = {
+            VertexBufferType.BoneWeights: "skin_weights",
+            VertexBufferType.ExtraWeights: "extra_skin_weights",
+        }.get(header.type)
+        if attribute is None:
+            continue
+        end = (
+            payload.buffer_headers[index + 1].offset
+            if index < len(payload.buffer_headers) - 1
+            else header.offset + header.size * vertex_count
+        )
+        data = memoryview(payload.vertex_bytes)[header.offset:end]
+        setattr(
+            payload,
+            attribute,
+            _decode_skin_weights(
+                data,
+                vertex_count,
+                version,
+                deform_limit=deform_limit,
+            ),
+        )
 
 
 def _decode_vertex_attributes(
@@ -436,6 +517,7 @@ class MeshBuffer:
         self.buffer_headers: List[MeshBufferItemHeader] = []
         self.streaming_buffer_headers: Dict[int, StreamingBufferHeader] = {}
         self.streaming_buffer_count = 0
+        self.streaming_data_provided = False
         self.buffer_payloads: Dict[int, MeshBufferPayload] = {}
         self.index_counts_by_buffer: Dict[int, int] = {}
 
@@ -560,6 +642,7 @@ class MeshBuffer:
         self.streaming_buffer_count = (
             len(streaming_info.entries) if streaming_info is not None else 0
         )
+        self.streaming_data_provided = streaming_data is not None
         self.element_headers_offset = h.read_int64()
         self.vertex_buffer_offset = h.read_int64()
         if self.version >= MeshMainVersion.RE4:
@@ -850,6 +933,14 @@ class MeshData:
             - self.buffer.buffer_payloads.keys()
         )
         if missing_buffers:
+            if (
+                self.buffer.streaming_buffer_count
+                and not self.buffer.streaming_data_provided
+            ):
+                raise MeshDependencyMissingError(
+                    "Missing streaming mesh companion; required buffer(s): "
+                    f"{sorted(missing_buffers)}"
+                )
             raise ValueError(f"Missing mesh buffers: {sorted(missing_buffers)}")
 
         index_size = 4 if self.buffer.has_32bit_indices else 2
@@ -1531,6 +1622,13 @@ class MeshFile:
 
         sorted_offsets = self._collect_section_offsets()
         self._parse_bones(h)
+        if self.mesh_buffer is not None and self.bone_remap_indices:
+            for payload in self.mesh_buffer.buffer_payloads.values():
+                _resolve_wots_skin_weight_layout(
+                    payload,
+                    len(self.bone_remap_indices),
+                    self.header.format_version,
+                )
         self._parse_bone_indices(data, sorted_offsets)
         self._parse_normal_recalc(data, sorted_offsets)
 

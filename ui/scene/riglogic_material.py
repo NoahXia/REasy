@@ -56,6 +56,8 @@ class _Program:
     tint: int
     ambient: int
     diffuse: int
+    exposure: int
+    gamma: int
     lit: int
 
 
@@ -76,6 +78,8 @@ class RigLogicMaterialRenderer:
         tint: tuple[float, float, float, float],
         ambient: float,
         diffuse: float,
+        exposure: float,
+        gamma: float,
         lit: bool,
         vertex_shader: tuple[str, str] | None = None,
     ) -> int | None:
@@ -108,6 +112,8 @@ class RigLogicMaterialRenderer:
             glUniform4f(program.tint, *tint)
             glUniform1f(program.ambient, float(ambient))
             glUniform1f(program.diffuse, float(diffuse))
+            glUniform1f(program.exposure, float(exposure))
+            glUniform1f(program.gamma, float(gamma))
             glUniform1i(program.lit, int(lit))
         except Exception:
             self.unbind()
@@ -162,6 +168,8 @@ class RigLogicMaterialRenderer:
             glGetUniformLocation(handle, "u_tint"),
             glGetUniformLocation(handle, "u_ambient"),
             glGetUniformLocation(handle, "u_diffuse"),
+            glGetUniformLocation(handle, "u_exposure"),
+            glGetUniformLocation(handle, "u_gamma"),
             glGetUniformLocation(handle, "u_lit"),
         )
         if any(location < 0 for location in (
@@ -170,6 +178,8 @@ class RigLogicMaterialRenderer:
             program.tint,
             program.ambient,
             program.diffuse,
+            program.exposure,
+            program.gamma,
             program.lit,
         )):
             glDeleteProgram(handle)
@@ -220,6 +230,8 @@ uniform float u_weights[{effect.weight_count}];
 uniform vec4 u_tint;
 uniform float u_ambient;
 uniform float u_diffuse;
+uniform float u_exposure;
+uniform float u_gamma;
 uniform bool u_lit;
 
 varying vec2 v_uv;
@@ -252,14 +264,18 @@ vec3 mappedNormal(vec3 tangentNormal) {{
 void main() {{
 {body}
     vec3 normal = mappedNormal(normalize(tangentNormal));
-    float light = u_lit
-        ? u_ambient * surfaceOcclusion + u_diffuse * max(
-            dot(normal, normalize(vec3(0.5, 1.0, 1.0))),
-            0.0
-        )
-        : 1.0;
+    float hemisphere = 0.35 + 0.65 * clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+    float key = max(dot(normal, normalize(vec3(0.45, 0.75, 0.55))), 0.0);
+    float fill = max(dot(normal, normalize(vec3(-0.70, 0.30, 0.45))), 0.0);
+    float rim = pow(max(dot(normal, normalize(vec3(0.10, 0.35, -0.95))), 0.0), 2.0);
+    float light = u_ambient * hemisphere * surfaceOcclusion
+        + u_diffuse * (0.72 * key + 0.28 * fill + 0.35 * rim);
+    vec3 surface = albedo * u_tint.rgb * v_color.rgb;
+    vec3 rgb = u_lit
+        ? pow(max(surface * light * max(u_exposure, 0.0), vec3(0.0)), vec3(1.0 / max(u_gamma, 0.01)))
+        : surface;
     gl_FragColor = vec4(
-        albedo * u_tint.rgb * v_color.rgb * light,
+        clamp(rgb, 0.0, 1.0),
         baseSample.a * u_tint.a * v_color.a
     );
 }}

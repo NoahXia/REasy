@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import suppress
+from pathlib import Path
 
 import numpy as np
 from ui.scene.scene_preview import ScenePreviewWidget
@@ -49,9 +50,11 @@ from PySide6.QtCore import QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QFontMetrics, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -120,9 +123,13 @@ class MeshViewer(QWidget):
                 self.gl_widget = _MeshGLWidget(
                     mesh,
                     self._settings_store(),
-                    use_vertex_colors=self._setting_bool(self.VERTEX_COLORS_SETTINGS_KEY),
+                    use_vertex_colors=self._setting_bool(
+                        self.VERTEX_COLORS_SETTINGS_KEY
+                    ),
                 )
-                self.gl_widget.texture_quality_changed.connect(self._on_texture_quality_changed)
+                self.gl_widget.texture_quality_changed.connect(
+                    self._on_texture_quality_changed
+                )
                 self.preview_splitter.insertWidget(0, self.gl_widget)
                 self.preview_splitter.setStretchFactor(0, 4)
                 self.preview_splitter.setStretchFactor(1, 2)
@@ -142,9 +149,7 @@ class MeshViewer(QWidget):
             parent=self._materials,
         )
         self._material_session.reset.connect(self._on_material_reset)
-        self._material_session.status_changed.connect(
-            self._on_material_status_changed
-        )
+        self._material_session.status_changed.connect(self._on_material_status_changed)
         self._materials.add("mesh", self._material_session, start=False)
         self._reload_materials()
 
@@ -157,9 +162,14 @@ class MeshViewer(QWidget):
         self.vertex_colors_check.setToolTip(
             self.tr("Multiply textured preview by mesh vertex colors")
         )
-        self.vertex_colors_check.setChecked(self._setting_bool(self.VERTEX_COLORS_SETTINGS_KEY))
+        self.vertex_colors_check.setChecked(
+            self._setting_bool(self.VERTEX_COLORS_SETTINGS_KEY)
+        )
         self.vertex_colors_check.toggled.connect(self._on_vertex_colors_toggled)
         top.addWidget(self.vertex_colors_check)
+        self.export_gltf_btn = QPushButton(self.tr("Export glTF…"))
+        self.export_gltf_btn.clicked.connect(self._export_gltf)
+        top.addWidget(self.export_gltf_btn)
         self.panel_toggle_btn = QPushButton(self.tr("Show texture panel"))
         self.panel_toggle_btn.clicked.connect(self._toggle_material_panel)
         top.addWidget(self.panel_toggle_btn)
@@ -185,11 +195,21 @@ class MeshViewer(QWidget):
         self.material_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.material_table.setSelectionMode(QTableWidget.SingleSelection)
         self.material_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.material_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.material_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.material_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.material_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.material_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.material_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents
+        )
+        self.material_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents
+        )
+        self.material_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeToContents
+        )
+        self.material_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.Stretch
+        )
+        self.material_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeToContents
+        )
         self.material_table.itemSelectionChanged.connect(self._update_texture_preview)
         side_layout.addWidget(self.material_table, 1)
 
@@ -203,6 +223,40 @@ class MeshViewer(QWidget):
 
         self.preview_splitter.addWidget(self.material_panel)
         self.material_panel.hide()
+
+    def _export_gltf(self):
+        source = getattr(self.handler, "filepath", "") or "model.mesh"
+        default = str(Path(source).with_suffix(".glb"))
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.tr("Export glTF"),
+            default,
+            self.tr("glTF Binary (*.glb);;glTF JSON (*.gltf)"),
+        )
+        if not path:
+            return
+        try:
+            from file_handlers.gltf_export import export_gltf
+            from file_handlers.motion.evaluation.mesh_adapter import (
+                rig_from_re_engine_mesh,
+            )
+
+            mesh = self.handler.mesh
+            rig = rig_from_re_engine_mesh(mesh) if mesh and mesh.joint_count else None
+            result = export_gltf(
+                path,
+                mesh=mesh,
+                rig=rig,
+                material_handler=self.handler,
+                resolved_mdf=self._material_session.resolved_mdf,
+            )
+            QMessageBox.information(
+                self,
+                self.tr("Export glTF"),
+                self.tr("Exported to:\n{path}").format(path=result),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, self.tr("Export glTF Failed"), str(exc))
 
     def _settings_store(self) -> dict | None:
         app = getattr(self.handler, "app", None)
@@ -309,7 +363,9 @@ class MeshViewer(QWidget):
         image = self._material_session.preview_image(binding)
         if not image or image.isNull():
             self.texture_preview.setPixmap(QPixmap())
-            self.texture_preview.setText(f"{binding.status}\n{binding.resolved_texture_path}")
+            self.texture_preview.setText(
+                f"{binding.status}\n{binding.resolved_texture_path}"
+            )
             return
 
         scaled = QPixmap.fromImage(image).scaled(
@@ -322,8 +378,11 @@ class MeshViewer(QWidget):
         self.texture_preview.setPixmap(scaled)
         self.texture_preview.setToolTip(binding.resolved_texture_path)
 
+
 class _MeshGLWidget(ScenePreviewWidget):
-    def __init__(self, mesh, settings: dict | None = None, *, use_vertex_colors: bool = False):
+    def __init__(
+        self, mesh, settings: dict | None = None, *, use_vertex_colors: bool = False
+    ):
         self.mesh = mesh
         self._bone_label_texture_id = None
         self._bone_label_centers_vbo = None
@@ -364,7 +423,11 @@ class _MeshGLWidget(ScenePreviewWidget):
         joint_count = int(getattr(self.mesh, "joint_count", 0) or 0)
         if joint_count <= 0:
             return [], np.zeros((0, 3), dtype=np.float32)
-        matrices = list(getattr(self.mesh, "world_matrices", None) or getattr(self.mesh, "local_matrices", None) or [])
+        matrices = list(
+            getattr(self.mesh, "world_matrices", None)
+            or getattr(self.mesh, "local_matrices", None)
+            or []
+        )
         if not matrices:
             return [], np.zeros((0, 3), dtype=np.float32)
         names = list(getattr(self.mesh, "names", []) or [])
@@ -381,7 +444,9 @@ class _MeshGLWidget(ScenePreviewWidget):
                 labels.append(f"bone_{i}")
         return labels, points
 
-    def _build_bone_label_atlas(self) -> tuple[QImage | None, list[tuple[int, int, int, int]]]:
+    def _build_bone_label_atlas(
+        self,
+    ) -> tuple[QImage | None, list[tuple[int, int, int, int]]]:
         if not self._bone_labels:
             return None, []
         metrics = QFontMetrics(self.font())
@@ -403,7 +468,9 @@ class _MeshGLWidget(ScenePreviewWidget):
             x += width
             row_height = max(row_height, height)
 
-        atlas = QImage(atlas_width, max(1, y + row_height), QImage.Format.Format_RGBA8888)
+        atlas = QImage(
+            atlas_width, max(1, y + row_height), QImage.Format.Format_RGBA8888
+        )
         atlas.fill(Qt.transparent)
         painter = QPainter(atlas)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
@@ -423,12 +490,14 @@ class _MeshGLWidget(ScenePreviewWidget):
 
         atlas_w = max(1, self._bone_label_atlas.width())
         atlas_h = max(1, self._bone_label_atlas.height())
-        centers = np.repeat(self._bone_points[:len(rects)], 4, axis=0).astype(np.float32, copy=False)
+        centers = np.repeat(self._bone_points[: len(rects)], 4, axis=0).astype(
+            np.float32, copy=False
+        )
         offsets = np.empty((len(rects) * 4, 2), dtype=np.float32)
         texcoords = np.empty_like(offsets)
         for i, (rx, ry, rw, rh) in enumerate(rects):
             base = i * 4
-            offsets[base:base + 4] = (
+            offsets[base : base + 4] = (
                 (4.0, -rh - 4.0),
                 (rw + 4.0, -rh - 4.0),
                 (rw + 4.0, -4.0),
@@ -436,7 +505,7 @@ class _MeshGLWidget(ScenePreviewWidget):
             )
             u0, v0 = rx / atlas_w, ry / atlas_h
             u1, v1 = (rx + rw) / atlas_w, (ry + rh) / atlas_h
-            texcoords[base:base + 4] = ((u0, v0), (u1, v0), (u1, v1), (u0, v1))
+            texcoords[base : base + 4] = ((u0, v0), (u1, v0), (u1, v1), (u0, v1))
         return centers, offsets, texcoords
 
     def _after_gl_initialized(self):
@@ -453,7 +522,11 @@ class _MeshGLWidget(ScenePreviewWidget):
             with suppress(Exception):
                 glDeleteTextures([self._bone_label_texture_id])
             self._bone_label_texture_id = None
-        for name in ("_bone_label_centers_vbo", "_bone_label_offsets_vbo", "_bone_label_texcoords_vbo"):
+        for name in (
+            "_bone_label_centers_vbo",
+            "_bone_label_offsets_vbo",
+            "_bone_label_texcoords_vbo",
+        ):
             self._dispose_vbo(getattr(self, name))
             setattr(self, name, None)
         if self._bone_label_shader is not None:
@@ -464,15 +537,23 @@ class _MeshGLWidget(ScenePreviewWidget):
     def _sync_bone_label_gl_resources(self):
         if self._bone_label_texture_id is None and self._bone_label_atlas is not None:
             self._bone_label_texture_id = glGenTextures(1)
-            self._upload_qimage_texture(self._bone_label_texture_id, self._bone_label_atlas)
+            self._upload_qimage_texture(
+                self._bone_label_texture_id, self._bone_label_atlas
+            )
         if self._bone_label_shader is None and self._bone_label_vertex_count > 0:
             self._bone_label_shader = compileProgram(
                 compileShader(BONE_LABEL_VERTEX_SHADER, GL_VERTEX_SHADER),
                 compileShader(BONE_LABEL_FRAGMENT_SHADER, GL_FRAGMENT_SHADER),
             )
-            self._bone_label_offset_attr = glGetAttribLocation(self._bone_label_shader, "labelOffset")
-            self._bone_label_viewport_uniform = glGetUniformLocation(self._bone_label_shader, "viewport")
-            self._bone_label_texture_uniform = glGetUniformLocation(self._bone_label_shader, "labelTexture")
+            self._bone_label_offset_attr = glGetAttribLocation(
+                self._bone_label_shader, "labelOffset"
+            )
+            self._bone_label_viewport_uniform = glGetUniformLocation(
+                self._bone_label_shader, "viewport"
+            )
+            self._bone_label_texture_uniform = glGetUniformLocation(
+                self._bone_label_shader, "labelTexture"
+            )
         if self._bone_label_centers_vbo is None and self._bone_label_vertex_count > 0:
             self._bone_label_centers_vbo = self._array_vbo(self._bone_label_centers)
             self._bone_label_offsets_vbo = self._array_vbo(self._bone_label_offsets)
@@ -539,8 +620,11 @@ class MeshThumbnailRenderer(QObject):
     rendered = Signal(object, QImage)
 
     def __init__(
-        self, settings: dict | None = None, size: int = 160,
-        widget_parent=None, parent=None,
+        self,
+        settings: dict | None = None,
+        size: int = 160,
+        widget_parent=None,
+        parent=None,
     ):
         super().__init__(parent)
         self._settings = settings if isinstance(settings, dict) else {}
@@ -579,7 +663,7 @@ class MeshThumbnailRenderer(QObject):
         points = mesh_bounds_points(scene)
         if len(points):
             mins, maxs = points.min(axis=0), points.max(axis=0)
-            widget.center = (mins + maxs) * .5
+            widget.center = (mins + maxs) * 0.5
             widget.scale = 1.0 / max(float(np.max(maxs - mins)), 1e-6)
             widget.distance = 1.55
         widget.rot_y = -25.0
@@ -599,7 +683,9 @@ class MeshThumbnailRenderer(QObject):
             background=(0.1, 0.1, 0.1, 1.0),
         )
         widget.color_source = (
-            "vertex" if self._settings.get("mesh_viewer_use_vertex_colors", False) else ""
+            "vertex"
+            if self._settings.get("mesh_viewer_use_vertex_colors", False)
+            else ""
         )
         if self._widget_parent is None:
             widget.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)

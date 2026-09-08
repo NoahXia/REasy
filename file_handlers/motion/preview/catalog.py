@@ -36,6 +36,7 @@ class MotionPreviewCatalog:
         self._resolver = MotionPreviewResolver(
             self.resources.load,
             tree_references,
+            self.resources.load_motion,
         )
         self.resolution = MotionPreviewResolution((), (), (), ())
         self.messages: tuple[str, ...] = ()
@@ -45,7 +46,8 @@ class MotionPreviewCatalog:
         self.resolution = resolution
         self.messages = tuple(
             dict.fromkeys(
-                [item.message for item in resolution.diagnostics]
+                list(getattr(self.root.model, "diagnostics", ()))
+                + [item.message for item in resolution.diagnostics]
                 + self.resources.errors
             )
         )

@@ -6,14 +6,17 @@ from typing import Callable
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QInputDialog,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ui.scene.scene_preview import ScenePreviewWidget
+from settings import save_settings
 from utils.resource_file_utils import resolve_handler_resource_data
 from file_handlers.mesh.material_session import (
     MeshMaterialCollection,
@@ -52,6 +55,7 @@ class MotListPreviewWidget(QWidget):
     """Interactive MOT preview backed by a game-specific evaluation profile."""
 
     modified_changed = Signal(bool)
+    BONE_NAMES_SETTING = "motion_preview_show_bone_names"
 
     def __init__(
         self,
@@ -65,8 +69,7 @@ class MotListPreviewWidget(QWidget):
         support = entity_motion_support_for_format(format_codec)
         if support is None:
             raise ValueError(
-                f"no preview support is registered for "
-                f"{format_codec.profile.name}"
+                f"no preview support is registered for {format_codec.profile.name}"
             )
         self.evaluation_profile = support.evaluation
         self.controller = MotionPreviewController(self.evaluation_profile)
@@ -120,9 +123,7 @@ class MotListPreviewWidget(QWidget):
         self.animation_pane.setMaximumWidth(470)
         self.motion_browser = MotionEntryList(self.animation_pane)
         self.motion_browser.selection_changed.connect(self._on_motion_changed)
-        self.motion_browser.entry_activated.connect(
-            self._play_selected_animation
-        )
+        self.motion_browser.entry_activated.connect(self._play_selected_animation)
         self.animation_pane.add_widget(self.motion_browser, 1)
         self.animation_pane.add_widget(self.playback)
 
@@ -166,6 +167,20 @@ class MotListPreviewWidget(QWidget):
         self.target_rig_button.setEnabled(False)
         self.target_rig_button.clicked.connect(self.use_target_rig)
         self.rig_pane.add_widget(self.target_rig_button)
+        self.export_gltf_button = QPushButton(self.tr("Export selected animation…"))
+        self.export_gltf_button.clicked.connect(self._export_gltf)
+        self.rig_pane.add_widget(self.export_gltf_button)
+        self.bone_names_toggle = QCheckBox(self.tr("Show bone names"))
+        self.bone_names_toggle.setChecked(
+            bool(settings.get(self.BONE_NAMES_SETTING, False))
+            if isinstance(settings, dict)
+            else False
+        )
+        self.bone_names_toggle.setToolTip(
+            self.tr("Display each animated joint name in the viewport")
+        )
+        self.bone_names_toggle.toggled.connect(self._on_bone_names_toggled)
+        self.rig_pane.add_widget(self.bone_names_toggle)
         self.blend_shapes_toggle = QCheckBox(self.tr("Blend shapes"))
         self.blend_shapes_toggle.setChecked(True)
         self.blend_shapes_toggle.setEnabled(False)
@@ -173,18 +188,19 @@ class MotListPreviewWidget(QWidget):
         self.blend_shapes_toggle.setToolTip(
             self.tr("Enable MOT-driven mesh blend shapes")
         )
-        self.blend_shapes_toggle.toggled.connect(
-            self._on_blend_shapes_toggled
-        )
+        self.blend_shapes_toggle.toggled.connect(self._on_blend_shapes_toggled)
         self.rig_pane.add_widget(self.blend_shapes_toggle)
         self.rig_pane.body_layout.addStretch(1)
 
         self.viewport = viewport_factory(
             self.viewport_pane,
-            controls="rcol",
+            controls="motion",
             settings=settings if isinstance(settings, dict) else None,
         )
         self.viewport.setMinimumHeight(320)
+        self.viewport.set_bone_name_labels_visible(
+            self.bone_names_toggle.isChecked()
+        )
         self.viewport_pane.add_widget(self.viewport, 1)
         self.viewport_pane.add_widget(self.status_label)
 
@@ -221,14 +237,18 @@ class MotListPreviewWidget(QWidget):
         self.motion_source_label.setText(summary)
         if not enabled:
             if resolution.unresolved_bank_ids:
-                banks = ", ".join(str(value) for value in resolution.unresolved_bank_ids)
+                banks = ", ".join(
+                    str(value) for value in resolution.unresolved_bank_ids
+                )
                 message = self.tr(
                     "This MOTLIST has no embedded or explicitly inherited MOT payloads. "
                     "Its MotTree references BankID value(s) {banks}; resolve those "
                     "through the owning MOTBANK/PFB preview."
                 ).format(banks=banks)
             else:
-                message = self.tr("This MOTLIST contains no resolvable MOT payloads to preview.")
+                message = self.tr(
+                    "This MOTLIST contains no resolvable MOT payloads to preview."
+                )
             if self._catalog.messages:
                 message = f"{message}  {'  '.join(self._catalog.messages)}"
             self._clear_scene(message)
@@ -267,6 +287,14 @@ class MotListPreviewWidget(QWidget):
         self.controller.set_deformation_enabled(enabled)
         self._render()
 
+    def _on_bone_names_toggled(self, enabled: bool) -> None:
+        self.viewport.set_bone_name_labels_visible(enabled)
+        app = getattr(self.handler, "app", None)
+        settings = getattr(app, "settings", None)
+        if isinstance(settings, dict):
+            settings[self.BONE_NAMES_SETTING] = bool(enabled)
+            save_settings(settings)
+
     def _load_current_motion(self, *, reset_camera: bool) -> None:
         deformation_targets = self._mesh_deformation_targets()
         self.blend_shapes_toggle.setVisible(bool(deformation_targets))
@@ -284,8 +312,13 @@ class MotListPreviewWidget(QWidget):
                     motion,
                     scale=self.evaluation_profile.source_preview_scale,
                 )
-                scale = ", ".join(f"{value:g}" for value in self.evaluation_profile.source_preview_scale)
-                rig_description = self.tr("MOT source skeleton (profile scale {scale})").format(scale=scale)
+                scale = ", ".join(
+                    f"{value:g}"
+                    for value in self.evaluation_profile.source_preview_scale
+                )
+                rig_description = self.tr(
+                    "MOT source skeleton (profile scale {scale})"
+                ).format(scale=scale)
             else:
                 rig = self._target.rig
                 rig_description = self._target.label
@@ -359,13 +392,65 @@ class MotListPreviewWidget(QWidget):
             self,
         )
         if hit is None:
-            self._show_error(self.tr("The target mesh was not found in the project, PAKs, or unpacked files."))
+            self._show_error(
+                self.tr(
+                    "The target mesh was not found in the project, PAKs, or unpacked files."
+                )
+            )
             return
         try:
             filepath, data = hit
             self.load_target_mesh(filepath, data)
         except ValueError as exc:
-            self._show_error(self.tr("Could not load target mesh: {error}").format(error=exc))
+            self._show_error(
+                self.tr("Could not load target mesh: {error}").format(error=exc)
+            )
+
+    def _export_gltf(self) -> None:
+        motion = self.current_motion
+        rig = self.controller.rig
+        if motion is None or rig is None or not self.controller.ready:
+            self._show_error(self.tr("Load a playable animation before exporting."))
+            return
+        default = f"{motion.name or 'animation'}.glb"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.tr("Export selected animation"),
+            default,
+            self.tr("glTF Binary (*.glb);;glTF JSON (*.gltf)"),
+        )
+        if not path:
+            return
+        try:
+            from file_handlers.gltf_export import export_gltf
+
+            mesh = None
+            if not self._using_source_rig and self._target is not None:
+                mesh = self._target.mesh
+            result = export_gltf(
+                path,
+                mesh=mesh,
+                rig=rig,
+                motion=motion,
+                evaluation_profile=self.evaluation_profile,
+                material_handler=(
+                    self._target.handler
+                    if mesh is not None and self._target is not None
+                    else None
+                ),
+                resolved_mdf=(
+                    self._target_material_session.resolved_mdf
+                    if mesh is not None and self._target_material_session is not None
+                    else None
+                ),
+            )
+            QMessageBox.information(
+                self,
+                self.tr("Export selected animation"),
+                self.tr("Exported to:\n{path}").format(path=result),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, self.tr("glTF Export Failed"), str(exc))
 
     def _render(self, reset_camera: bool = False) -> None:
         if not self.controller.ready:
@@ -396,15 +481,21 @@ class MotListPreviewWidget(QWidget):
             self.tr,
         )
         if any(abs(weight - 1.0) > 1e-4 for weight in snapshot.node_weights):
-            messages.append(self.tr(
-                "Orange joints have non-unit MOT weights."
-            ))
+            messages.append(self.tr("Orange joints have non-unit MOT weights."))
         motion = self.current_motion
         entry = self.current_entry
         if entry is not None and entry.origin is PreviewMotionOrigin.INHERITED:
-            messages.append(self.tr("Motion payload inherited from {path}.").format(path=entry.source_path))
+            messages.append(
+                self.tr("Motion payload inherited from {path}.").format(
+                    path=entry.source_path
+                )
+            )
         if motion is not None and motion.character_path:
-            messages.append(self.tr("Character/JMAP expressions are not evaluated in this skeleton preview."))
+            messages.append(
+                self.tr(
+                    "Character/JMAP expressions are not evaluated in this skeleton preview."
+                )
+            )
         messages.extend(snapshot_diagnostic_messages(snapshot))
         messages.extend(self._catalog.messages)
         return "  ".join(messages)
@@ -415,9 +506,7 @@ class MotListPreviewWidget(QWidget):
         return mesh_blend_shape_targets(
             self._target.mesh,
             self.evaluation_profile.property_name_hash,
-            motion_name_key=(
-                self.evaluation_profile.joint_binding.motion_name_key
-            ),
+            motion_name_key=(self.evaluation_profile.joint_binding.motion_name_key),
         )
 
     def _show_error(self, message: str) -> None:

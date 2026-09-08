@@ -58,6 +58,14 @@ class PreviewViewport(Protocol):
         recompute_bounds: bool = True,
     ) -> None: ...
 
+    def set_bone_name_labels(
+        self,
+        names: tuple[str, ...],
+        positions: tuple[tuple[float, float, float], ...],
+    ) -> None: ...
+
+    def clear_bone_name_labels(self) -> None: ...
+
 
 class MotionRenderState:
     """Detect semantic pose/deformation changes between rendered snapshots."""
@@ -121,6 +129,7 @@ class MotionPreviewRenderer:
         self._gpu_skinning = False
         self._skeleton = None
         self._render_state.clear()
+        self.viewport.clear_bone_name_labels()
         self.viewport.set_scene([], reset_camera=reset_camera)
 
     def _build(
@@ -162,6 +171,10 @@ class MotionPreviewRenderer:
         if self._target_mesh is None:
             meshes.extend(self._skeleton.meshes)
         self.viewport.set_scene(meshes, reset_camera=reset_camera)
+        self.viewport.set_bone_name_labels(
+            snapshot.joint_names,
+            snapshot.joint_positions,
+        )
         if self._gpu_skinning and self._deformer is not None:
             self.viewport.set_mesh_skinning(
                 self.TARGET_KEY,
@@ -184,6 +197,10 @@ class MotionPreviewRenderer:
 
     def _update(self, snapshot: MotionPreviewSnapshot) -> None:
         assert self._skeleton is not None
+        self.viewport.set_bone_name_labels(
+            snapshot.joint_names,
+            snapshot.joint_positions,
+        )
         pose_changed, deformation_changed = self._render_state.changes(snapshot)
         if self._deformer is not None and self._target_mesh is not None:
             if self._gpu_skinning:

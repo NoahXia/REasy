@@ -31,6 +31,10 @@ from OpenGL.GL import (
     GL_FLOAT,
     GL_FRONT_AND_BACK,
     GL_LIGHT0,
+    GL_LIGHT1,
+    GL_LIGHT2,
+    GL_LIGHT3,
+    GL_LIGHT_MODEL_AMBIENT,
     GL_LIGHTING,
     GL_LINE,
     GL_LINES,
@@ -48,6 +52,7 @@ from OpenGL.GL import (
     GL_NORMALIZE,
     GL_ONE_MINUS_SRC_ALPHA,
     GL_POSITION,
+    GL_SPECULAR,
     GL_POINTS,
     GL_PROJECTION,
     GL_PROJECTION_MATRIX,
@@ -98,6 +103,7 @@ from OpenGL.GL import (
     glGetIntegerv,
     glGetString,
     glLightfv,
+    glLightModelfv,
     glLineWidth,
     glLoadIdentity,
     glMatrixMode,
@@ -126,10 +132,11 @@ from OpenGL.GL import (
 )
 from OpenGL.GLU import gluPerspective, gluProject
 from PySide6.QtCore import QEvent, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCursor, QImage
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -141,7 +148,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from file_handlers.mesh.material_effects import riglogic_material_effect
+from file_handlers.mesh.material_effects import (
+    WOTS_ALPHA_TEXTURE,
+    WOTS_NORMAL_TEXTURE,
+    WOTS_NRRO_TEXTURE,
+    WOTS_RCTO_TEXTURE,
+    material_texture_key,
+    riglogic_material_effect,
+    wots_material_parameters,
+)
 from file_handlers.tex.qt_image_utils import TexPreviewUpload
 from file_handlers.tex.texture_quality import (
     DEFAULT_TEXTURE_QUALITY,
@@ -155,6 +170,7 @@ from ui.opengl_camera import OrbitCameraMixin
 from .opengl_setup import mesh_surface_format
 from .freecam_controller import FreecamController
 from .gpu_skinning import GpuSkinningDeformer
+from .studio_material import StudioMaterialRenderer
 from .scene_buffers import (
     SceneBufferSet,
     build_scene_buffer_set,
@@ -251,6 +267,12 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         "mesh_viewer_line_width": 1.5,
         "mesh_viewer_ambient": 0.35,
         "mesh_viewer_diffuse": 0.65,
+        "scene_preview_exposure": 1.0,
+        "scene_preview_gamma": 2.2,
+        "scene_preview_tone_revision": 1,
+        "motion_preview_lighting_mode": "off",
+        "motion_preview_ambient": 0.7,
+        "motion_preview_diffuse": 0.8,
         "scene_probe_exposure": 0.12,
         "scene_probe_viz_mode": "all",
         "scene_probe_viz_points": 12000,
@@ -264,6 +286,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         "scene_camera_wheel": 0.08,
         "scene_camera_boost": 3.0,
         "scene_camera_slow": 0.25,
+        "scene_background_color": "",
     }
     WIREFRAME_MODES = ("off", "polygon", "lines_depth", "lines_overlay")
     LIGHTING_MODES = ("off", "fixed", "software", "probes")
@@ -286,7 +309,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
         self._settings = settings if isinstance(settings, dict) else None
         self._controls = controls
-        self._background = background
+        self._background = self._load_background_color(background)
         self._init_orbit_camera(
             rot_x=float(initial_rotation[0]),
             rot_y=float(initial_rotation[1]),
@@ -328,6 +351,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._max_texture_anisotropy = 1.0
         self._anisotropy_limit_logs: set[tuple[str, float]] = set()
         self._pending_material_images: dict[str, tuple[str, TexPreviewUpload]] = {}
+        self._material_profiles: dict[str, object] = {}
         self._material_effects: dict[str, object] = {}
         self._material_tints: dict[str, tuple[float, float, float, float]] = {}
         self._two_sided_materials: set[str] = set()
@@ -339,12 +363,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._hidden_keys: set[str] = set()
         self._hidden_parts: dict[str, frozenset[int]] = {}
         self._gpu_skinning = GpuSkinningDeformer()
+        self._studio_material = StudioMaterialRenderer()
         self._skinned_draw_sets: list[_GlSkinnedDrawSet] = []
         self._rigid_draw_sets: list[_GlRigidDrawSet] = []
         self._mesh_draw_matrices: dict[str, np.ndarray] = {}
         self._skinned_draw_sets_dirty = False
         self._gl_cleanup_context = None
         self._needs_gl_upload = False
+        self._bone_name_labels: tuple[str, ...] = ()
+        self._bone_name_positions = np.zeros((0, 3), dtype=np.float32)
+        self._bone_name_labels_visible = False
 
         self.render_mode = "wire" if self._controls == "mesh" else self._setting_choice("scene_render_mode", ("wire", "hybrid", "solid"))
         self._gizmo_mode = self._setting_choice("scene_gizmo_mode", ("position", "rotation", "scale"))
@@ -352,7 +380,25 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._fps_limit = self._setting_int("mesh_viewer_fps_limit", 0, 240)
         self.texture_quality = self._setting_choice("renderer_texture_quality", tuple(TEXTURE_QUALITY_PROFILES))
         self.wireframe_mode = self._setting_choice("mesh_viewer_wireframe_mode", self.WIREFRAME_MODES)
-        self.lighting_mode = self._setting_choice("mesh_viewer_lighting_mode", self.LIGHTING_MODES)
+        self._lighting_setting_key = (
+            "motion_preview_lighting_mode"
+            if self._controls == "motion"
+            else "mesh_viewer_lighting_mode"
+        )
+        self._ambient_setting_key = (
+            "motion_preview_ambient"
+            if self._controls == "motion"
+            else "mesh_viewer_ambient"
+        )
+        self._diffuse_setting_key = (
+            "motion_preview_diffuse"
+            if self._controls == "motion"
+            else "mesh_viewer_diffuse"
+        )
+        self.lighting_mode = self._setting_choice(
+            self._lighting_setting_key,
+            self.LIGHTING_MODES,
+        )
         self._light_probe_instances: dict[str, SceneLightProbeInstance] = {}
         self._light_probe_status = ""
         self._preferred_selection_keys: set[str] = set()
@@ -368,8 +414,10 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._probe_shade_percent = 0
         self.line_width = self._setting_float("mesh_viewer_line_width", 0.5, 8.0)
         self.color_source = "vertex"
-        self.ambient = self._setting_float("mesh_viewer_ambient", 0.0, 1.0)
-        self.diffuse = self._setting_float("mesh_viewer_diffuse", 0.0, 1.0)
+        self.ambient = self._setting_float(self._ambient_setting_key, 0.0, 1.0)
+        self.diffuse = self._setting_float(self._diffuse_setting_key, 0.0, 1.0)
+        self.exposure = self._setting_float("scene_preview_exposure", 0.1, 4.0)
+        self.gamma = self._setting_float("scene_preview_gamma", 0.5, 3.0)
         self.probe_exposure = self._setting_float("scene_probe_exposure", 0.01, 2.0)
         self.probe_viz_mode = self._setting_choice("scene_probe_viz_mode", self.PROBE_VIZ_MODES)
         self.probe_viz_points = self._setting_int("scene_probe_viz_points", 100, 50000)
@@ -418,7 +466,14 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.fullscreen_button = self._overlay_button(
             "⛶", self.tr("Fullscreen viewport"), self._toggle_view_fullscreen
         )
+        self.background_button = self._overlay_button(
+            "BG",
+            self.tr("Choose viewport background color"),
+            self._choose_background_color,
+        )
+        self._refresh_background_button()
         header.addWidget(self.fps_label, 1)
+        header.addWidget(self.background_button)
         header.addWidget(self.fullscreen_button)
         header.addWidget(self.overlay_fold_button)
         layout.addLayout(header)
@@ -432,6 +487,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
         builders = {
             "mesh": self._build_mesh_controls,
+            "motion": self._build_motion_controls,
             "rcol": self._build_rcol_controls,
             "scene": self._build_scene_controls,
         }
@@ -450,6 +506,58 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             button.clicked.connect(slot)
         button.setFocusPolicy(Qt.NoFocus)
         return button
+
+    def _load_background_color(
+        self,
+        fallback: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        value = (
+            self._settings.get("scene_background_color", "")
+            if self._settings is not None
+            else ""
+        )
+        color = QColor(str(value))
+        if not color.isValid():
+            return tuple(float(component) for component in fallback)
+        return (color.redF(), color.greenF(), color.blueF(), 1.0)
+
+    def _choose_background_color(self) -> None:
+        initial = QColor.fromRgbF(*self._background)
+        color = QColorDialog.getColor(
+            initial,
+            self,
+            self.tr("Viewport background color"),
+        )
+        if color.isValid():
+            self._set_background_color(color)
+
+    def _set_background_color(self, color: QColor) -> None:
+        self._background = (color.redF(), color.greenF(), color.blueF(), 1.0)
+        self._save_view_setting(
+            "scene_background_color",
+            color.name(QColor.NameFormat.HexRgb),
+        )
+        self._refresh_background_button()
+        if self.context() is not None:
+            with suppress(Exception):
+                self.makeCurrent()
+                glClearColor(*self._background)
+                self.doneCurrent()
+        self.update()
+
+    def _refresh_background_button(self) -> None:
+        button = getattr(self, "background_button", None)
+        if button is None:
+            return
+        color = QColor.fromRgbF(*self._background)
+        text_color = "#111111" if color.lightnessF() > 0.58 else "#f2f2f2"
+        name = color.name(QColor.NameFormat.HexRgb)
+        button.setStyleSheet(
+            "QToolButton {"
+            f"background-color:{name}; color:{text_color};"
+            "border:1px solid #607080; border-radius:3px; padding:0px;"
+            "}"
+        )
 
     def setup_viewport_overlay(
         self,
@@ -570,15 +678,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         )
         self.scene_light_combo = self._data_combo(
             (
-                (self.tr("Fixed"), "fixed"),
+                (self.tr("Studio"), "fixed"),
                 (self.tr("Software"), "software"),
                 (self.tr("Probes"), "probes"),
-                (self.tr("Off"), "off"),
+                (self.tr("Unlit"), "off"),
             ),
             self._set_lighting_mode,
             self.lighting_mode,
         )
         self._add_control_row(layout, self.tr("Light"), self.scene_light_combo)
+        self._add_tone_controls(layout)
         self.probe_exposure_spin = self._float_spin(0.01, 2.0, 0.01, self.probe_exposure, self._set_probe_exposure)
         self._add_control_row(layout, self.tr("Probe Exp"), self.probe_exposure_spin)
         self.probe_viz_combo = self._data_combo(
@@ -641,6 +750,47 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._add_fps_limit_control(layout)
         self._add_highlight_filter_control(layout)
 
+    def _build_motion_controls(self, layout: QVBoxLayout):
+        self._add_scene_mode_control(layout)
+        self._add_fps_limit_control(layout)
+        self.motion_light_combo = self._data_combo(
+            (
+                (self.tr("Unlit"), "off"),
+                (self.tr("Studio"), "fixed"),
+                (self.tr("Software"), "software"),
+            ),
+            self._set_lighting_mode,
+            self.lighting_mode,
+        )
+        self._add_control_row(
+            layout,
+            self.tr("Light"),
+            self.motion_light_combo,
+        )
+        self.motion_amb_spin = self._float_spin(
+            0.0,
+            1.0,
+            0.05,
+            self.ambient,
+            self._set_ambient,
+        )
+        self.motion_diff_spin = self._float_spin(
+            0.0,
+            1.0,
+            0.05,
+            self.diffuse,
+            self._set_diffuse,
+        )
+        self._add_control_row(
+            layout,
+            self.tr("Amb"),
+            self.motion_amb_spin,
+            self.tr("Diff"),
+            self.motion_diff_spin,
+        )
+        self._add_tone_controls(layout)
+        self._add_highlight_filter_control(layout)
+
     def _add_scene_mode_control(self, layout: QVBoxLayout):
         modes = (
             (self.tr("Wireframe"), "wire"),
@@ -694,6 +844,19 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             )
         )
         self._add_control_row(layout, self.tr("Quality"), combo)
+
+    def _add_tone_controls(self, layout: QVBoxLayout) -> None:
+        exposure_spin = self._float_spin(
+            0.1, 4.0, 0.05, self.exposure, self._set_exposure
+        )
+        gamma_spin = self._float_spin(
+            0.5, 3.0, 0.05, self.gamma, self._set_gamma
+        )
+        self._add_control_row(
+            layout,
+            self.tr("Exp"), exposure_spin,
+            self.tr("Gamma"), gamma_spin,
+        )
 
     def _add_control_row(self, layout: QVBoxLayout, *items):
         row = QHBoxLayout()
@@ -749,8 +912,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
         self.light_combo = self._data_combo(
             (
-                (self.tr("Off"), "off"),
-                (self.tr("Fixed"), "fixed"),
+                (self.tr("Unlit"), "off"),
+                (self.tr("Studio"), "fixed"),
                 (self.tr("Software"), "software"),
             ),
             self._set_lighting_mode,
@@ -774,6 +937,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.diff_spin = self._float_spin(0.0, 1.0, 0.05, self.diffuse, self._set_diffuse)
         for item in (self.tr("Amb"), self.amb_spin, self.tr("Diff"), self.diff_spin):
             row2.addWidget(QLabel(item, self.overlay) if isinstance(item, str) else item)
+        self._add_tone_controls(layout)
 
         self.bone_labels_check = QCheckBox(self.tr("Bones"), self.overlay)
         self.bone_labels_check.setChecked(self.show_bone_labels)
@@ -824,6 +988,29 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         if reset_camera:
             self.freecam.reset(self.center, self.extent, self.camera_speed)
         self._upload_buffers()
+        self.update()
+
+    def set_bone_name_labels(self, names, positions) -> None:
+        """Set dynamic world-space labels used by motion skeleton previews."""
+        labels = tuple(str(name) for name in names)
+        points = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+        if len(labels) != len(points):
+            raise ValueError(
+                f"bone label count {len(labels)} does not match position count {len(points)}"
+            )
+        self._bone_name_labels = labels
+        self._bone_name_positions = points.copy()
+        if self._bone_name_labels_visible:
+            self.update()
+
+    def clear_bone_name_labels(self) -> None:
+        self._bone_name_labels = ()
+        self._bone_name_positions = np.zeros((0, 3), dtype=np.float32)
+        if self._bone_name_labels_visible:
+            self.update()
+
+    def set_bone_name_labels_visible(self, visible: bool) -> None:
+        self._bone_name_labels_visible = bool(visible)
         self.update()
 
     def set_mesh_skinning(
@@ -1252,6 +1439,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.update()
 
     def set_material_profiles(self, profiles: dict[str, object]):
+        self._material_profiles.clear()
         self._material_effects.clear()
         self._material_tints, self._two_sided_materials = {}, set()
         self._material_effect_errors.clear()
@@ -1261,6 +1449,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
     def update_material_profiles(self, profiles: dict[str, object]):
         for name, profile in profiles.items():
+            self._material_profiles[name] = profile
             self._material_effects.pop(name, None)
             self._material_effect_errors.pop(name, None)
             try:
@@ -1274,6 +1463,26 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._material_tints[name] = (tint + (1.0, 1.0, 1.0, 1.0))[:4]
             (self._two_sided_materials.add if getattr(profile, "two_sided", False) else self._two_sided_materials.discard)(name)
         self.update()
+
+    def _wots_material_inputs(self, material_name: str) -> dict[str, object]:
+        parameters = wots_material_parameters(
+            self._material_profiles.get(material_name)
+        )
+        return {
+            **parameters,
+            "nrro_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_NRRO_TEXTURE), 0
+            ),
+            "normal_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_NORMAL_TEXTURE), 0
+            ),
+            "rcto_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_RCTO_TEXTURE), 0
+            ),
+            "alpha_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_ALPHA_TEXTURE), 0
+            ),
+        }
 
     def set_material_parameters(
         self,
@@ -2556,6 +2765,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             lighting_mode=self.lighting_mode,
             ambient=self.ambient,
             diffuse=self.diffuse,
+            exposure=self.exposure,
+            gamma=self.gamma,
         )
 
     def _hover_vertices(self, buffer_set: SceneBufferSet, key: str) -> np.ndarray:
@@ -3091,6 +3302,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             with suppress(Exception):
                 self._riglogic_material.dispose_gl()
             with suppress(Exception):
+                self._studio_material.dispose_gl()
+            with suppress(Exception):
                 self._cleanup_extra_gl()
             with suppress(Exception):
                 self.doneCurrent()
@@ -3124,6 +3337,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._hidden_keys.clear()
         self._hidden_parts.clear()
         self._material_effects.clear()
+        self._material_profiles.clear()
         self._material_tints.clear()
         self._two_sided_materials.clear()
         self._material_parameters.clear()
@@ -3227,17 +3441,36 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         glColorMask(True, True, True, False)
         glDepthMask(True)
 
+        lights = (GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3)
         if self.lighting_mode == "fixed":
             glEnable(GL_LIGHTING)
-            glEnable(GL_LIGHT0)
             glEnable(GL_COLOR_MATERIAL)
             glEnable(GL_NORMALIZE)
             glShadeModel(GL_SMOOTH)
-            glLightfv(GL_LIGHT0, GL_DIFFUSE, (self.diffuse, self.diffuse, self.diffuse, 1.0))
-            glLightfv(GL_LIGHT0, GL_AMBIENT, (self.ambient, self.ambient, self.ambient, 1.0))
+            gamma = max(float(self.gamma), 0.01)
+
+            def adjusted(value: float) -> float:
+                return min(max(float(value) * float(self.exposure), 0.0), 1.0) ** (1.0 / gamma)
+
+            strengths = (
+                adjusted(self.diffuse * 0.72),  # key
+                adjusted(self.diffuse * 0.28),  # fill
+                adjusted(self.diffuse * 0.35),  # rim
+                adjusted(self.ambient * 0.65),  # sky half of hemisphere
+            )
+            glLightModelfv(
+                GL_LIGHT_MODEL_AMBIENT,
+                (adjusted(self.ambient * 0.35),) * 3 + (1.0,),
+            )
+            for light, strength in zip(lights, strengths, strict=True):
+                glEnable(light)
+                glLightfv(light, GL_AMBIENT, (0.0, 0.0, 0.0, 1.0))
+                glLightfv(light, GL_DIFFUSE, (strength, strength, strength, 1.0))
+                glLightfv(light, GL_SPECULAR, (0.0, 0.0, 0.0, 1.0))
         else:
             glDisable(GL_LIGHTING)
-            glDisable(GL_LIGHT0)
+            for light in lights:
+                glDisable(light)
 
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         glLineWidth(1.0)
@@ -3316,30 +3549,52 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     )
                     if effect_bound is None:
                         continue
+                    studio_bound = False
                     if effect_bound:
                         glColor4f(1.0, 1.0, 1.0, 1.0)
                         glDisable(GL_TEXTURE_2D)
-                    elif textured and tex_id:
-                        glColor4f(tint[0], tint[1], tint[2], tint[3])
-                        glEnable(GL_TEXTURE_2D)
-                        glBindTexture(GL_TEXTURE_2D, tex_id)
                     else:
-                        glColor4f(tint[0], tint[1], tint[2], tint[3])
-                        glBindTexture(GL_TEXTURE_2D, 0)
-                        glDisable(GL_TEXTURE_2D)
+                        glColor4f(1.0, 1.0, 1.0, 1.0)
+                        has_texture = bool(textured and tex_id)
+                        self._studio_material.bind(
+                            tint=tint,
+                            ambient=self.ambient,
+                            diffuse=self.diffuse,
+                            exposure=self.exposure,
+                            gamma=self.gamma,
+                            textured=has_texture,
+                            texture_id=tex_id or 0,
+                            lit=self.lighting_mode == "fixed",
+                            **self._wots_material_inputs(material_name),
+                        )
+                        studio_bound = True
                     batch_vbo.bind()
                     glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, None)
                     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
                     if effect_bound:
                         self._riglogic_material.unbind()
+                    elif studio_bound:
+                        self._studio_material.unbind()
                 glEnable(GL_CULL_FACE)
                 glColor4f(1.0, 1.0, 1.0, 1.0)
             else:
                 glBindTexture(GL_TEXTURE_2D, 0)
                 glDisable(GL_TEXTURE_2D)
+                self._studio_material.bind(
+                    tint=(1.0, 1.0, 1.0, 1.0),
+                    ambient=self.ambient,
+                    diffuse=self.diffuse,
+                    exposure=self.exposure,
+                    gamma=self.gamma,
+                    textured=False,
+                    lit=self.lighting_mode == "fixed",
+                )
+                studio_bound = True
                 buffer_set.indices_vbo.bind()
                 glDrawElements(GL_TRIANGLES, buffer_set.index_count, GL_UNSIGNED_INT, None)
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
+                if studio_bound:
+                    self._studio_material.unbind()
 
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
@@ -3380,6 +3635,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 )
                 if effect_program is None:
                     continue
+                tex_id = self._texture_ids.get(material_name)
+                has_texture = bool(not effect_program and use_textures and tex_id)
                 self._gpu_skinning.bind(
                     draw_set.key,
                     uvs_vbo=draw_set.source.uvs_vbo,
@@ -3389,16 +3646,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     tint=tint,
                     ambient=self.ambient,
                     diffuse=self.diffuse,
+                    exposure=self.exposure,
+                    gamma=self.gamma,
                     lit=self.lighting_mode == "fixed",
+                    textured=has_texture,
+                    texture_id=tex_id or 0,
+                    **self._wots_material_inputs(material_name),
                 )
-                tex_id = self._texture_ids.get(material_name)
                 if effect_program:
                     glDisable(GL_TEXTURE_2D)
-                elif use_textures and tex_id:
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex_id)
                 else:
-                    glBindTexture(GL_TEXTURE_2D, 0)
                     glDisable(GL_TEXTURE_2D)
                 indices_vbo.bind()
                 glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, None)
@@ -3537,6 +3794,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 tint=tint,
                 ambient=self.ambient,
                 diffuse=self.diffuse,
+                exposure=self.exposure,
+                gamma=self.gamma,
                 lit=self.lighting_mode == "fixed",
                 vertex_shader=vertex_shader,
             )
@@ -3897,7 +4156,10 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
     def _prepare_scene_view(self) -> None:
         self._apply_render_state()
         glLoadIdentity()
-        glLightfv(GL_LIGHT0, GL_POSITION, (0.5, 1.0, 1.0, 0.0))
+        glLightfv(GL_LIGHT0, GL_POSITION, (0.45, 0.75, 0.55, 0.0))
+        glLightfv(GL_LIGHT1, GL_POSITION, (-0.70, 0.30, 0.45, 0.0))
+        glLightfv(GL_LIGHT2, GL_POSITION, (0.10, 0.35, -0.95, 0.0))
+        glLightfv(GL_LIGHT3, GL_POSITION, (0.0, 1.0, 0.0, 0.0))
         self._apply_camera_transform()
         self._gizmo_projection = None
         if self._controls != "mesh" and self._selection_center is not None:
@@ -3941,9 +4203,59 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._draw_gizmo()
         glColorMask(True, True, True, True)
         self._after_scene_draw()
+        self._draw_bone_name_labels(scene_matrix)
         self._record_frame()
         if self._fps_limit == 0 and self.isVisible():
             self._timer.start(0)
+
+    def _draw_bone_name_labels(self, scene_matrix: np.ndarray | None) -> None:
+        if (
+            not self._bone_name_labels_visible
+            or not self._bone_name_labels
+            or not len(self._bone_name_positions)
+        ):
+            return
+        model = glGetDoublev(GL_MODELVIEW_MATRIX)
+        projection = glGetDoublev(GL_PROJECTION_MATRIX)
+        viewport = glGetIntegerv(GL_VIEWPORT)
+        dpr = float(self.devicePixelRatioF())
+        points = self._bone_name_positions
+        if scene_matrix is not None:
+            points = transform_points(points, scene_matrix)
+
+        projected: list[tuple[str, float, float, float]] = []
+        for name, point in zip(self._bone_name_labels, points, strict=True):
+            if not np.isfinite(point).all():
+                continue
+            try:
+                x, y, depth = gluProject(
+                    float(point[0]),
+                    float(point[1]),
+                    float(point[2]),
+                    model,
+                    projection,
+                    viewport,
+                )
+            except Exception:
+                continue
+            x /= dpr
+            y = self.height() - y / dpr
+            if not 0.0 <= depth <= 1.0 or not 0.0 <= x <= self.width() or not 0.0 <= y <= self.height():
+                continue
+            projected.append((name, x + 4.0, y - 4.0, depth))
+
+        if not projected:
+            return
+        projected.sort(key=lambda item: item[3], reverse=True)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setPen(QPen(QColor(0, 0, 0, 220), 3.0))
+        for name, x, y, _depth in projected:
+            painter.drawText(round(x + 1.0), round(y + 1.0), name)
+        painter.setPen(QColor(255, 226, 96))
+        for name, x, y, _depth in projected:
+            painter.drawText(round(x), round(y), name)
+        painter.end()
 
     def _update_timer_state(self):
         self._timer.stop()
@@ -4004,7 +4316,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         if mode not in self.LIGHTING_MODES:
             return
         self.lighting_mode = mode
-        self._save_view_setting("mesh_viewer_lighting_mode", mode)
+        self._save_view_setting(self._lighting_setting_key, mode)
+        self._colors_dirty = True
         self._invalidate_probe_shading()
         self.update()
 
@@ -4015,13 +4328,25 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
     def _set_ambient(self, value: float):
         self.ambient = float(value)
-        self._save_view_setting("mesh_viewer_ambient", self.ambient)
+        self._save_view_setting(self._ambient_setting_key, self.ambient)
         self._colors_dirty = True
         self.update()
 
     def _set_diffuse(self, value: float):
         self.diffuse = float(value)
-        self._save_view_setting("mesh_viewer_diffuse", self.diffuse)
+        self._save_view_setting(self._diffuse_setting_key, self.diffuse)
+        self._colors_dirty = True
+        self.update()
+
+    def _set_exposure(self, value: float):
+        self.exposure = float(value)
+        self._save_view_setting("scene_preview_exposure", self.exposure)
+        self._colors_dirty = True
+        self.update()
+
+    def _set_gamma(self, value: float):
+        self.gamma = float(value)
+        self._save_view_setting("scene_preview_gamma", self.gamma)
         self._colors_dirty = True
         self.update()
 

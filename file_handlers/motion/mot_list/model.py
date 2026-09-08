@@ -37,6 +37,7 @@ class MotionSlot:
     physics_group_flags: int = 0
     joint_mask_id: int = 0
     overrides: list[SequenceData] = field(default_factory=list)
+    external_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -45,3 +46,4 @@ class MotList:
     slots: list[MotionSlot] = field(default_factory=list)
     base_motion_list_path: str | None = None
     error_flags: int = 0
+    diagnostics: list[str] = field(default_factory=list)

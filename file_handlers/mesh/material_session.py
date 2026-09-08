@@ -23,9 +23,14 @@ from file_handlers.tex.texture_quality import (
 )
 
 from .material_effects import (
+    WOTS_ALPHA_TEXTURE,
+    WOTS_NORMAL_TEXTURE,
+    WOTS_NRRO_TEXTURE,
+    WOTS_RCTO_TEXTURE,
     material_texture_key,
     riglogic_material_effect,
     surface_texture_paths,
+    wots_material_texture_paths,
 )
 from .material_resolver import MeshMaterialBinding, MeshMaterialResolver, ResolvedMdf
 
@@ -187,17 +192,31 @@ class MeshMaterialSession(QObject):
                 self.errors[material_key] = f"{material_key}: {exc}"
                 continue
             if effect is None:
-                if not binding.texture_path:
-                    continue
-                primary = _TextureRequest(
-                    binding.texture_path,
-                    material_key,
-                    source_binding=binding,
-                    resolved_path=binding.resolved_texture_path,
-                    resolved_data=binding.resolved_texture_data,
-                )
-                self._primary_requests[id(binding)] = primary
-                self._queue.append(primary)
+                if binding.texture_path:
+                    primary = _TextureRequest(
+                        binding.texture_path,
+                        material_key,
+                        source_binding=binding,
+                        resolved_path=binding.resolved_texture_path,
+                        resolved_data=binding.resolved_texture_data,
+                    )
+                    self._primary_requests[id(binding)] = primary
+                    self._queue.append(primary)
+                for texture_type, texture_path in wots_material_texture_paths(
+                    binding.surface
+                ).items():
+                    if texture_type not in (
+                        WOTS_NRRO_TEXTURE,
+                        WOTS_NORMAL_TEXTURE,
+                        WOTS_RCTO_TEXTURE,
+                        WOTS_ALPHA_TEXTURE,
+                    ):
+                        continue
+                    self._queue.append(_TextureRequest(
+                        texture_path,
+                        material_texture_key(material_key, texture_type),
+                        material_key=material_key,
+                    ))
                 continue
 
             texture_paths = surface_texture_paths(binding.surface)

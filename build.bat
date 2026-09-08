@@ -17,7 +17,13 @@ if /I "%GITHUB_ACTIONS%"=="true" (
   call "%~dp0prepare_env.bat" || exit /b 1
 )
 
+rem Keep unrelated Qt/ICU installations on the machine out of PyInstaller's
+rem dependency resolution. Qt uses the Windows system ICU on supported hosts.
+set "REASY_ORIGINAL_PATH=%PATH%"
+set "PATH=%CD%\.venv\Scripts;%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem"
+
 "%PY%" -c "import runpy, sys, sysconfig; sys.path.insert(0, sysconfig.get_path('stdlib')); runpy.run_module('PyInstaller', run_name='__main__')" --onefile --windowed --icon=resources/icons/reasy_editor_logo.ico --version-file=version.txt ^
+  --runtime-hook scripts\pyi_rth_preload_qt.py ^
   --collect-submodules file_handlers ^
   --hidden-import fast_pakresolve --collect-binaries fast_pakresolve ^
   --hidden-import fast_string_scan --collect-binaries fast_string_scan ^
@@ -25,6 +31,8 @@ if /I "%GITHUB_ACTIONS%"=="true" (
   --hidden-import texture2ddecoder --collect-all texture2ddecoder ^
   --add-binary "%GDEFLATE_DLL%;tools\runtimes\win-x64\native" ^
   REasy.py || exit /b 1
+
+set "PATH=%REASY_ORIGINAL_PATH%"
 
 xcopy /E /I /Y resources dist\resources || exit /b 1
 if exist dist\resources\data\dumps rmdir /S /Q dist\resources\data\dumps

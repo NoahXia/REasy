@@ -69,6 +69,8 @@ def display_colors(
     lighting_mode: str,
     ambient: float,
     diffuse: float,
+    exposure: float = 1.0,
+    gamma: float = 1.0,
 ) -> np.ndarray | None:
     return display_vertex_colors(
         buffer_set.vertices,
@@ -77,6 +79,8 @@ def display_colors(
         lighting_mode=lighting_mode,
         ambient=ambient,
         diffuse=diffuse,
+        exposure=exposure,
+        gamma=gamma,
     )
 
 
@@ -88,6 +92,8 @@ def display_vertex_colors(
     lighting_mode: str,
     ambient: float,
     diffuse: float,
+    exposure: float = 1.0,
+    gamma: float = 1.0,
 ) -> np.ndarray | None:
     if base is None:
         if lighting_mode != "software":
@@ -97,13 +103,29 @@ def display_vertex_colors(
         return base
     if normals is None or not np.isfinite(normals).all():
         normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (len(vertices), 1))
-    light_dir = np.array([0.4, 0.8, 0.4], dtype=np.float32)
-    light_dir /= np.linalg.norm(light_dir) or 1.0
-    intensity = np.clip((normals @ light_dir) * float(diffuse) + float(ambient), 0.0, 1.0).astype(np.float32)
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    safe_normals = normals / np.maximum(lengths, 1e-8)
+    key_dir = _normalized_direction((0.45, 0.75, 0.55))
+    fill_dir = _normalized_direction((-0.70, 0.30, 0.45))
+    rim_dir = _normalized_direction((0.10, 0.35, -0.95))
+    key = np.maximum(safe_normals @ key_dir, 0.0)
+    fill = np.maximum(safe_normals @ fill_dir, 0.0)
+    rim = np.maximum(safe_normals @ rim_dir, 0.0) ** 2.0
+    hemisphere = 0.35 + 0.65 * np.clip(safe_normals[:, 1] * 0.5 + 0.5, 0.0, 1.0)
+    intensity = (
+        float(ambient) * hemisphere
+        + float(diffuse) * (0.72 * key + 0.28 * fill + 0.35 * rim)
+    ).astype(np.float32)
     colors = base.copy()
-    colors[:, :3] *= intensity[:, np.newaxis]
+    rgb = np.maximum(colors[:, :3] * intensity[:, np.newaxis] * max(float(exposure), 0.0), 0.0)
+    colors[:, :3] = np.clip(np.power(rgb, 1.0 / max(float(gamma), 0.01)), 0.0, 1.0)
     colors[:, 3] = 1.0
     return colors
+
+
+def _normalized_direction(values: tuple[float, float, float]) -> np.ndarray:
+    direction = np.asarray(values, dtype=np.float32)
+    return direction / (np.linalg.norm(direction) or 1.0)
 
 
 def build_scene_buffer_set(

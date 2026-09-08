@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from ..dmc5_codec import DMC5_MOTION_FORMAT_CODEC
 from ..evaluation import DMC5_EVALUATION_PROFILE
+from ..evaluation import WOTS_EVALUATION_PROFILE
 from ..format_codec import MotionFormatCodec
+from ..wots_codec import WOTS_MOTION_FORMAT_CODEC
 from ..runtime.dmc5 import DMC5_ENTITY_MOTION_BACKEND
 from .catalog_reader import Dmc5MotionListCatalogReader
-from .resolution import DMC5_TREE_MOTION_REFERENCES
+from .resolution import DMC5_TREE_MOTION_REFERENCES, NO_TREE_MOTION_REFERENCES
 from .support import EntityMotionSupport
 
 
@@ -17,7 +19,14 @@ DMC5_ENTITY_MOTION_SUPPORT = EntityMotionSupport(
     catalog_reader=Dmc5MotionListCatalogReader(DMC5_MOTION_FORMAT_CODEC.profile),
 )
 
-ENTITY_MOTION_SUPPORTS = (DMC5_ENTITY_MOTION_SUPPORT,)
+WOTS_MOTION_SUPPORT = EntityMotionSupport(
+    format_codec=WOTS_MOTION_FORMAT_CODEC,
+    evaluation=WOTS_EVALUATION_PROFILE,
+    tree_references=NO_TREE_MOTION_REFERENCES,
+    backend=None,
+)
+
+ENTITY_MOTION_SUPPORTS = (DMC5_ENTITY_MOTION_SUPPORT, WOTS_MOTION_SUPPORT)
 
 
 def entity_motion_support_for_game(
@@ -28,7 +37,8 @@ def entity_motion_support_for_game(
         (
             support
             for support in ENTITY_MOTION_SUPPORTS
-            if support.backend.game_version.upper() == normalized
+            if support.backend is not None
+            and support.backend.game_version.upper() == normalized
         ),
         None,
     )

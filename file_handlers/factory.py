@@ -26,12 +26,16 @@ def _handler_classes():
     yield DdsHandler
     from file_handlers.mesh.mesh_handler import MeshHandler
     yield MeshHandler
+    from file_handlers.mesh.stmesh_handler import StMeshHandler
+    yield StMeshHandler
     from file_handlers.sound.sound_handler import SoundHandler
     yield SoundHandler
     from file_handlers.clip.clip_handler import ClipHandler
     yield ClipHandler
     from file_handlers.motion.motlist_handler import MotListHandler
     yield MotListHandler
+    from file_handlers.motion.mot_handler import WotsMotHandler
+    yield WotsMotHandler
     from file_handlers.uvs.uvs_handler import UvsHandler
     yield UvsHandler
     from file_handlers.gui.gui_handler import GuiHandler

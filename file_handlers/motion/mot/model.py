@@ -47,6 +47,7 @@ class Joint:
     translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rotation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     joint_map_extra_type: JointMapExtraType = JointMapExtraType.DEFAULT
+    binding_hash: int | None = None
 
 
 @dataclass(slots=True, eq=False)

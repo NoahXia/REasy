@@ -78,6 +78,20 @@ class MotionListResourceStore:
         self._documents[resource_path_key(path)] = document
         return document
 
+    def load_motion(self, path: str):
+        parser = getattr(self.codec, "parse_mot", None)
+        if parser is None:
+            return None
+        hit = self.resource_data(path)
+        if hit is None:
+            return None
+        resolved_path, data = hit
+        try:
+            return parser(data, label=resolved_path)
+        except (OSError, ValueError) as exc:
+            self.errors.append(f"could not parse external MOT {resolved_path!r}: {exc}")
+            return None
+
     def motion_entries(
         self,
         path: str,

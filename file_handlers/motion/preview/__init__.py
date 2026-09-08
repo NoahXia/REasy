@@ -18,6 +18,7 @@ from .model import (
 from .support import EntityMotionSupport
 from .support_registry import (
     DMC5_ENTITY_MOTION_SUPPORT,
+    WOTS_MOTION_SUPPORT,
     entity_motion_support_for_format,
     entity_motion_support_for_game,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "MotionPreviewController",
     "MotionSceneAttachmentResolver",
     "DMC5_ENTITY_MOTION_SUPPORT",
+    "WOTS_MOTION_SUPPORT",
     "EntityMotionSessionResolver",
     "EntityMotionSession",
     "EntityMotionSupport",

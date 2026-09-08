@@ -36,6 +36,10 @@ class Dmc5JointBindingStrategy:
         return murmur3_hash_utf16le(name)
 
     def motion_key(self, joint: Joint) -> int:
+        if joint.binding_hash is not None:
+            if not 0 <= joint.binding_hash <= 0xFFFFFFFF:
+                raise ValueError("motion joint binding hash must be unsigned 32-bit")
+            return joint.binding_hash
         return self.motion_name_key(joint.name)
 
     def rig_key(self, joint: RigJoint) -> int:
@@ -64,6 +68,15 @@ DMC5_EVALUATION_PROFILE = MotionEvaluationProfile(
     pose_composition_policy=PoseCompositionPolicy(
         source_defaults=SourceDefaultTopologyPolicy.MATCH_TARGET_HIERARCHY,
     ),
+    joint_binding=Dmc5JointBindingStrategy(),
+    source_preview_scale=(1.0, 1.0, 1.0),
+    property_name_hash=murmur3_hash_utf16le,
+)
+
+WOTS_EVALUATION_PROFILE = MotionEvaluationProfile(
+    name="Onimusha: Way of the Sword 1.0.1.0",
+    sampling_policy=DMC5_EVALUATION_PROFILE.sampling_policy,
+    pose_composition_policy=DMC5_EVALUATION_PROFILE.pose_composition_policy,
     joint_binding=Dmc5JointBindingStrategy(),
     source_preview_scale=(1.0, 1.0, 1.0),
     property_name_hash=murmur3_hash_utf16le,

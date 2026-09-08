@@ -10,6 +10,7 @@ class Dmc5MotionFormatCodec:
     """DMC5 MOTLIST v85 with embedded MOT v65, MotTree v4, and MotClip v27."""
 
     profile = DMC5_PROFILE
+    supports_writing = True
 
     def matches(self, data: bytes | bytearray | memoryview) -> bool:
         return (

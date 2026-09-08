@@ -10,6 +10,28 @@ NORMAL_ROUGHNESS_MAP = "NormalRoughnessMap"
 ATLAS_WRINKLE_MASK_MAP = "AtlasWrinkleMaskMap"
 ALPHA_TRANSLUCENT_OCCLUSION_SSS_MAP = "AlphaTranslucentOcclusionSSSMap"
 BLEND_ATOS = "BlendATOS"
+WOTS_NRRO_TEXTURE = "WOTS_NormalRoughnessOcclusion"
+WOTS_NORMAL_TEXTURE = "WOTS_Normal"
+WOTS_RCTO_TEXTURE = "WOTS_RoughnessCavityTranslucentOcclusion"
+WOTS_ALPHA_TEXTURE = "WOTS_Alpha"
+WOTS_GAME_VERSIONS = frozenset({"ONIMUSHAWOTS", "ONIWOTS", "WOTS"})
+WOTS_NRRO_ROLES = (
+    "NormalRoughnessOcclusionMap",
+    "WrinkleBlend_NRROMap",
+    "TexChange_NRRO",
+)
+WOTS_ALPHA_ROLES = (
+    "AlphaMap",
+    "BaseAlphaMap",
+)
+WOTS_NORMAL_ROLES = (
+    "Wrinkle_NRMMap01",
+    "NormalMap",
+)
+WOTS_RCTO_ROLES = (
+    "RoughnessCavityTranslucentOcclusionMap",
+    "TexChange_RoughnessCavityTranslucentOcclusionMap",
+)
 WRINKLE_DIFFUSE_MAPS = tuple(
     f"WrinkleDiffuseMap{index}"
     for index in range(1, 4)
@@ -30,6 +52,7 @@ class _SurfaceProfile(Protocol):
     mmtr_path: str
     textures: tuple[_TextureProfile, ...]
     parameter_names: tuple[str, ...]
+    parameters: dict[str, tuple[float, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +191,79 @@ def surface_texture_paths(
     return {
         texture.texture_type: texture.texture_path
         for texture in surface.textures
+    }
+
+
+def is_wots_surface(surface: _SurfaceProfile | None) -> bool:
+    if surface is None:
+        return False
+    game = "".join(
+        character
+        for character in str(getattr(surface, "game_version", "")).upper()
+        if character.isalnum()
+    )
+    return game in WOTS_GAME_VERSIONS
+
+
+def wots_material_texture_paths(
+    surface: _SurfaceProfile | None,
+) -> dict[str, str]:
+    """Map WOTS texture aliases onto stable preview roles.
+
+    The role names in MDF files vary between character templates.  Selection
+    remains deterministic and never guesses from a filename.
+    """
+
+    if not is_wots_surface(surface):
+        return {}
+    by_name = {
+        texture.texture_type.casefold(): texture.texture_path
+        for texture in surface.textures
+        if texture.texture_type and texture.texture_path
+    }
+
+    def first(roles: tuple[str, ...]) -> str:
+        return next(
+            (by_name[role.casefold()] for role in roles if role.casefold() in by_name),
+            "",
+        )
+
+    return {
+        role: path
+        for role, path in (
+            (WOTS_NRRO_TEXTURE, first(WOTS_NRRO_ROLES)),
+            (WOTS_NORMAL_TEXTURE, first(WOTS_NORMAL_ROLES)),
+            (WOTS_RCTO_TEXTURE, first(WOTS_RCTO_ROLES)),
+            (WOTS_ALPHA_TEXTURE, first(WOTS_ALPHA_ROLES)),
+        )
+        if path
+    }
+
+
+def wots_material_parameters(
+    surface: _SurfaceProfile | None,
+) -> dict[str, float | bool]:
+    """Extract the verified common WOTS character-material controls."""
+
+    if not is_wots_surface(surface):
+        return {"wots_material": False}
+    values = {
+        str(name).casefold(): tuple(float(value) for value in components)
+        for name, components in getattr(surface, "parameters", {}).items()
+        if components
+    }
+
+    def scalar(name: str, default: float) -> float:
+        components = values.get(name.casefold())
+        return float(components[0]) if components else float(default)
+
+    return {
+        "wots_material": True,
+        "roughness_scale": scalar("RoughnessScale", 1.0),
+        "occlusion_scale": scalar("OcclusionScale", 1.0),
+        "alpha_adjust": scalar("AlphaAdjust", 1.0),
+        "alpha_threshold": scalar("AlphaTestThreshold", 0.5),
+        "alpha_test": scalar("IsAlphaTest", 0.0) >= 0.5,
     }
 
 

@@ -41,5 +41,6 @@ def rig_from_motion_skeleton(motion: Motion, *, scale: Vector3) -> Rig:
             name=joint.name,
             parent_index=parent_index,
             rest=Transform(joint.translation, joint.rotation, scale),
+            binding_key=joint.binding_hash,
         ))
     return Rig(result)

@@ -107,6 +107,7 @@ class MotionPreviewResolution:
 
 
 BaseDocumentLoader = Callable[[str], MotionListDocument | None]
+ExternalMotionLoader = Callable[[str], Motion | None]
 _MOTION_PARAMETER = re.compile(r"^(?:(No\d{2})_)?MotionID$")
 
 
@@ -186,6 +187,17 @@ class Dmc5TreeMotionReferenceStrategy:
 DMC5_TREE_MOTION_REFERENCES = Dmc5TreeMotionReferenceStrategy()
 
 
+@dataclass(frozen=True, slots=True)
+class NoTreeMotionReferenceStrategy:
+    """Format policy for MOTLIST families that do not expose MotTree slots."""
+
+    def extract(self, tree: MotTree):
+        return (), ()
+
+
+NO_TREE_MOTION_REFERENCES = NoTreeMotionReferenceStrategy()
+
+
 class MotionPreviewResolver:
     """Resolve only MOT payload relationships serialized by a MOTLIST."""
 
@@ -193,9 +205,11 @@ class MotionPreviewResolver:
         self,
         load_base: BaseDocumentLoader,
         tree_reference_strategy: TreeMotionReferenceStrategy,
+        load_external_motion: ExternalMotionLoader | None = None,
     ):
         self._load_base = load_base
         self._tree_reference_strategy = tree_reference_strategy
+        self._load_external_motion = load_external_motion
         self._diagnostics: list[MotionResolutionDiagnostic] = []
         self._effective_cache: dict[int, dict[int, PreviewMotionEntry]] = {}
 
@@ -247,6 +261,18 @@ class MotionPreviewResolver:
         result: dict[int, PreviewMotionEntry] = {}
         for slot_index, slot in enumerate(document.model.slots):
             value = slot.payload.value if slot.payload is not None else None
+            if (
+                value is None
+                and slot.slot_type == MotionSlotType.MOT
+                and slot.external_path
+                and self._load_external_motion is not None
+            ):
+                value = self._load_external_motion(slot.external_path)
+                if value is None:
+                    self._diagnostics.append(MotionResolutionDiagnostic(
+                        "missing_external_motion",
+                        f"external MOT {slot.external_path!r} for slot ID {slot.motion_id} could not be loaded",
+                    ))
             if slot.slot_type == MotionSlotType.MOT and isinstance(value, Motion):
                 result[slot.motion_id] = PreviewMotionEntry(
                     slot.motion_id,

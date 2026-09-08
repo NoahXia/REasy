@@ -6,6 +6,7 @@ __pycache__/
 settings.json
 .cache/
 myevn/
+.venv/
 .sonar/**
 tools/reasy_tex_gdeflate_helper/bin/
 tools/diff_lists.py
@@ -39,6 +40,10 @@ Thumbs.db
 
 # Local Tests
 /tests/**
+!/tests/test_wots_motion.py
+!/tests/test_gltf_export.py
+!/tests/test_wots_mesh.py
+!/tests/test_wots_stmesh.py
 !/tests/test_scn_parser.py
 !/tests/test_motbank_roundtrip.py
 !/tests/test_scn_scene_editing.py

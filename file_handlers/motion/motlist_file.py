@@ -42,6 +42,10 @@ class MotListFile:
             raise MotionWriteError("no parsed MOTLIST model is available")
         if self.codec is None:
             raise MotionWriteError("no MOTLIST format codec is selected")
+        if not self.codec.supports_writing:
+            raise MotionWriteError(
+                f"{self.codec.profile.name} MOTLIST resources are read-only"
+            )
         return self.codec.write(self._model)
 
     @property
