@@ -236,7 +236,7 @@ WOTS_PROFILE = MotionFormatProfile(
     ),
     mot_clip=CompactClipLayout(version=0, header_size=0, node_size=0, property_size=0, key_size=0),
     mot_tree=MotTreeLayout(
-        version=0,
+        version=21,
         parameter_tables=MotTreeParameterTableStrategy(
             materialized_empty_classes=frozenset(),
         ),

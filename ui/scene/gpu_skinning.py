@@ -644,15 +644,15 @@ void main() {
     float occlusion = 1.0;
     if (u_wots_material && u_has_nrro) {
         vec4 nrro = texture2D(u_nrro_texture, v_uv);
-        vec2 normalXY = nrro.rg * 2.0 - 1.0;
+        vec2 normalXY = nrro.ag * 2.0 - 1.0;
         vec3 tangentNormal = vec3(
             normalXY,
             sqrt(max(1.0 - dot(normalXY, normalXY), 0.0))
         );
         normal = mappedNormal(normalize(tangentNormal));
-        roughness = clamp(nrro.b * max(u_roughness_scale, 0.0), 0.04, 1.0);
+        roughness = clamp(nrro.r * max(u_roughness_scale, 0.0), 0.04, 1.0);
         occlusion = clamp(
-            mix(1.0, nrro.a, max(u_occlusion_scale, 0.0)),
+            mix(1.0, nrro.b, max(u_occlusion_scale, 0.0)),
             0.0,
             1.0
         );

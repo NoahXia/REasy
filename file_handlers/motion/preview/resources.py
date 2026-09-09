@@ -218,6 +218,144 @@ class MotionListResourceStore:
             self._resource_data[resource_path_key(hit[0])] = hit
         return hit
 
+    def find_bank_motion_lists(self, bank_ids: set[int]) -> dict[int, str]:
+        items = self.nearby_motion_bank_items()
+        return {bank_id: items[bank_id] for bank_id in bank_ids if bank_id in items}
+
+    def nearby_motion_list_paths(self) -> tuple[str, ...]:
+        """Return every MOTLIST registered by the nearest owning MOTBANK."""
+        return tuple(dict.fromkeys(self.nearby_motion_bank_items().values()))
+
+    def nearby_motion_bank_items(self) -> dict[int, str]:
+        """Find bank IDs and MOTLIST paths in MOTBANK files near this list.
+
+        WOTS keeps tree-only MOTLISTs beside an owning MOTBANK. Search both a
+        loose-file ancestor chain and the owning PAK's known paths so this also
+        works when the editor tab uses a virtual ``natives/stm/...`` filename.
+        """
+        from file_handlers.motbank.motbank_file import MotbankFile
+
+        result: dict[int, str] = {}
+
+        def consume(candidate_path: str, data: bytes) -> None:
+            try:
+                bank = MotbankFile()
+                bank.read(data)
+            except (OSError, ValueError) as exc:
+                self.errors.append(
+                    f"could not parse nearby MOTBANK {candidate_path!r}: {exc}"
+                )
+                return
+            for item in bank.items:
+                if not item.path:
+                    continue
+                path = normalize_resource_path(item.path)
+                if not path.casefold().startswith(
+                    ("natives/stm/", "natives/x64/")
+                ):
+                    path = f"natives/stm/{path}"
+                result.setdefault(item.bank_id, path)
+
+        local_anchors: list[Path] = []
+        anchor = Path(self.anchor_path)
+        if anchor.is_absolute() and anchor.is_file():
+            local_anchors.append(anchor)
+        elif self.resource_context is not None:
+            hit = self.resource_context.resolve(
+                self.anchor_path,
+                self.selection_parent,
+                allow_selection_dialog=False,
+            )
+            if hit is not None:
+                resolved = Path(hit[0])
+                if resolved.is_absolute() and resolved.is_file():
+                    local_anchors.append(resolved)
+
+        visited_directories: set[str] = set()
+        for local_anchor in local_anchors:
+            current = local_anchor.parent
+            while current != current.parent:
+                key = str(current).casefold()
+                if key in visited_directories:
+                    break
+                visited_directories.add(key)
+                try:
+                    candidates = sorted(
+                        item
+                        for item in current.iterdir()
+                        if item.is_file() and ".motbank." in item.name.casefold()
+                    )
+                except OSError:
+                    candidates = []
+                for candidate in candidates:
+                    try:
+                        data = candidate.read_bytes()
+                    except OSError as exc:
+                        self.errors.append(
+                            f"could not read nearby MOTBANK {str(candidate)!r}: {exc}"
+                        )
+                        continue
+                    consume(str(candidate), data)
+                if candidates and result:
+                    break
+                if current.name.casefold() == "natives":
+                    break
+                current = current.parent
+
+        context = self.resource_context
+        reader = context.pak_cached_reader if context is not None else None
+        if not result and reader is not None:
+            cached_known_paths = getattr(reader, "cached_known_paths", None)
+            try:
+                paths = tuple(
+                    cached_known_paths()
+                    if callable(cached_known_paths)
+                    else reader.cached_paths(include_unknown=False)
+                )
+            except (AttributeError, OSError, ValueError) as exc:
+                self.errors.append(f"could not enumerate MOTBANK resources: {exc}")
+                paths = ()
+            anchor_key = resource_path_key(self.anchor_path)
+            anchor_directory = anchor_key.rsplit("/", 1)[0]
+            candidates = []
+            for path in paths:
+                normalized = normalize_resource_path(path)
+                lowered = normalized.casefold()
+                if ".motbank" not in lowered:
+                    continue
+                parent = lowered.rsplit("/", 1)[0]
+                if "/" in anchor_directory and not anchor_directory.startswith(
+                    parent + "/"
+                ):
+                    continue
+                candidates.append(normalized)
+            candidates.sort(
+                key=lambda value: value.count("/"),
+                reverse=True,
+            )
+            for candidate in candidates:
+                hit = self.resource_data(candidate)
+                if hit is not None:
+                    consume(hit[0], hit[1])
+        return result
+
+    def load_skeletons(self, path: str):
+        """Read only embedded source skeletons from a related MOTLIST."""
+        scanner = getattr(self.codec, "parse_skeletons", None)
+        if scanner is None:
+            return ()
+        hit = self.resource_data(path)
+        if hit is None:
+            return ()
+        resolved_path, data = hit
+        try:
+            return tuple(scanner(data, label=resolved_path))
+        except (OSError, ValueError) as exc:
+            self.errors.append(
+                f"could not scan related MOTLIST skeletons {resolved_path!r}: {exc}"
+            )
+            return ()
+
     def _filesystem_hit(self, path: str) -> tuple[str, bytes] | None:
         requested = Path(path)
         candidates = [requested] if requested.is_absolute() else []

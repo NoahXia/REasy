@@ -134,3 +134,7 @@ class Motion:
     character_path: str | None = None
     sync_points: list[SyncPointGrid] = field(default_factory=list)
     append: MotionAppend | None = None
+    # Some modern MOTs omit their source skeleton and only retain the size of
+    # the shared joint map. Preview resolution uses this to select a compatible
+    # skeleton from another MOTLIST in the same MOTBANK.
+    source_joint_count: int | None = None

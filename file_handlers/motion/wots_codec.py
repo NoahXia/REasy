@@ -9,6 +9,7 @@ from .binary import ReadContext
 from .errors import MotionParseError, MotionWriteError
 from .mot.model import AnimationNode, Joint, KeyTrack, Motion, Skeleton, TrackFamily
 from .mot_list.model import EmbeddedPayload, MotList, MotionSlot, MotionSlotType
+from .mot_tree.wots_parser import WotsMotTreeV21Parser
 from .profiles import WOTS_PROFILE
 
 
@@ -212,6 +213,7 @@ class WotsMotParser:
             raw_end_frame=raw_end,
             skeleton=skeleton,
             animation_nodes=nodes,
+            source_joint_count=joint_count,
         )
 
     @staticmethod
@@ -648,6 +650,7 @@ class WotsMotListParser:
         boundaries = nonzero[1:] + [ids_offset]
         ends = dict(zip(nonzero, boundaries))
         parser = WotsMotParser(c)
+        tree_parser = WotsMotTreeV21Parser()
         skeletons_by_count: dict[int, Skeleton] = {}
         for pointer in nonzero:
             if c.bytes(pointer + 4, 4, "MOTLIST payload magic") != b"mot ":
@@ -678,10 +681,15 @@ class WotsMotListParser:
                     ).lstrip("/")
                 elif magic == b"mtre":
                     slot_type = MotionSlotType.MOT_TREE
-                    diagnostics.append(
-                        f"MOTLIST slot ID {motion_id} contains unsupported MotTree "
-                        f"v{version} at 0x{pointer:X}; state-machine playback is not enabled."
-                    )
+                    if version != tree_parser.VERSION:
+                        raise MotionParseError(
+                            f"{label}: unsupported MotTree v{version} at 0x{pointer:X}"
+                        )
+                    if pointer not in cache:
+                        cache[pointer] = EmbeddedPayload(
+                            tree_parser.parse(c, pointer, ends[pointer])
+                        )
+                    payload = cache[pointer]
                 elif magic != b"mot ":
                     raise MotionParseError(
                         f"{label}: unsupported payload {magic!r} v{version} at 0x{pointer:X}"
@@ -727,6 +735,36 @@ class WotsMotionFormatCodec:
     def parse_mot(self, data, *, label: str = "MOT") -> Motion:
         c = ReadContext.from_bytes(data, label=label)
         return WotsMotParser(c).parse(0, len(c.data))
+
+    def parse_skeletons(self, data, *, label: str = "MOTLIST") -> tuple[Skeleton, ...]:
+        """Scan a v1036 list for embedded skeleton owners without decoding tracks."""
+        c = ReadContext.from_bytes(data, label=label)
+        c.require(0, WotsMotListParser.HEADER_SIZE, "MOTLIST header")
+        if c.u32(0) != self.profile.motlist.version or c.bytes(4, 4) != b"mlst":
+            raise MotionParseError(f"{label}: expected MOTLIST v1036 magic 'mlst'")
+        pointers_offset = c.u64(0x10, "MOTLIST pointer table")
+        ids_offset = c.u64(0x18, "MOTLIST motion-ID table")
+        count = c.u32(0x38, "MOTLIST entry count")
+        if count > len(c.data) // 8:
+            raise MotionParseError(f"{label}: impossible MOTLIST entry count {count}")
+        c.require(pointers_offset, count * 8, "MOTLIST pointer table")
+        pointers = sorted(
+            {
+                c.u64(pointers_offset + index * 8, f"MOTLIST pointer[{index}]")
+                for index in range(count)
+            }
+            - {0}
+        )
+        boundaries = pointers[1:] + [ids_offset]
+        parser = WotsMotParser(c)
+        result = []
+        for pointer, physical_end in zip(pointers, boundaries):
+            if c.bytes(pointer + 4, 4, "MOTLIST payload magic") != b"mot ":
+                continue
+            skeleton = parser.parse_skeleton(pointer, physical_end)
+            if skeleton is not None:
+                result.append(skeleton)
+        return tuple(result)
 
     def write(self, model: MotList) -> bytes:
         raise MotionWriteError("WOTS MOTLIST v1036 is read-only")

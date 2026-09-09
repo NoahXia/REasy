@@ -188,6 +188,14 @@ DMC5_TREE_MOTION_REFERENCES = Dmc5TreeMotionReferenceStrategy()
 
 
 @dataclass(frozen=True, slots=True)
+class WotsTreeMotionReferenceStrategy(Dmc5TreeMotionReferenceStrategy):
+    """WOTS v21 trees expose the same named BankID/MotionID pairs as v4."""
+
+
+WOTS_TREE_MOTION_REFERENCES = WotsTreeMotionReferenceStrategy()
+
+
+@dataclass(frozen=True, slots=True)
 class NoTreeMotionReferenceStrategy:
     """Format policy for MOTLIST families that do not expose MotTree slots."""
 

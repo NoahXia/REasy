@@ -105,6 +105,7 @@ void main()
 class MeshViewer(QWidget):
     modified_changed = Signal(bool)
     VERTEX_COLORS_SETTINGS_KEY = "mesh_viewer_use_vertex_colors"
+    AUXILIARY_GROUPS_SETTINGS_KEY = "mesh_viewer_include_auxiliary_groups"
 
     def __init__(self, handler):
         super().__init__()
@@ -125,6 +126,9 @@ class MeshViewer(QWidget):
                     self._settings_store(),
                     use_vertex_colors=self._setting_bool(
                         self.VERTEX_COLORS_SETTINGS_KEY
+                    ),
+                    include_auxiliary_groups=self._setting_bool(
+                        self.AUXILIARY_GROUPS_SETTINGS_KEY
                     ),
                 )
                 self.gl_widget.texture_quality_changed.connect(
@@ -167,6 +171,17 @@ class MeshViewer(QWidget):
         )
         self.vertex_colors_check.toggled.connect(self._on_vertex_colors_toggled)
         top.addWidget(self.vertex_colors_check)
+        self.auxiliary_groups_check = QCheckBox(self.tr("Auxiliary groups"))
+        self.auxiliary_groups_check.setToolTip(
+            self.tr("Show runtime helper/replacement mesh groups")
+        )
+        self.auxiliary_groups_check.setChecked(
+            self._setting_bool(self.AUXILIARY_GROUPS_SETTINGS_KEY)
+        )
+        self.auxiliary_groups_check.toggled.connect(
+            self._on_auxiliary_groups_toggled
+        )
+        top.addWidget(self.auxiliary_groups_check)
         self.export_gltf_btn = QPushButton(self.tr("Export glTF…"))
         self.export_gltf_btn.clicked.connect(self._export_gltf)
         top.addWidget(self.export_gltf_btn)
@@ -249,6 +264,7 @@ class MeshViewer(QWidget):
                 rig=rig,
                 material_handler=self.handler,
                 resolved_mdf=self._material_session.resolved_mdf,
+                include_auxiliary_groups=self.auxiliary_groups_check.isChecked(),
             )
             QMessageBox.information(
                 self,
@@ -280,6 +296,11 @@ class MeshViewer(QWidget):
         self._save_bool_setting(self.VERTEX_COLORS_SETTINGS_KEY, checked)
         if self.gl_widget:
             self.gl_widget.set_vertex_colors_enabled(checked)
+
+    def _on_auxiliary_groups_toggled(self, checked: bool):
+        self._save_bool_setting(self.AUXILIARY_GROUPS_SETTINGS_KEY, checked)
+        if self.gl_widget is not None:
+            self.gl_widget.set_auxiliary_groups_enabled(checked)
 
     def _reload_materials(self):
         self._material_session.reload()
@@ -381,9 +402,15 @@ class MeshViewer(QWidget):
 
 class _MeshGLWidget(ScenePreviewWidget):
     def __init__(
-        self, mesh, settings: dict | None = None, *, use_vertex_colors: bool = False
+        self,
+        mesh,
+        settings: dict | None = None,
+        *,
+        use_vertex_colors: bool = False,
+        include_auxiliary_groups: bool = False,
     ):
         self.mesh = mesh
+        self._include_auxiliary_groups = bool(include_auxiliary_groups)
         self._bone_label_texture_id = None
         self._bone_label_centers_vbo = None
         self._bone_label_offsets_vbo = None
@@ -400,7 +427,13 @@ class _MeshGLWidget(ScenePreviewWidget):
             background=(0.1, 0.1, 0.1, 1.0),
         )
         self.set_vertex_colors_enabled(use_vertex_colors, refresh=False)
-        self.set_scene(build_mesh_scene(mesh, key="mesh"))
+        self.set_scene(
+            build_mesh_scene(
+                mesh,
+                key="mesh",
+                include_auxiliary_groups=self._include_auxiliary_groups,
+            )
+        )
         self._bone_labels, self._bone_points = self._build_bone_label_points()
         self._bone_label_atlas, bone_label_rects = self._build_bone_label_atlas()
         (
@@ -418,6 +451,19 @@ class _MeshGLWidget(ScenePreviewWidget):
         self._colors_dirty = True
         if refresh:
             self.update()
+
+    def set_auxiliary_groups_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._include_auxiliary_groups:
+            return
+        self._include_auxiliary_groups = enabled
+        self.set_scene(
+            build_mesh_scene(
+                self.mesh,
+                key="mesh",
+                include_auxiliary_groups=enabled,
+            )
+        )
 
     def _build_bone_label_points(self) -> tuple[list[str], np.ndarray]:
         joint_count = int(getattr(self.mesh, "joint_count", 0) or 0)

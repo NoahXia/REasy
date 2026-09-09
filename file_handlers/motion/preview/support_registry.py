@@ -7,7 +7,7 @@ from ..format_codec import MotionFormatCodec
 from ..wots_codec import WOTS_MOTION_FORMAT_CODEC
 from ..runtime.dmc5 import DMC5_ENTITY_MOTION_BACKEND
 from .catalog_reader import Dmc5MotionListCatalogReader
-from .resolution import DMC5_TREE_MOTION_REFERENCES, NO_TREE_MOTION_REFERENCES
+from .resolution import DMC5_TREE_MOTION_REFERENCES, WOTS_TREE_MOTION_REFERENCES
 from .support import EntityMotionSupport
 
 
@@ -22,7 +22,7 @@ DMC5_ENTITY_MOTION_SUPPORT = EntityMotionSupport(
 WOTS_MOTION_SUPPORT = EntityMotionSupport(
     format_codec=WOTS_MOTION_FORMAT_CODEC,
     evaluation=WOTS_EVALUATION_PROFILE,
-    tree_references=NO_TREE_MOTION_REFERENCES,
+    tree_references=WOTS_TREE_MOTION_REFERENCES,
     backend=None,
 )
 

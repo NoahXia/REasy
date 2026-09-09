@@ -6,9 +6,11 @@ from enum import IntEnum
 
 class TreeParameterType(IntEnum):
     BOOL = 0
+    I32 = 5
     U32 = 6
     F32 = 9
     STR16 = 12
+    OPAQUE = 13
 
 
 class TreeNodeType(IntEnum):

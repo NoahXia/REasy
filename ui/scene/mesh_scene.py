@@ -8,6 +8,17 @@ import numpy as np
 from .scene_model import SceneDrawBatch, SceneDrawMesh
 
 
+# WOTS group 250 is a runtime helper/replacement surface. Drawing it together
+# with the normal costume groups duplicates the body with the wrong material.
+# Keep it in the parsed MESH, but hide it from normal preview/export.
+WOTS_AUXILIARY_MESH_GROUP_IDS = frozenset({250})
+
+
+def _is_wots_1010_mesh(mesh) -> bool:
+    version = getattr(getattr(mesh, "header", None), "format_version", None)
+    return getattr(version, "name", "") == "ONIMUSHA_WOTS_1010"
+
+
 @dataclass(frozen=True, slots=True)
 class MeshScenePayload:
     buffer_index: int
@@ -16,17 +27,38 @@ class MeshScenePayload:
     vertex_base: int
 
 
-def mesh_lod0_submeshes(mesh) -> list[object]:
-    return [submesh for _part, submesh in mesh_lod0_parts(mesh)]
+def mesh_lod0_submeshes(
+    mesh,
+    *,
+    include_auxiliary_groups: bool = False,
+) -> list[object]:
+    return [
+        submesh
+        for _part, submesh in mesh_lod0_parts(
+            mesh,
+            include_auxiliary_groups=include_auxiliary_groups,
+        )
+    ]
 
 
-def mesh_lod0_parts(mesh) -> list[tuple[int, object]]:
+def mesh_lod0_parts(
+    mesh,
+    *,
+    include_auxiliary_groups: bool = False,
+) -> list[tuple[int, object]]:
     parts = []
+    hidden = (
+        WOTS_AUXILIARY_MESH_GROUP_IDS
+        if _is_wots_1010_mesh(mesh) and not include_auxiliary_groups
+        else ()
+    )
     for mesh_data in mesh.meshes:
         if not mesh_data.lods:
             continue
         for group_index, group in enumerate(mesh_data.lods[0].mesh_groups):
             part_index = int(getattr(group, "group_id", group_index))
+            if part_index in hidden:
+                continue
             parts.extend((part_index, submesh) for submesh in group.submeshes)
     return parts
 
@@ -108,6 +140,7 @@ def build_mesh_scene(
     force_solid: bool = False,
     ignore_highlight_filter: bool = False,
     include_vertex_colors: bool = True,
+    include_auxiliary_groups: bool = False,
     material_key: Callable[[str], str] | None = None,
 ) -> list[SceneDrawMesh]:
     mesh_buffer = getattr(mesh, "mesh_buffer", None)
@@ -115,7 +148,10 @@ def build_mesh_scene(
         return []
 
     payloads = mesh_buffer.buffer_payloads
-    parts = mesh_lod0_parts(mesh)
+    parts = mesh_lod0_parts(
+        mesh,
+        include_auxiliary_groups=include_auxiliary_groups,
+    )
     submeshes = [submesh for _part, submesh in parts]
     if not payloads or not submeshes:
         return []

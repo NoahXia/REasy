@@ -9,7 +9,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ui.scene.mesh_scene import build_mesh_scene, mesh_scene_payloads
+from ui.scene.mesh_scene import (
+    build_mesh_scene,
+    mesh_lod0_submeshes,
+    mesh_scene_payloads,
+)
 
 
 _COMPONENT = {
@@ -40,6 +44,8 @@ class GltfMaterialAsset:
     base_color: GltfTextureImage | None = None
     normal: GltfTextureImage | None = None
     orm: GltfTextureImage | None = None
+    wots_textures: dict[str, GltfTextureImage] = field(default_factory=dict)
+    unreal_master_material: str = ""
     extras: dict = field(default_factory=dict)
 
 
@@ -163,100 +169,20 @@ def _decoded_texture(handler, texture_path: str, cache: dict):
     return result
 
 
-def _rgba_array(image: GltfTextureImage) -> np.ndarray:
-    return np.frombuffer(image.rgba, dtype=np.uint8).reshape(
-        image.height, image.width, 4
-    )
+_WOTS_UNREAL_MATERIAL_ROOT = "/Game/Prototype/Demo/Onimusha/Materials"
 
 
-def _copy_image(image: GltfTextureImage, rgba: np.ndarray) -> GltfTextureImage:
-    return GltfTextureImage(
-        image.width,
-        image.height,
-        np.ascontiguousarray(rgba, dtype=np.uint8).tobytes(),
-        image.source_path,
-    )
-
-
-def _combine_base_alpha(
-    base: GltfTextureImage | None,
-    alpha: GltfTextureImage | None,
-    alpha_adjust: float,
-) -> GltfTextureImage | None:
-    if base is None:
-        if alpha is None:
-            return None
-        rgba = np.full((alpha.height, alpha.width, 4), 255, dtype=np.uint8)
-        source = alpha
+def _wots_unreal_master(material_name: str, mmtr_path: str, alpha_test: bool) -> str:
+    identity = f"{material_name} {mmtr_path}".casefold()
+    if any(token in identity for token in ("hair", "beard", "eyelash", "brow")):
+        name = "M_WOTS_Hair"
+    elif any(token in identity for token in ("skin", "face")):
+        name = "M_WOTS_Skin"
+    elif alpha_test:
+        name = "M_WOTS_Masked"
     else:
-        rgba = _rgba_array(base).copy()
-        source = base
-    if alpha is not None:
-        mask = _rgba_array(alpha)[:, :, 0]
-        if (alpha.width, alpha.height) != (source.width, source.height):
-            y = np.minimum(
-                np.arange(source.height, dtype=np.int64) * alpha.height
-                // source.height,
-                alpha.height - 1,
-            )
-            x = np.minimum(
-                np.arange(source.width, dtype=np.int64) * alpha.width
-                // source.width,
-                alpha.width - 1,
-            )
-            mask = mask[y[:, None], x[None, :]]
-        mask = mask.astype(np.float32) / 255.0
-        rgba[:, :, 3] = np.rint(
-            np.power(np.clip(mask, 0.0, 1.0), max(float(alpha_adjust), 0.0001))
-            * 255.0
-        ).astype(np.uint8)
-    return _copy_image(source, rgba)
-
-
-def _normal_from_packed(image: GltfTextureImage) -> GltfTextureImage:
-    source = _rgba_array(image)
-    # WOTS NRRO follows RE Engine's DXT5nm-style packing: tangent-space X is
-    # stored in alpha and Y in green. Red and blue are material channels, so
-    # treating RG as XY biases the exported normal map toward magenta.
-    xy_u8 = source[:, :, (3, 1)]
-    xy = xy_u8.astype(np.float32) / 127.5 - 1.0
-    z = np.sqrt(np.maximum(1.0 - np.sum(xy * xy, axis=2), 0.0))
-    rgba = np.full_like(source, 255)
-    rgba[:, :, :2] = xy_u8
-    rgba[:, :, 2] = np.rint((z * 0.5 + 0.5) * 255.0).astype(np.uint8)
-    return _copy_image(image, rgba)
-
-
-def _orm_from_wots(
-    nrro: GltfTextureImage | None,
-    rcto: GltfTextureImage | None,
-    roughness_scale: float,
-    occlusion_scale: float,
-) -> GltfTextureImage | None:
-    source = rcto or nrro
-    if source is None:
-        return None
-    packed = _rgba_array(source)
-    # RCTO is R=roughness, A=occlusion. NRRO keeps the two normal components
-    # in A/G, leaving R=roughness and B=occlusion.
-    roughness = packed[:, :, 0]
-    occlusion = packed[:, :, 3] if rcto is not None else packed[:, :, 2]
-    roughness = np.clip(
-        roughness.astype(np.float32) * max(float(roughness_scale), 0.0),
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    occlusion = np.clip(
-        255.0 + (occlusion.astype(np.float32) - 255.0)
-        * max(float(occlusion_scale), 0.0),
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    rgba = np.full_like(packed, 255)
-    rgba[:, :, 0] = occlusion
-    rgba[:, :, 1] = roughness
-    rgba[:, :, 2] = 0
-    return _copy_image(source, rgba)
+        name = "M_WOTS_Surface"
+    return f"{_WOTS_UNREAL_MATERIAL_ROOT}/{name}"
 
 
 def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterialAsset]:
@@ -288,7 +214,7 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
         nrro = _decoded_texture(
             handler, role_paths.get(WOTS_NRRO_TEXTURE, ""), texture_cache
         )
-        normal_source = nrro or _decoded_texture(
+        normal_source = _decoded_texture(
             handler, role_paths.get(WOTS_NORMAL_TEXTURE, ""), texture_cache
         )
         rcto = _decoded_texture(
@@ -323,17 +249,49 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
         }
         if missing:
             reasy_extras["missingTextures"] = missing
+        raw_textures = {
+            role: image
+            for role, image in (
+                ("BaseColorTexture", base),
+                ("NRROTexture", nrro),
+                ("NormalTexture", normal_source),
+                ("RCTOTexture", rcto),
+                ("AlphaTexture", alpha),
+            )
+            if image is not None
+        }
+        unreal_master = _wots_unreal_master(
+            name,
+            surface.mmtr_path,
+            alpha_test,
+        )
+        reasy_extras["unreal"] = {
+            "masterMaterial": unreal_master,
+            "textureEncoding": "WOTS_RAW_RGBA",
+            "textureParameters": tuple(raw_textures),
+            "scalarParameters": {
+                "RoughnessScale": roughness_scale,
+                "OcclusionScale": occlusion_scale,
+                "AlphaAdjust": alpha_adjust,
+            },
+            "staticSwitchParameters": {
+                "UseRCTO": rcto is not None,
+                "UseStandaloneNormal": normal_source is not None and nrro is None,
+            },
+            "vectorParameters": {
+                "BaseColorTint": list(surface.tint),
+            },
+        }
         result[name] = GltfMaterialAsset(
             name=name,
             base_color_factor=tuple(float(value) for value in surface.tint),
-            roughness_factor=(1.0 if nrro is not None or rcto is not None else roughness_scale),
+            roughness_factor=1.0,
             metallic_factor=0.0,
             double_sided=bool(surface.two_sided),
             alpha_mode=("MASK" if alpha_test else ("BLEND" if alpha is not None else "OPAQUE")),
             alpha_cutoff=float(parameters.get("alpha_threshold", 0.5)),
-            base_color=_combine_base_alpha(base, alpha, alpha_adjust),
-            normal=(_normal_from_packed(nrro) if nrro is not None else normal_source),
-            orm=_orm_from_wots(nrro, rcto, roughness_scale, occlusion_scale),
+            wots_textures=raw_textures,
+            unreal_master_material=unreal_master,
             extras={"REasy": reasy_extras},
         )
     return result
@@ -343,8 +301,8 @@ def _converted_trs(transform):
     tx, ty, tz = transform.translation
     qx, qy, qz, qw = transform.rotation
     return (
-        [float(tx), float(ty), float(-tz)],
-        [float(-qx), float(-qy), float(qz), float(qw)],
+        [float(tx), float(ty), float(tz)],
+        [float(qx), float(qy), float(qz), float(qw)],
         [float(value) for value in transform.scale],
     )
 
@@ -356,7 +314,6 @@ def _inverse_bind_matrices(rig) -> np.ndarray:
         tuple(joint.rest for joint in rig.joints),
         tuple(joint.parent_index for joint in rig.joints),
     )
-    reflection = np.diag([1.0, 1.0, -1.0, 1.0])
     matrices = []
     for index, joint in enumerate(rig.joints):
         if joint.inverse_bind_matrix is None:
@@ -367,20 +324,29 @@ def _inverse_bind_matrices(rig) -> np.ndarray:
             inverse_row = np.asarray(
                 joint.inverse_bind_matrix, dtype=np.float64
             ).reshape(4, 4)
-        inverse_column = inverse_row.T
-        converted = reflection @ inverse_column @ reflection
-        # glTF MAT4 payloads are column-major.
-        matrices.append(converted.T.astype(np.float32).reshape(16))
+        # RE Engine's WOTS matrices are stored row-major. glTF MAT4 payloads
+        # are column-major, so the same flat values represent the transposed
+        # mathematical matrix without an additional axis reflection.
+        matrices.append(inverse_row.astype(np.float32).reshape(16))
     return np.asarray(matrices, dtype=np.float32)
 
 
-def _mesh_skin(mesh, vertex_count: int):
+def _mesh_skin(
+    mesh,
+    vertex_count: int,
+    *,
+    include_auxiliary_groups: bool = False,
+):
     remap = np.asarray(mesh.bone_remap_indices, dtype=np.int64)
     if not len(remap):
         return None
     influences = []
     weights = []
-    for record in mesh_scene_payloads(mesh):
+    submeshes = mesh_lod0_submeshes(
+        mesh,
+        include_auxiliary_groups=include_auxiliary_groups,
+    )
+    for record in mesh_scene_payloads(mesh, submeshes):
         streams = [
             stream
             for stream in (
@@ -468,7 +434,26 @@ def _material_document(
         "roughnessFactor": float(asset.roughness_factor),
     }
     result = {"name": asset.name, "pbrMetallicRoughness": pbr}
-    if asset.base_color is not None:
+    extras = dict(asset.extras)
+    if asset.wots_textures:
+        texture_indices = {}
+        for parameter_name, image in asset.wots_textures.items():
+            texture_indices[parameter_name] = _add_texture(
+                document,
+                builder,
+                image,
+                f"{asset.name}_{parameter_name}",
+            )
+        base_index = texture_indices.get("BaseColorTexture")
+        if base_index is not None:
+            pbr["baseColorTexture"] = {"index": base_index}
+        reasy = dict(extras.get("REasy", {}))
+        unreal = dict(reasy.get("unreal", {}))
+        unreal["masterMaterial"] = asset.unreal_master_material
+        unreal["textureIndices"] = texture_indices
+        reasy["unreal"] = unreal
+        extras["REasy"] = reasy
+    elif asset.base_color is not None:
         index = _add_texture(document, builder, asset.base_color, f"{asset.name}_BaseColor")
         pbr["baseColorTexture"] = {"index": index}
     if asset.normal is not None:
@@ -484,12 +469,92 @@ def _material_document(
         result["alphaMode"] = asset.alpha_mode
         if asset.alpha_mode == "MASK":
             result["alphaCutoff"] = float(asset.alpha_cutoff)
-    if asset.extras:
-        result["extras"] = asset.extras
+    if extras:
+        result["extras"] = extras
     return result
 
 
-def _base_document(mesh=None, rig=None, material_assets=None):
+def _safe_export_name(value: str) -> str:
+    cleaned = "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in str(value)
+    ).strip("._")
+    return cleaned or "material"
+
+
+def _write_wots_unreal_bundle(
+    gltf_path: Path,
+    material_assets: dict[str, GltfMaterialAsset] | None,
+) -> Path | None:
+    assets = material_assets or {}
+    if not any(asset.wots_textures for asset in assets.values()):
+        return None
+
+    texture_dir = gltf_path.with_name(f"{gltf_path.stem}_wots_textures")
+    texture_dir.mkdir(parents=True, exist_ok=True)
+    materials = []
+    for material_name, asset in assets.items():
+        if not asset.wots_textures:
+            continue
+        texture_files = {}
+        for parameter_name, image in asset.wots_textures.items():
+            filename = (
+                f"{_safe_export_name(material_name)}__"
+                f"{_safe_export_name(parameter_name)}.png"
+            )
+            (texture_dir / filename).write_bytes(_encode_png(image))
+            texture_files[parameter_name] = {
+                "file": f"{texture_dir.name}/{filename}",
+                "source": image.source_path,
+                "sRGB": parameter_name == "BaseColorTexture",
+                "compression": (
+                    "TC_Default"
+                    if parameter_name == "BaseColorTexture"
+                    else "TC_Masks"
+                ),
+                "flipGreenChannel": False,
+            }
+        reasy = asset.extras.get("REasy", {})
+        unreal = reasy.get("unreal", {})
+        materials.append(
+            {
+                "name": material_name,
+                "masterMaterial": asset.unreal_master_material,
+                "textures": texture_files,
+                "scalarParameters": unreal.get("scalarParameters", {}),
+                "staticSwitchParameters": unreal.get(
+                    "staticSwitchParameters", {}
+                ),
+                "vectorParameters": unreal.get("vectorParameters", {}),
+                "alphaMode": asset.alpha_mode,
+                "alphaCutoff": asset.alpha_cutoff,
+                "doubleSided": asset.double_sided,
+            }
+        )
+
+    manifest_path = gltf_path.with_name(f"{gltf_path.stem}.wots-materials.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "REasy.WOTS.UnrealMaterials/1",
+                "model": gltf_path.name,
+                "materials": materials,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _base_document(
+    mesh=None,
+    rig=None,
+    material_assets=None,
+    *,
+    include_auxiliary_groups: bool = False,
+):
     builder = _GltfBuilder()
     document = {
         "asset": {"version": "2.0", "generator": "REasy WOTS exporter"},
@@ -524,18 +589,20 @@ def _base_document(mesh=None, rig=None, material_assets=None):
                 ).append(joint_nodes[index])
 
     if mesh is not None:
-        scenes = build_mesh_scene(mesh, key="export")
+        scenes = build_mesh_scene(
+            mesh,
+            key="export",
+            include_auxiliary_groups=include_auxiliary_groups,
+        )
         if not scenes:
             raise ValueError("mesh has no LOD0 geometry")
         scene = scenes[0]
         positions = np.asarray(scene.vertices, dtype=np.float32).copy()
-        positions[:, 2] *= -1
         attributes = {
             "POSITION": builder.accessor(positions, "VEC3", target=34962, bounds=True)
         }
         if scene.normals is not None:
             normals = np.asarray(scene.normals, dtype=np.float32).copy()
-            normals[:, 2] *= -1
             attributes["NORMAL"] = builder.accessor(normals, "VEC3", target=34962)
         if scene.uvs is not None:
             attributes["TEXCOORD_0"] = builder.accessor(
@@ -550,7 +617,11 @@ def _base_document(mesh=None, rig=None, material_assets=None):
                 target=34962,
             )
         if rig is not None and mesh.joint_count:
-            skin = _mesh_skin(mesh, len(positions))
+            skin = _mesh_skin(
+                mesh,
+                len(positions),
+                include_auxiliary_groups=include_auxiliary_groups,
+            )
             if skin is not None:
                 joints, weights = skin
                 attributes["JOINTS_0"] = builder.accessor(
@@ -575,16 +646,16 @@ def _base_document(mesh=None, rig=None, material_assets=None):
         material_indices = {}
         primitives = []
         for batch in scene.batches:
-            indices = (
-                np.asarray(batch.indices, dtype=np.uint32)
-                .reshape(-1, 3)[:, [0, 2, 1]]
-                .reshape(-1)
-            )
+            indices = np.asarray(batch.indices, dtype=np.uint32)
             primitive = {
                 "attributes": attributes,
                 "indices": builder.accessor(indices, "SCALAR", target=34963),
                 "mode": 4,
             }
+            if batch.part_index is not None:
+                primitive["extras"] = {
+                    "REasy": {"meshGroupId": int(batch.part_index)}
+                }
             name = batch.material_name or "Material"
             if name not in material_indices:
                 material_indices[name] = len(document["materials"])
@@ -672,13 +743,19 @@ def export_gltf(
     material_handler=None,
     resolved_mdf=None,
     material_assets: dict[str, GltfMaterialAsset] | None = None,
+    include_auxiliary_groups: bool = False,
 ) -> Path:
     path = Path(path)
     if mesh is None and rig is None:
         raise ValueError("glTF export needs a mesh or rig")
     if material_assets is None and material_handler is not None and mesh is not None:
         material_assets = resolve_gltf_materials(material_handler, resolved_mdf)
-    document, builder, joint_nodes = _base_document(mesh, rig, material_assets)
+    document, builder, joint_nodes = _base_document(
+        mesh,
+        rig,
+        material_assets,
+        include_auxiliary_groups=include_auxiliary_groups,
+    )
     if motion is not None:
         if rig is None or evaluation_profile is None:
             raise ValueError("animation export needs a rig and evaluation profile")
@@ -707,6 +784,7 @@ def export_gltf(
         path.write_text(
             json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        _write_wots_unreal_bundle(path, material_assets)
         return path
     if path.suffix.lower() != ".glb":
         path = path.with_suffix(".glb")
@@ -722,6 +800,7 @@ def export_gltf(
     glb.extend(struct.pack("<I4s", len(binary), b"BIN\0"))
     glb.extend(binary)
     path.write_bytes(glb)
+    _write_wots_unreal_bundle(path, material_assets)
     return path
 
 

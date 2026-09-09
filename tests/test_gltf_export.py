@@ -13,11 +13,11 @@ import numpy as np
 from file_handlers.gltf_export import (
     GltfMaterialAsset,
     GltfTextureImage,
-    _combine_base_alpha,
-    _normal_from_packed,
-    _orm_from_wots,
+    _converted_trs,
+    _encode_png,
     export_gltf,
 )
+from file_handlers.mesh.mesh_file import MeshMainVersion
 from file_handlers.motion.evaluation.model import Rig, RigJoint, Transform
 from file_handlers.motion.evaluation.profiles import WOTS_EVALUATION_PROFILE
 from file_handlers.motion.evaluation.source_adapter import rig_from_motion_skeleton
@@ -63,7 +63,14 @@ class TestGltfExport(unittest.TestCase):
         )
 
     @staticmethod
-    def _triangle_mesh(payload, *, joint_count=0, remap=()):
+    def _triangle_mesh(
+        payload,
+        *,
+        joint_count=0,
+        remap=(),
+        group_id=0,
+        wots=False,
+    ):
         submesh = SimpleNamespace(
             buffer_index=0,
             verts_index_offset=0,
@@ -80,7 +87,7 @@ class TestGltfExport(unittest.TestCase):
                         SimpleNamespace(
                             mesh_groups=[
                                 SimpleNamespace(
-                                    group_id=0,
+                                    group_id=group_id,
                                     submeshes=[submesh],
                                 )
                             ]
@@ -89,6 +96,13 @@ class TestGltfExport(unittest.TestCase):
                 )
             ],
             material_names=["body"],
+            header=SimpleNamespace(
+                format_version=(
+                    MeshMainVersion.ONIMUSHA_WOTS_1010
+                    if wots
+                    else MeshMainVersion.DMC5
+                )
+            ),
             joint_count=joint_count,
             bone_remap_indices=list(remap),
         )
@@ -103,13 +117,44 @@ class TestGltfExport(unittest.TestCase):
         index_accessor = document["accessors"][primitive["indices"]]
         view = document["bufferViews"][index_accessor["bufferView"]]
         indices = struct.unpack_from("<3I", binary, view["byteOffset"])
-        self.assertEqual(indices, (0, 2, 1))
+        self.assertEqual(indices, (0, 1, 2))
         position_accessor = document["accessors"][primitive["attributes"]["POSITION"]]
         position_view = document["bufferViews"][position_accessor["bufferView"]]
-        self.assertEqual(
-            struct.unpack_from("<3f", binary, position_view["byteOffset"]),
-            (0.0, 0.0, -1.0),
+        positions = struct.unpack_from(
+            "<9f", binary, position_view["byteOffset"]
         )
+        self.assertEqual(positions[:3], (0.0, 0.0, 1.0))
+        self.assertEqual(positions[3:6], (1.0, 0.0, 1.0))
+
+    def test_coordinate_conversion_preserves_wots_handedness(self):
+        translation, rotation, scale = _converted_trs(
+            Transform(
+                translation=(2.0, 3.0, 4.0),
+                rotation=(0.1, 0.2, 0.3, 0.9),
+                scale=(1.0, 2.0, 3.0),
+            )
+        )
+        self.assertEqual(translation, [2.0, 3.0, 4.0])
+        self.assertEqual(rotation, [0.1, 0.2, 0.3, 0.9])
+        self.assertEqual(scale, [1.0, 2.0, 3.0])
+
+    def test_wots_auxiliary_group_is_hidden_by_default(self):
+        mesh = self._triangle_mesh(
+            self._triangle_payload(),
+            group_id=250,
+            wots=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "no LOD0 geometry"):
+                export_gltf(Path(directory) / "hidden.glb", mesh=mesh)
+            path = export_gltf(
+                Path(directory) / "included.glb",
+                mesh=mesh,
+                include_auxiliary_groups=True,
+            )
+            document, _ = _read_glb(path)
+        primitive = document["meshes"][0]["primitives"][0]
+        self.assertEqual(primitive["extras"]["REasy"]["meshGroupId"], 250)
 
     def test_embeds_pbr_material_textures_in_glb(self):
         mesh = self._triangle_mesh(self._triangle_payload())
@@ -152,30 +197,65 @@ class TestGltfExport(unittest.TestCase):
             start = view["byteOffset"]
             self.assertEqual(binary[start : start + 8], b"\x89PNG\r\n\x1a\n")
 
-    def test_wots_packed_texture_conversion(self):
-        base = GltfTextureImage(1, 1, bytes((20, 40, 60, 255)))
-        alpha = GltfTextureImage(1, 1, bytes((128, 0, 0, 255)))
-        combined = _combine_base_alpha(base, alpha, 1.0)
-        self.assertEqual(combined.rgba[:3], bytes((20, 40, 60)))
-        self.assertEqual(combined.rgba[3], 128)
+    def test_wots_unreal_bundle_preserves_raw_texture_channels(self):
+        mesh = self._triangle_mesh(self._triangle_payload())
+        textures = {
+            "BaseColorTexture": GltfTextureImage(
+                1, 1, bytes((10, 20, 30, 40)), "body_albd.tex"
+            ),
+            "NRROTexture": GltfTextureImage(
+                1, 1, bytes((80, 128, 200, 128)), "body_nrro.tex"
+            ),
+            "AlphaTexture": GltfTextureImage(
+                1, 1, bytes((64, 0, 0, 255)), "body_alp.tex"
+            ),
+        }
+        material = GltfMaterialAsset(
+            name="body",
+            wots_textures=textures,
+            unreal_master_material=(
+                "/Game/Prototype/Demo/Onimusha/Materials/M_WOTS_Masked"
+            ),
+            extras={
+                "REasy": {
+                    "unreal": {
+                        "scalarParameters": {"RoughnessScale": 0.75},
+                        "vectorParameters": {
+                            "BaseColorTint": [1.0, 0.5, 0.25, 1.0]
+                        },
+                    }
+                }
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = export_gltf(
+                Path(directory) / "material.glb",
+                mesh=mesh,
+                material_assets={"body": material},
+            )
+            document, _ = _read_glb(path)
+            manifest = json.loads(
+                path.with_name("material.wots-materials.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            raw_nrro = (
+                path.with_name("material_wots_textures")
+                / "body__NRROTexture.png"
+            ).read_bytes()
 
-        # WOTS NRRO: R=roughness, G=normal Y, B=occlusion, A=normal X.
-        nrro = GltfTextureImage(1, 1, bytes((80, 128, 200, 128)))
-        normal = _normal_from_packed(nrro)
-        self.assertEqual(tuple(normal.rgba), (128, 128, 255, 255))
-        orm = _orm_from_wots(nrro, None, 0.5, 1.0)
-        self.assertEqual(tuple(orm.rgba), (200, 40, 0, 255))
-
-        rcto = GltfTextureImage(1, 1, bytes((100, 20, 30, 220)))
-        rcto_orm = _orm_from_wots(None, rcto, 0.5, 1.0)
-        self.assertEqual(tuple(rcto_orm.rgba), (220, 50, 0, 255))
-
-    def test_alpha_mask_is_resampled_to_base_color_size(self):
-        base = GltfTextureImage(2, 2, bytes((10, 20, 30, 255)) * 4)
-        alpha = GltfTextureImage(1, 1, bytes((64, 0, 0, 255)))
-        combined = _combine_base_alpha(base, alpha, 1.0)
-        pixels = np.frombuffer(combined.rgba, dtype=np.uint8).reshape(-1, 4)
-        self.assertEqual(pixels[:, 3].tolist(), [64, 64, 64, 64])
+        exported = document["materials"][0]
+        self.assertNotIn("normalTexture", exported)
+        self.assertNotIn("metallicRoughnessTexture", exported["pbrMetallicRoughness"])
+        indices = exported["extras"]["REasy"]["unreal"]["textureIndices"]
+        self.assertEqual(set(indices), set(textures))
+        self.assertEqual(len(document["images"]), 3)
+        self.assertEqual(manifest["schema"], "REasy.WOTS.UnrealMaterials/1")
+        self.assertEqual(
+            manifest["materials"][0]["masterMaterial"],
+            "/Game/Prototype/Demo/Onimusha/Materials/M_WOTS_Masked",
+        )
+        self.assertEqual(raw_nrro, _encode_png(textures["NRROTexture"]))
 
     def test_skin_and_json_sidecar_export(self):
         influences = SimpleNamespace(
