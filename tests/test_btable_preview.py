@@ -6,9 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from file_handlers.rsz.btable_preview import (
+    BTableNode,
+    BTableRow,
+    BTableGraphWidget,
     BTableGraphLoader,
     _NodeItem,
     build_btable_graph,
+    build_semantic_steps,
     is_btable_document,
 )
 from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
@@ -73,6 +77,8 @@ class TestBTableGraph(unittest.TestCase):
         children = item.childItems()
         self.assertEqual(len(children), 1)
         self.assertIsInstance(children[0], QGraphicsTextItem)
+        self.assertIn("Entry", children[0].toHtml())
+        item.set_mode("raw")
         self.assertIn("OperatorJump", children[0].toHtml())
         app.processEvents()
 
@@ -86,13 +92,74 @@ class TestBTableGraph(unittest.TestCase):
         self.assertEqual(graph.edges[0].source_guid, graph.nodes[0].guid)
         self.assertEqual(graph.edges[0].target_guid, graph.nodes[1].guid)
         self.assertEqual(graph.nodes[0].rows[0].operator_name, "OperatorJump")
+        self.assertEqual(graph.nodes[0].semantic_title, "Entry")
+        self.assertEqual(graph.edges[0].label, "Next")
+
+    def test_semantic_tree_collapses_else_and_end_markers(self):
+        node = BTableNode(
+            0,
+            1,
+            "11111111-1111-1111-1111-111111111111",
+            (
+                BTableRow(0, 1, 1, "OperatorIf", 1, "TargetExistCheck"),
+                BTableRow(1, 2, 1, "OperatorNext", 1, "TargetReset"),
+                BTableRow(2, 3, 1, "OperatorElseIf", 0, "None"),
+                BTableRow(3, 4, 1, "OperatorNext", 1, "EnemyExitPatrol"),
+                BTableRow(4, 5, 1, "OperatorIfEnd", 0, "None"),
+            ),
+        )
+        labels = [step.label for step in build_semantic_steps(node, {})]
+        self.assertEqual(
+            labels,
+            ["IF Target exists", "Reset target", "ELSE", "Exit patrol"],
+        )
+        self.assertNotIn("If End", labels)
+
+    def test_known_wots_action_guid_gets_a_readable_name(self):
+        node = BTableNode(
+            0,
+            1,
+            "11111111-1111-1111-1111-111111111111",
+            (
+                BTableRow(
+                    0,
+                    1,
+                    1,
+                    "OperatorNext",
+                    1,
+                    "RequestFullBodyAction",
+                    command_argument=(
+                        "RequestFullBodyActionArg(ActionIndexBody="
+                        "Guid>(05e14c01-4b4d-4399-b213-c74f49c308aa))"
+                    ),
+                ),
+            ),
+        )
+        steps = build_semantic_steps(node, {})
+        self.assertEqual(steps[0].label, "cAlertTargetLose")
+
+    def test_widget_switches_between_behavior_and_raw_modes(self):
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        widget = BTableGraphWidget(
+            build_btable_graph(_fixture(), {10: "OperatorJump"}, {0: "None"})
+        )
+        self.assertEqual(widget._mode, "behavior")
+        self.assertEqual(widget.details.headerItem().text(0), "Table 000 · Entry")
+        widget._set_mode("raw")
+        self.assertEqual(widget.details.headerItem().text(0), "Row")
+        widget._set_mode("behavior")
+        self.assertEqual(widget.details.headerItem().text(0), "Table 000 · Entry")
+        widget.cleanup()
+        app.processEvents()
 
 
 @unittest.skipUnless(os.environ.get("REASY_WOTS_ASSET_ROOT"), "set REASY_WOTS_ASSET_ROOT")
 class TestWotsBTableAssets(unittest.TestCase):
-    def test_em100_action_graph_is_complete(self):
+    def _load_graph(self, relative_path: str):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
-        path = root / "GameDesign/Action/Enemy/em100/00/btable/em100_00_action.user.3"
+        path = root / relative_path
         registry_path = Path(__file__).resolve().parents[1] / "resources/data/dumps/rszoniwots.json"
         rsz = RszFile()
         rsz.filepath = str(path)
@@ -105,7 +172,12 @@ class TestWotsBTableAssets(unittest.TestCase):
             game_version="ONIWOTS",
             type_registry=rsz.type_registry,
         )
-        graph = BTableGraphLoader(handler).load()
+        return BTableGraphLoader(handler).load()
+
+    def test_em100_action_graph_is_complete(self):
+        graph = self._load_graph(
+            "GameDesign/Action/Enemy/em100/00/btable/em100_00_action.user.3"
+        )
         self.assertEqual(len(graph.nodes), 179)
         self.assertEqual(sum(len(node.rows) for node in graph.nodes), 1158)
         self.assertEqual(len(graph.edges), 59)
@@ -115,6 +187,32 @@ class TestWotsBTableAssets(unittest.TestCase):
         self.assertIn("OperatorJump", operator_names)
         self.assertIn("OperatorIf", operator_names)
         self.assertIn("RequestFullBodyAction", command_names)
+
+    def test_em100_alert_main_has_semantic_nodes_and_import_names(self):
+        graph = self._load_graph(
+            "GameDesign/Action/Enemy/em100/00/btable/em100_00_alrt_main.user.3"
+        )
+        self.assertEqual(
+            [node.semantic_title for node in graph.nodes],
+            [
+                "Entry",
+                "Target routing",
+                "Approach target",
+                "Patrol routing",
+                "Alert idle selector",
+                "Tour point resolver",
+            ],
+        )
+        imported_names = {
+            row.resolved_import
+            for node in graph.nodes
+            for row in node.rows
+            if row.resolved_import
+        }
+        self.assertIn("cChangeToOneHand", imported_names)
+        self.assertIn("WALK · 10 s · arrive 0.5 m", imported_names)
+        alert_steps = build_semantic_steps(graph.nodes[4], {})
+        self.assertIn("10% CHANCE", {step.label for step in alert_steps})
 
 
 if __name__ == "__main__":

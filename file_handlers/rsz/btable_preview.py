@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QBrush, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
@@ -54,6 +56,9 @@ class BTableRow:
     operator_argument: str = ""
     command_argument: str = ""
     jump_target_guid: str | None = None
+    import_source_guid: str | None = None
+    import_target_guid: str | None = None
+    resolved_import: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +67,16 @@ class BTableNode:
     instance_id: int
     guid: str
     rows: tuple[BTableRow, ...]
+    semantic_title: str = "Behavior"
+    semantic_summary: tuple[str, ...] = ()
 
     @property
     def title(self) -> str:
         return f"Table {self.index:03d}  {self.guid[:8]}"
+
+    @property
+    def display_title(self) -> str:
+        return f"Table {self.index:03d} · {self.semantic_title}"
 
     @property
     def search_text(self) -> str:
@@ -77,6 +88,7 @@ class BTableNode:
                     row.command_name,
                     row.operator_argument,
                     row.command_argument,
+                    row.resolved_import,
                 )
             )
         return " ".join(values).casefold()
@@ -87,6 +99,7 @@ class BTableEdge:
     source_guid: str
     target_guid: str
     row_index: int
+    label: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +107,349 @@ class BTableGraph:
     nodes: tuple[BTableNode, ...]
     edges: tuple[BTableEdge, ...]
     diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BTableSemanticStep:
+    row_index: int
+    depth: int
+    label: str
+    detail: str = ""
+    kind: str = "action"
+
+
+_GUID_PAIR_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"\|"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+_GUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+# Verified WOTS 1.0.1.0 action identifiers. Unknown GUIDs remain visible in Raw mode.
+WOTS_ACTION_NAMES = {
+    "4023715c-1734-4b6a-bde6-f718cdb1826e": "cChangeToOneHand",
+    "029ed6ea-d2eb-4478-9b94-1c293edde1d1": "cTurnOneHandCombat",
+    "05e14c01-4b4d-4399-b213-c74f49c308aa": "cAlertTargetLose",
+    "224a6d6d-6ea3-4bef-90fc-f842a3b7a3a1": "cSetTypeIdle_Lookout",
+    "666a1369-ffc1-4744-bb47-a56657aba7ab": "cSetTypeIdle_LookoutEnd",
+    "a69eb05a-d083-4c73-82fb-260f7d57bbed": "cSetTypeIdle_GateAttack",
+    "0ab12da0-835b-4c44-ab83-71b4d4282bd2": "cSetTypeWalkTurn",
+    "8fa169d1-76e5-4722-86f8-8450de226e16": "cWaitAndSeeMinimumMoveOneHand",
+}
+
+_MOVE_ACTION_NAMES = {1: "IDLE", 2: "WALK", 4: "RUN", 5: "DASH", 6: "MINIMUM MOVE"}
+_PERCEPTION_NAMES = {515639104: "CHARA", 789249792: "POS"}
+
+
+def _argument_number(argument: str, field_name: str) -> float | None:
+    match = re.search(
+        rf"\b{re.escape(field_name)}=[^;(]*\((-?\d+(?:\.\d+)?)\)",
+        argument,
+    )
+    return float(match.group(1)) if match else None
+
+
+def _fmt_number(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:g}"
+
+
+def _humanize(value: str) -> str:
+    value = re.sub(r"^(Operator|Request|Check|Register)", "", value or "")
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    return value.strip() or "Action"
+
+
+def _known_action(argument: str) -> str:
+    for guid in _GUID_RE.findall(argument or ""):
+        name = WOTS_ACTION_NAMES.get(guid.casefold())
+        if name:
+            return name
+    return ""
+
+
+def _condition_text(row: BTableRow) -> str:
+    command = row.command_name
+    argument = row.command_argument
+    if command == "None":
+        return "Else"
+    if command == "TargetExistCheck":
+        return "Target exists"
+    if command == "TargetCombatZoneCheck":
+        return "Inside combat zone"
+    if command == "CheckTargetNpc":
+        return "NPC target exists"
+    if command == "IsExistTourPoint":
+        return "Tour point exists"
+    if command == "IsTwoHanded":
+        return "Two-handed stance"
+    if command == "CheckXZDistance":
+        distance = _argument_number(argument, "Distance")
+        method = _argument_number(argument, "CheckMethod")
+        relation = "Farther than" if method == 1 else "Within"
+        return f"{relation} {_fmt_number(distance)} m" if distance is not None else "XZ distance check"
+    if command == "TargetDurationCheck":
+        seconds = _argument_number(argument, "CheckTimeSec")
+        return f"Target held for {_fmt_number(seconds)} s" if seconds is not None else "Target duration check"
+    if command == "TargetPerceptionCheck":
+        value = _argument_number(argument, "PerceptionType")
+        name = _PERCEPTION_NAMES.get(int(value), str(int(value))) if value is not None else "unknown"
+        return f"{name} perceived"
+    if command == "CheckEnemyIdleFormType":
+        value = _argument_number(argument, "CheckMethod")
+        return f"Idle form = COMMON_{int(value)}" if value in (1, 2, 3) else "Idle form check"
+    if command == "CheckEnemyTourFormType":
+        value = _argument_number(argument, "CheckMethod")
+        return f"Tour form = COMMON_{int(value)}" if value in (1, 2, 3) else "Tour form check"
+    if command == "CheckAngle":
+        width = _argument_number(argument, "AngleWidth")
+        return f"Angle within {_fmt_number(width)}°" if width is not None else "Angle check"
+    if command == "SetTourPoint":
+        return "Tour point found"
+    return _humanize(command)
+
+
+def _action_text(row: BTableRow, target_titles: dict[str, str] | None = None) -> str:
+    target_titles = target_titles or {}
+    if row.resolved_import:
+        return f"Call {row.resolved_import}"
+    if row.jump_target_guid:
+        target = target_titles.get(row.jump_target_guid, row.jump_target_guid[:8])
+        return f"Go to {target}"
+    action_name = _known_action(row.command_argument)
+    if action_name:
+        return action_name
+    command = row.command_name
+    argument = row.command_argument
+    if command in ("None", ""):
+        return ""
+    if command.startswith("RequestMoveAction") or command == "RequestPatrolMoveActionArrival":
+        move_value = _argument_number(argument, "MoveActionType")
+        move = _MOVE_ACTION_NAMES.get(int(move_value), "MOVE") if move_value is not None else "MOVE"
+        timeout = _argument_number(argument, "ActionTime")
+        distance = _argument_number(argument, "ArrivalDist")
+        height = _argument_number(argument, "ArrivalHeight")
+        facts = [move]
+        if timeout is not None:
+            facts.append(f"{_fmt_number(timeout)} s")
+        if distance is not None:
+            facts.append(f"arrive {_fmt_number(distance)} m")
+        if height is not None:
+            facts.append(f"height {_fmt_number(height)} m")
+        return " · ".join(facts)
+    aliases = {
+        "TargetReset": "Reset target",
+        "EnemyExitPatrol": "Exit patrol",
+        "SetTargetNpc": "Set NPC target",
+        "SetTargetStartDir": "Use start direction",
+        "RegisterMoveActionSetting": "Configure move target",
+        "RegisterComboBreak": "Enable combo break",
+    }
+    return aliases.get(command, _humanize(command))
+
+
+def _node_role(node: BTableNode) -> str:
+    commands = {row.command_name for row in node.rows}
+    operators = {row.operator_name for row in node.rows}
+    if node.index == 0 and len(node.rows) <= 3 and "OperatorJump" in operators:
+        return "Entry"
+    if {"TargetExistCheck", "TargetCombatZoneCheck"} <= commands:
+        return "Target routing"
+    if {"TargetPerceptionCheck", "TargetDurationCheck"} <= commands:
+        return "Approach target"
+    if {"CheckTargetNpc", "CheckEnemyTourFormType"} <= commands:
+        return "Patrol routing"
+    if "CheckEnemyIdleFormType" in commands and any("Random" in name for name in operators):
+        return "Alert idle selector"
+    if {"IsExistTourPoint", "SetTourPoint"} <= commands:
+        return "Tour point resolver"
+    meaningful = next((row.command_name for row in node.rows if row.command_name not in ("", "None")), "")
+    return _humanize(meaningful) if meaningful else "Behavior"
+
+
+def _unique(values) -> list[str]:
+    result = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _node_summary(node: BTableNode, target_titles: dict[str, str]) -> tuple[str, ...]:
+    role_summaries = {
+        "Entry": ("Enter the local behavior flow",),
+        "Target routing": (
+            "Weapon state · target existence · combat zone",
+            "Route to approach, patrol, or alert idle",
+        ),
+        "Approach target": (
+            "5 m range · CHARA/POS perception · 2 s hold",
+            "RUN/WALK arrival or reset target",
+        ),
+        "Patrol routing": ("NPC · distance · tour form", "Follow, resolve a tour point, or idle"),
+        "Alert idle selector": ("Facing · weighted random · idle form", "10 / 20 / 70 and 10 / 90 branches"),
+        "Tour point resolver": ("Find point · angle · patrol arrival", "180 s timeout · 1 m arrival"),
+    }
+    if node.semantic_title in role_summaries:
+        return role_summaries[node.semantic_title]
+    conditions = _unique(
+        _condition_text(row)
+        for row in node.rows
+        if row.operator_name in ("OperatorIf", "OperatorORIf") and row.command_name != "None"
+    )
+    actions = _unique(
+        _action_text(row, target_titles)
+        for row in node.rows
+        if row.operator_name in ("OperatorNext", "OperatorJump", "OperatorJumpToImportBTable")
+    )
+    lines = []
+    if conditions:
+        lines.append("Checks: " + " · ".join(conditions[:3]))
+    if actions:
+        lines.append("Actions: " + " · ".join(actions[:3]))
+    return tuple(lines[:3]) or (f"{len(node.rows)} behavior rows",)
+
+
+def _edge_labels(node: BTableNode) -> dict[int, str]:
+    stack: list[tuple[str, str]] = []
+    result = {}
+    for row in node.rows:
+        operator = row.operator_name
+        if operator == "OperatorIf":
+            stack.append(("if", _condition_text(row)))
+        elif operator == "OperatorORIf" and stack and stack[-1][0] == "if":
+            stack[-1] = ("if", stack[-1][1] + " OR " + _condition_text(row))
+        elif operator == "OperatorElseIf":
+            while stack and stack[-1][0] != "if":
+                stack.pop()
+            if stack:
+                previous = stack[-1][1]
+                stack[-1] = (
+                    "if",
+                    _condition_text(row)
+                    if row.command_name != "None"
+                    else f"Else ({previous})",
+                )
+        elif operator == "OperatorIfEnd":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index][0] == "if":
+                    del stack[index:]
+                    break
+        elif operator == "OperatorRandom":
+            weight = _argument_number(row.operator_argument, "EditRandom")
+            stack.append(("random", f"{_fmt_number(weight)}%" if weight is not None else "Random"))
+        elif operator == "OperatorElseRandom":
+            weight = _argument_number(row.operator_argument, "EditRandom")
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index][0] == "random":
+                    stack[index] = ("random", f"{_fmt_number(weight)}%" if weight is not None else "Random")
+                    del stack[index + 1 :]
+                    break
+        elif operator == "OperatorRandomEnd":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index][0] == "random":
+                    del stack[index:]
+                    break
+        if row.jump_target_guid:
+            result[row.index] = " · ".join(value for _, value in stack[-2:]) or "Next"
+    return result
+
+
+def apply_btable_semantics(graph: BTableGraph) -> BTableGraph:
+    titled_nodes = tuple(replace(node, semantic_title=_node_role(node)) for node in graph.nodes)
+    target_titles = {node.guid: node.semantic_title for node in titled_nodes}
+    nodes = tuple(
+        replace(node, semantic_summary=_node_summary(node, target_titles))
+        for node in titled_nodes
+    )
+    node_by_guid = {node.guid: node for node in nodes}
+    edge_labels = {
+        (node.guid, row_index): label
+        for node in nodes
+        for row_index, label in _edge_labels(node).items()
+    }
+    edges = tuple(
+        replace(edge, label=edge_labels.get((edge.source_guid, edge.row_index), ""))
+        for edge in graph.edges
+        if edge.source_guid in node_by_guid and edge.target_guid in node_by_guid
+    )
+    return BTableGraph(nodes, edges, graph.diagnostics)
+
+
+def build_semantic_steps(
+    node: BTableNode,
+    target_titles: dict[str, str],
+) -> tuple[BTableSemanticStep, ...]:
+    steps = []
+    stack: list[str] = []
+    for row in node.rows:
+        operator = row.operator_name
+        if operator == "OperatorIf":
+            steps.append(
+                BTableSemanticStep(
+                    row.index,
+                    len(stack),
+                    f"IF {_condition_text(row)}",
+                    row.command_argument,
+                    "branch",
+                )
+            )
+            stack.append("if")
+        elif operator == "OperatorORIf":
+            steps.append(
+                BTableSemanticStep(
+                    row.index,
+                    max(0, len(stack) - 1),
+                    f"OR {_condition_text(row)}",
+                    row.command_argument,
+                    "branch",
+                )
+            )
+        elif operator == "OperatorElseIf":
+            while stack and stack[-1] != "if":
+                stack.pop()
+            if stack:
+                stack.pop()
+            label = f"ELSE IF {_condition_text(row)}" if row.command_name != "None" else "ELSE"
+            steps.append(BTableSemanticStep(row.index, len(stack), label, row.command_argument, "branch"))
+            stack.append("if")
+        elif operator == "OperatorIfEnd":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index] == "if":
+                    del stack[index:]
+                    break
+        elif operator == "OperatorRandom":
+            weight = _argument_number(row.operator_argument, "EditRandom")
+            label = f"{_fmt_number(weight)}% CHANCE" if weight is not None else "RANDOM"
+            steps.append(BTableSemanticStep(row.index, len(stack), label, "Weighted branch", "branch"))
+            stack.append("random")
+        elif operator == "OperatorElseRandom":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index] == "random":
+                    del stack[index:]
+                    break
+            weight = _argument_number(row.operator_argument, "EditRandom")
+            label = f"{_fmt_number(weight)}% CHANCE" if weight is not None else "RANDOM"
+            steps.append(BTableSemanticStep(row.index, len(stack), label, "Weighted branch", "branch"))
+            stack.append("random")
+        elif operator == "OperatorRandomEnd":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index] == "random":
+                    del stack[index:]
+                    break
+        elif operator in ("OperatorReturn", "OperatorExit"):
+            steps.append(BTableSemanticStep(row.index, len(stack), _humanize(operator), "", "flow"))
+        else:
+            label = _action_text(row, target_titles)
+            if label:
+                detail = row.command_argument or row.operator_argument
+                steps.append(BTableSemanticStep(row.index, len(stack), label, detail, "action"))
+    return tuple(steps)
 
 
 def _type_name(rsz: RszFile, instance_id: int) -> str:
@@ -273,6 +629,11 @@ def build_btable_graph(
             cmd_ref = next(iter(_objects(fields.get("_CommandArgument"))), 0)
             op_name = operator_names.get(op_hash) or _fallback_order_name(rsz, op_ref, op_hash)
             cmd_name = command_names.get(cmd_hash) or _fallback_order_name(rsz, cmd_ref, cmd_hash)
+            op_summary = _argument_summary(rsz, op_ref)
+            cmd_summary = _argument_summary(rsz, cmd_ref)
+            import_match = _GUID_PAIR_RE.search(op_summary)
+            import_source = import_match.group(1).casefold() if import_match else None
+            import_target = import_match.group(2).casefold() if import_match else None
             jump_guid = None
             if _type_name(rsz, op_ref) == JUMP_ARGUMENT_TYPE or op_name == "OperatorJump":
                 for candidate in _collect_guids(rsz, op_ref):
@@ -290,16 +651,20 @@ def build_btable_graph(
                     op_name,
                     cmd_hash,
                     cmd_name,
-                    _argument_summary(rsz, op_ref),
-                    _argument_summary(rsz, cmd_ref),
+                    op_summary,
+                    cmd_summary,
                     jump_guid,
+                    import_source,
+                    import_target,
                 )
             )
         nodes.append(BTableNode(index, table_id, guid, tuple(rows)))
     graph_diagnostics = list(diagnostics)
     if unresolved:
         graph_diagnostics.append(f"{unresolved} jump target(s) could not be resolved")
-    return BTableGraph(tuple(nodes), tuple(edges), tuple(graph_diagnostics))
+    return apply_btable_semantics(
+        BTableGraph(tuple(nodes), tuple(edges), tuple(graph_diagnostics))
+    )
 
 
 class BTableGraphLoader:
@@ -310,12 +675,103 @@ class BTableGraphLoader:
 
     def load(self) -> BTableGraph:
         operator_names, command_names = self._load_order_names(self.handler.rsz_file)
-        return build_btable_graph(
+        graph = build_btable_graph(
             self.handler.rsz_file,
             operator_names,
             command_names,
             tuple(self.diagnostics),
         )
+        imported_names = self._load_imported_names(
+            self.handler.rsz_file,
+            operator_names,
+            command_names,
+        )
+        unresolved = 0
+        nodes = []
+        for node in graph.nodes:
+            rows = []
+            for row in node.rows:
+                resolved = ""
+                if row.import_source_guid and row.import_target_guid:
+                    resolved = imported_names.get(
+                        (row.import_source_guid, row.import_target_guid),
+                        "",
+                    )
+                    if not resolved:
+                        unresolved += 1
+                rows.append(replace(row, resolved_import=resolved))
+            nodes.append(replace(node, rows=tuple(rows)))
+        diagnostics = list(dict.fromkeys((*graph.diagnostics, *self.diagnostics)))
+        if unresolved:
+            diagnostics.append(f"{unresolved} imported call(s) could not be named")
+        return apply_btable_semantics(
+            BTableGraph(tuple(nodes), graph.edges, tuple(diagnostics))
+        )
+
+    def _load_imported_names(
+        self,
+        source: RszFile,
+        operator_names: dict[int, str],
+        command_names: dict[int, str],
+    ) -> dict[tuple[str, str], str]:
+        root_id = _find_root(source, BTABLE_TYPE)
+        root = source.parsed_elements.get(root_id, {}) if root_id is not None else {}
+        imports = root.get("_ImportBTableList")
+        values = imports.values if isinstance(imports, ArrayData) else ()
+        result = {}
+        for value in values:
+            if not isinstance(value, UserDataData) or not value.string:
+                continue
+            imported = self._load_resource(value.string.rstrip("\0"))
+            if imported is None:
+                self.diagnostics.append(
+                    f"Imported BTable could not be loaded: {value.string.rstrip(chr(0))}"
+                )
+                continue
+            imported_root_id = _find_root(imported, BTABLE_TYPE)
+            if imported_root_id is None:
+                continue
+            imported_root = imported.parsed_elements.get(imported_root_id, {})
+            source_guid = str(_scalar(imported_root.get("_ThisGuid", ""))).casefold()
+            if not source_guid:
+                continue
+            imported_graph = build_btable_graph(
+                imported,
+                operator_names,
+                command_names,
+            )
+            for node in imported_graph.nodes:
+                result[(source_guid, node.guid.casefold())] = self._describe_imported_node(node)
+        return result
+
+    @staticmethod
+    def _describe_imported_node(node: BTableNode) -> str:
+        known_actions = _unique(_known_action(row.command_argument) for row in node.rows)
+        if known_actions:
+            return " + ".join(known_actions[:3])
+        actions = _unique(
+            _action_text(row)
+            for row in node.rows
+            if row.command_name not in (
+                "",
+                "None",
+                "RegisterMoveActionSetting",
+                "RegisterComboBreak",
+            )
+            and row.operator_name not in (
+                "OperatorIf",
+                "OperatorORIf",
+                "OperatorElseIf",
+            )
+        )
+        if actions:
+            return " + ".join(actions[:2])
+        conditions = _unique(
+            _condition_text(row)
+            for row in node.rows
+            if row.operator_name in ("OperatorIf", "OperatorORIf")
+        )
+        return " / ".join(conditions[:2]) or node.title
 
     def _load_order_names(self, source: RszFile) -> tuple[dict[int, str], dict[int, str]]:
         root_id = _find_root(source, BTABLE_TYPE)
@@ -433,12 +889,13 @@ class _GraphView(QGraphicsView):
 
 
 class _NodeItem(QGraphicsRectItem):
-    WIDTH = 410.0
-    MAX_VISIBLE_ROWS = 12
+    WIDTH = 330.0
+    MAX_VISIBLE_ROWS = 7
 
     def __init__(self, node: BTableNode):
         super().__init__()
         self.node = node
+        self.mode = "behavior"
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setData(0, node.guid)
         self.setBrush(QBrush(QColor("#252a34")))
@@ -450,8 +907,16 @@ class _NodeItem(QGraphicsRectItem):
         self._text.setTextWidth(self.WIDTH - 20)
         self._text.setPos(10, 7)
         self._text.setHtml(self._html(node))
+        self._resize_to_text()
+
+    def _resize_to_text(self) -> None:
         height = max(70.0, self._text.document().size().height() + 14.0)
         self.setRect(QRectF(0, 0, self.WIDTH, height))
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self._text.setHtml(self._html(self.node))
+        self._resize_to_text()
 
     @staticmethod
     def _row_color(operator_name: str) -> str:
@@ -467,6 +932,23 @@ class _NodeItem(QGraphicsRectItem):
         return "#a6accd"
 
     def _html(self, node: BTableNode) -> str:
+        if self.mode == "behavior":
+            return self._semantic_html(node)
+        return self._raw_html(node)
+
+    @staticmethod
+    def _semantic_html(node: BTableNode) -> str:
+        lines = [
+            "<div style='font-size:12pt;font-weight:600;color:#ffffff'>"
+            f"{escape(node.display_title)}</div>",
+            f"<div style='color:#7f8ba3;font-size:8pt'>{len(node.rows)} rows</div>",
+            "<hr style='color:#40485a'>",
+        ]
+        for summary in node.semantic_summary[:3]:
+            lines.append(f"<div style='color:#d8dee9;margin-bottom:3px'>{escape(summary)}</div>")
+        return "".join(lines)
+
+    def _raw_html(self, node: BTableNode) -> str:
         lines = [
             f"<div style='font-size:12pt;font-weight:600;color:#ffffff'>{escape(node.title)}</div>",
             f"<div style='color:#7f8ba3;font-size:8pt'>{escape(node.guid)}</div>",
@@ -492,7 +974,7 @@ class _NodeItem(QGraphicsRectItem):
 
 
 class _EdgeItem(QGraphicsPathItem):
-    def __init__(self, source: _NodeItem, target: _NodeItem, row_index: int):
+    def __init__(self, source: _NodeItem, target: _NodeItem, row_index: int, label: str = ""):
         source_rect = source.sceneBoundingRect()
         target_rect = target.sceneBoundingRect()
         start = QPointF(source_rect.right(), source_rect.center().y())
@@ -508,7 +990,9 @@ class _EdgeItem(QGraphicsPathItem):
         super().__init__(path)
         self.setPen(QPen(QColor("#bb80e6"), 2.0))
         self.setZValue(-10)
-        self.setToolTip(f"Jump from row {row_index} to {target.node.guid}")
+        self.setToolTip(
+            f"{label + ': ' if label else ''}jump from row {row_index} to {target.node.display_title}"
+        )
         arrow = QPolygonF(
             [
                 end,
@@ -519,6 +1003,15 @@ class _EdgeItem(QGraphicsPathItem):
         marker = QGraphicsPolygonItem(arrow, self)
         marker.setPen(QPen(QColor("#bb80e6")))
         marker.setBrush(QBrush(QColor("#bb80e6")))
+        self._label = QGraphicsTextItem(self)
+        self._label.setDefaultTextColor(QColor("#a6accd"))
+        self._label.setTextWidth(190.0)
+        self._label.setPlainText(label)
+        midpoint = path.pointAtPercent(0.5)
+        self._label.setPos(midpoint + QPointF(5.0, -22.0))
+
+    def set_mode(self, mode: str) -> None:
+        self._label.setVisible(mode == "behavior" and bool(self._label.toPlainText()))
 
 
 def _weak_components(graph: BTableGraph) -> list[list[str]]:
@@ -598,16 +1091,29 @@ class BTableGraphWidget(QWidget):
         self.graph = graph
         self._match_index = -1
         self._matches: list[_NodeItem] = []
+        self._mode = "behavior"
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         tools = QHBoxLayout()
         self.summary = QLabel(
-            f"{len(graph.nodes)} tables · {sum(len(node.rows) for node in graph.nodes)} rows · {len(graph.edges)} jumps"
+            self._summary_text()
         )
         tools.addWidget(self.summary)
         tools.addStretch(1)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        behavior_button = QPushButton("Behavior", self)
+        raw_button = QPushButton("Raw", self)
+        for button in (behavior_button, raw_button):
+            button.setCheckable(True)
+            self.mode_group.addButton(button)
+        behavior_button.setChecked(True)
+        behavior_button.setToolTip("Show semantic behavior summaries and a nested condition tree")
+        raw_button.setToolTip("Show original rows, operators, arguments, and GUIDs")
+        tools.addWidget(behavior_button)
+        tools.addWidget(raw_button)
         self.search = QLineEdit(self)
-        self.search.setPlaceholderText("Search commands, arguments, GUID…")
+        self.search.setPlaceholderText("Search behavior, commands, arguments, GUID…")
         self.search.setClearButtonEnabled(True)
         self.search.setMinimumWidth(280)
         next_button = QPushButton("Next", self)
@@ -620,11 +1126,10 @@ class BTableGraphWidget(QWidget):
         self.scene = QGraphicsScene(self)
         self.view = _GraphView(self.scene, self)
         self.details = QTreeWidget(self)
-        self.details.setHeaderLabels(("Row", "Operator", "Command / arguments"))
+        self.details.setHeaderLabels(("Behavior", "Source"))
         self.details.setAlternatingRowColors(True)
-        self.details.setMinimumWidth(430)
-        self.details.setColumnWidth(0, 52)
-        self.details.setColumnWidth(1, 150)
+        self.details.setMinimumWidth(480)
+        self.details.setColumnWidth(0, 300)
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self.view)
         splitter.addWidget(self.details)
@@ -640,19 +1145,59 @@ class BTableGraphWidget(QWidget):
         self._items = {node.guid: _NodeItem(node) for node in graph.nodes}
         for item in self._items.values():
             self.scene.addItem(item)
-        _layout_nodes(graph, self._items)
-        for edge in graph.edges:
-            source = self._items.get(edge.source_guid)
-            target = self._items.get(edge.target_guid)
-            if source is not None and target is not None:
-                self.scene.addItem(_EdgeItem(source, target, edge.row_index))
+        self._edge_items: list[_EdgeItem] = []
+        self._rebuild_edges()
         self.scene.selectionChanged.connect(self._selection_changed)
         self.search.textChanged.connect(self._apply_search)
         self.search.returnPressed.connect(self._next_match)
         next_button.clicked.connect(self._next_match)
         fit_button.clicked.connect(self.fit_graph)
+        behavior_button.clicked.connect(lambda: self._set_mode("behavior"))
+        raw_button.clicked.connect(lambda: self._set_mode("raw"))
         if self._items:
             next(iter(self._items.values())).setSelected(True)
+        self.fit_graph()
+
+    def _summary_text(self, match_count: int | None = None) -> str:
+        imported = sum(
+            1
+            for node in self.graph.nodes
+            for row in node.rows
+            if row.import_target_guid
+        )
+        text = (
+            f"{len(self.graph.nodes)} tables · "
+            f"{sum(len(node.rows) for node in self.graph.nodes)} rows · "
+            f"{len(self.graph.edges)} local jumps · {imported} imported calls"
+        )
+        if match_count is not None:
+            text += f" · {match_count} matches"
+        return text
+
+    def _rebuild_edges(self) -> None:
+        for item in self._edge_items:
+            self.scene.removeItem(item)
+        self._edge_items.clear()
+        _layout_nodes(self.graph, self._items)
+        show_labels = len(self.graph.nodes) <= 30
+        for edge in self.graph.edges:
+            source = self._items.get(edge.source_guid)
+            target = self._items.get(edge.target_guid)
+            if source is None or target is None:
+                continue
+            item = _EdgeItem(source, target, edge.row_index, edge.label)
+            item.set_mode(self._mode if show_labels else "raw")
+            self.scene.addItem(item)
+            self._edge_items.append(item)
+
+    def _set_mode(self, mode: str) -> None:
+        if mode not in ("behavior", "raw"):
+            return
+        self._mode = mode
+        for item in self._items.values():
+            item.set_mode(mode)
+        self._rebuild_edges()
+        self._selection_changed()
         self.fit_graph()
 
     def fit_graph(self):
@@ -670,10 +1215,7 @@ class BTableGraphWidget(QWidget):
             item.setZValue(1 if matched and query else 0)
             if matched and query:
                 self._matches.append(item)
-        self.summary.setText(
-            f"{len(self.graph.nodes)} tables · {sum(len(node.rows) for node in self.graph.nodes)} rows · "
-            f"{len(self.graph.edges)} jumps" + (f" · {len(self._matches)} matches" if query else "")
-        )
+        self.summary.setText(self._summary_text(len(self._matches) if query else None))
 
     def _next_match(self):
         if not self._matches:
@@ -690,6 +1232,34 @@ class BTableGraphWidget(QWidget):
             return
         node = selected[0].node
         self.details.clear()
+        if self._mode == "behavior":
+            self._populate_behavior_details(node)
+        else:
+            self._populate_raw_details(node)
+
+    def _populate_behavior_details(self, node: BTableNode) -> None:
+        self.details.setHeaderLabels((node.display_title, "Source"))
+        target_titles = {
+            item.guid: item.semantic_title
+            for item in self.graph.nodes
+        }
+        branch_parents: dict[int, QTreeWidgetItem] = {}
+        for step in build_semantic_steps(node, target_titles):
+            item = QTreeWidgetItem((step.label, f"Row {step.row_index:02d}"))
+            parent = branch_parents.get(step.depth - 1) if step.depth else None
+            if parent is None:
+                self.details.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            for depth in tuple(branch_parents):
+                if depth >= step.depth:
+                    del branch_parents[depth]
+            if step.kind == "branch":
+                branch_parents[step.depth] = item
+        self.details.expandAll()
+        self.details.resizeColumnToContents(0)
+
+    def _populate_raw_details(self, node: BTableNode) -> None:
         self.details.setHeaderLabels(("Row", node.title, node.guid))
         for row in node.rows:
             item = QTreeWidgetItem(
@@ -705,6 +1275,17 @@ class BTableGraphWidget(QWidget):
                 item.addChild(QTreeWidgetItem(("", "Command args", row.command_argument)))
             if row.jump_target_guid:
                 item.addChild(QTreeWidgetItem(("", "Jump target", row.jump_target_guid)))
+            if row.import_target_guid:
+                item.addChild(
+                    QTreeWidgetItem(
+                        (
+                            "",
+                            "Imported call",
+                            row.resolved_import
+                            or f"{row.import_source_guid}|{row.import_target_guid}",
+                        )
+                    )
+                )
             self.details.addTopLevelItem(item)
         self.details.resizeColumnToContents(0)
         self.details.resizeColumnToContents(1)
