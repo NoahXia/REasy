@@ -1305,13 +1305,17 @@ class REasyEditorApp(QMainWindow):
                 handler.resource_context = resource_context
             if hasattr(handler, 'needs_json_path') and handler.needs_json_path():
                 if not self.settings.get("rcol_json_path") and not getattr(self, "_rsz_type_registry_override", None):
-                    msg = QMessageBox(QMessageBox.Warning,
-                        self.tr("JSON Path Not Set"),
-                        self.tr("RSZ type registry JSON path is not set.\nWould you like to set it now?"),
-                        QMessageBox.Yes | QMessageBox.No)
-                    if msg.exec() == QMessageBox.Yes:
-                        self.open_settings_dialog()
-                    return None
+                    handler.app = self
+                    handler.filepath = filename or ""
+                    handler.init_type_registry()
+                    if handler.type_registry is None:
+                        msg = QMessageBox(QMessageBox.Warning,
+                            self.tr("JSON Path Not Set"),
+                            self.tr("RSZ type registry JSON path is not set.\nWould you like to set it now?"),
+                            QMessageBox.Yes | QMessageBox.No)
+                        if msg.exec() == QMessageBox.Yes:
+                            self.open_settings_dialog()
+                        return None
 
             tab = FileTab(
                 None,

@@ -17,6 +17,7 @@ from file_handlers.rsz.btable_preview import (
 )
 from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
 from file_handlers.rsz.rsz_file import RszFile
+from file_handlers.rsz.rsz_handler import RszHandler, _registry_filename_for_game
 from utils.type_registry import TypeRegistry
 
 
@@ -66,6 +67,23 @@ def _fixture():
 
 
 class TestBTableGraph(unittest.TestCase):
+    def test_wots_registry_filename_aliases(self):
+        self.assertEqual(_registry_filename_for_game("OnimushaWOTS"), "rszoniwots.json")
+        self.assertEqual(_registry_filename_for_game("ONIWOTS"), "rszoniwots.json")
+
+    def test_wots_context_finds_bundled_registry_without_a_setting(self):
+        handler = RszHandler()
+        handler.app = SimpleNamespace(
+            settings={"game_version": "RE4", "rcol_json_path": ""},
+            current_game=None,
+            proj_dock=None,
+        )
+        handler.resource_context = SimpleNamespace(game="OnimushaWOTS")
+        resolved = Path(handler._resolve_type_registry_path())
+        self.assertEqual(resolved.name, "rszoniwots.json")
+        self.assertTrue(resolved.is_file())
+        self.assertEqual(handler.game_version, "OnimushaWOTS")
+
     def test_node_retains_its_text_item(self):
         from PySide6.QtWidgets import QApplication, QGraphicsTextItem
 
@@ -213,6 +231,27 @@ class TestWotsBTableAssets(unittest.TestCase):
         self.assertIn("WALK · 10 s · arrive 0.5 m", imported_names)
         alert_steps = build_semantic_steps(graph.nodes[4], {})
         self.assertIn("10% CHANCE", {step.label for step in alert_steps})
+
+    def test_action_file_recovers_a_relocated_wots_registry(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        path = root / "GameDesign/Action/Enemy/em100/00/btable/em100_00_action.user.3"
+        handler = RszHandler()
+        handler.filepath = str(path)
+        handler.resource_context = SimpleNamespace(game="OnimushaWOTS")
+        handler.app = SimpleNamespace(
+            settings={
+                "game_version": "RE4",
+                "rcol_json_path": str(
+                    Path("Z:/old/REasy/dist/resources/data/dumps/rszoniwots.json")
+                ),
+            },
+            _rsz_type_registry_override=None,
+        )
+        handler.read(path.read_bytes(), validate_type_registry=True)
+        self.assertIsNotNone(handler.type_registry)
+        self.assertEqual(Path(handler.type_registry.json_path).name, "rszoniwots.json")
+        self.assertEqual(handler.game_version, "OnimushaWOTS")
+        self.assertTrue(is_btable_document(handler.rsz_file))
 
 
 if __name__ == "__main__":

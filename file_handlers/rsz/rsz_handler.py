@@ -7,6 +7,10 @@ This file contains:
 """
 
 import functools
+import os
+import re
+from pathlib import Path
+
 from PySide6.QtCore import Signal, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QWidget,
@@ -19,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from utils.enum_manager import EnumManager
+from utils.app_paths import resource_path
 from utils.registry_manager import RegistryManager
 from utils.hex_util import guid_le_to_str
 from ..base_handler import BaseFileHandler
@@ -62,6 +67,28 @@ RESOURCE_COUNT_LABEL = "Resource Count"
 USERDATA_COUNT_LABEL = "UserData Count"
 RESOURCE_INFO_TBL_LABEL = "Resource Info Tbl"
 PARENT_ID_LABEL = "Parent ID"
+
+_REGISTRY_GAME_ALIASES = {
+    "ONIMUSHAWOTS": "OnimushaWOTS",
+    "ONIWOTS": "OnimushaWOTS",
+    "WOTS": "OnimushaWOTS",
+}
+
+
+def _canonical_game_name(value) -> str:
+    text = str(value or "").strip()
+    normalized = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+    return _REGISTRY_GAME_ALIASES.get(normalized, text)
+
+
+def _registry_filename_for_game(game) -> str:
+    canonical = _canonical_game_name(game)
+    normalized = re.sub(r"[^A-Za-z0-9]", "", canonical).casefold()
+    if not normalized:
+        return ""
+    if normalized == "onimushawots":
+        normalized = "oniwots"
+    return f"rsz{normalized}.json"
 
 class RszHandler(BaseFileHandler):
     """Handler for SCN/PFB/USR files"""
@@ -108,12 +135,71 @@ class RszHandler(BaseFileHandler):
 
     def init_type_registry(self):
         """Initialize type registry using shared registry manager"""
-        if hasattr(self, 'app') and self.app:
-            json_path = self.app.settings.get("rcol_json_path")
-            if (registry := getattr(self.app, "_rsz_type_registry_override", None)) or json_path:
-                self.type_registry = registry or RegistryManager.instance().get_registry(json_path)
-                if self.type_registry and (self.type_registry.registry.get("metadata", {}).get("complete", False) or self.type_registry.registry.get("metadata", {}).get("resources_identified", False)):
-                    self.auto_resource_management = True
+        if not hasattr(self, "app") or not self.app:
+            return
+        registry = getattr(self.app, "_rsz_type_registry_override", None)
+        if registry is None:
+            json_path = self._resolve_type_registry_path()
+            registry = RegistryManager.instance().get_registry(json_path) if json_path else None
+        self.type_registry = registry
+        if self.type_registry and (
+            self.type_registry.registry.get("metadata", {}).get("complete", False)
+            or self.type_registry.registry.get("metadata", {}).get(
+                "resources_identified", False
+            )
+        ):
+            self.auto_resource_management = True
+
+    def _infer_registry_game(self) -> str:
+        context_game = getattr(getattr(self, "resource_context", None), "game", "")
+        project = getattr(self.app, "proj_dock", None)
+        candidates = (
+            context_game,
+            getattr(self.app, "current_game", ""),
+            getattr(project, "current_game", ""),
+            getattr(getattr(self.app, "project_manager", None), "current_game", ""),
+        )
+        game = next((str(value).strip() for value in candidates if str(value or "").strip()), "")
+        if not game and "onimusha" in str(self.filepath or "").casefold():
+            game = "OnimushaWOTS"
+        if not game:
+            settings = getattr(self.app, "settings", {}) or {}
+            configured_name = Path(
+                str(settings.get("rcol_json_path", "") or "")
+            ).name.casefold()
+            if configured_name == "rszoniwots.json":
+                game = "OnimushaWOTS"
+        if not game:
+            settings = getattr(self.app, "settings", {}) or {}
+            game = str(settings.get("game_version", "") or self._game_version)
+        canonical = _canonical_game_name(game)
+        if canonical:
+            self.game_version = canonical
+        return canonical
+
+    def _resolve_type_registry_path(self) -> str:
+        settings = getattr(self.app, "settings", {}) or {}
+        game = self._infer_registry_game()
+        configured = str(settings.get("rcol_json_path", "") or "").strip()
+        if configured:
+            candidate = Path(os.path.expandvars(configured)).expanduser()
+            if candidate.is_file():
+                return str(candidate.resolve())
+            relocated = resource_path(candidate.name)
+            if relocated.is_file():
+                return str(relocated.resolve())
+
+        json_name = _registry_filename_for_game(game)
+        if not json_name:
+            return ""
+        for relative in (
+            Path("resources") / "data" / "dumps" / json_name,
+            Path(json_name),
+        ):
+            candidate = resource_path(relative)
+            if candidate.is_file():
+                return str(candidate.resolve())
+        return ""
 
     def read(self, data: bytes, validate_type_registry: bool = False):
         """Parse the file data"""
