@@ -8,9 +8,11 @@ from utils.hash_util import murmur3_hash_utf16le
 from .binary import ReadContext
 from .errors import MotionParseError, MotionWriteError
 from .mot.model import AnimationNode, Joint, KeyTrack, Motion, Skeleton, TrackFamily
+from .mot_clip.wots_v89 import WotsCompactMotClipV89Parser
 from .mot_list.model import EmbeddedPayload, MotList, MotionSlot, MotionSlotType
 from .mot_tree.wots_parser import WotsMotTreeV21Parser
 from .profiles import WOTS_PROFILE
+from .sequence.model import SequenceCategory, SequenceData, SequenceTrack
 
 
 class WotsMotParser:
@@ -28,6 +30,7 @@ class WotsMotParser:
 
     def __init__(self, context: ReadContext):
         self.context = context
+        self.clip_parser = WotsCompactMotClipV89Parser()
 
     def _mot_context(self, base: int, physical_end: int) -> ReadContext:
         c = self.context.subcontext(
@@ -125,6 +128,7 @@ class WotsMotParser:
         raw_end = c.f32(base + 0x6C, "MOT raw end frame")
         joint_count = c.u16(base + 0x70, "MOT joint count")
         clip_count = c.u16(base + 0x72, "MOT bone clip count")
+        sequence_count = c.u8(base + 0x74, "MOT sequence count")
         # v973 moved the rate after the legacy u16 at 0x76.
         fps = c.u16(base + 0x78, "MOT frame rate")
         if fps not in (30, 60):
@@ -205,6 +209,44 @@ class WotsMotParser:
                     )
                 )
 
+        character_path = None
+        character_stored = c.u64(base + 0x38, "MOT character path")
+        if character_stored:
+            character_path, _ = c.utf16_z(
+                base + character_stored,
+                "MOT character/JMAP path",
+            )
+
+        sequences: list[SequenceData] = []
+        sequence_stored = c.u64(base + 0x30, "MOT sequence table")
+        if bool(sequence_stored) != bool(sequence_count):
+            raise MotionParseError(
+                f"{c.label}: sequence pointer/count presence mismatch"
+            )
+        if sequence_count:
+            sequence_table = base + sequence_stored
+            c.require(sequence_table, sequence_count * 8, "MOT sequence pointer table")
+            object_data = bytes(c.data[base:physical_end])
+            for index in range(sequence_count):
+                stored = c.u64(
+                    sequence_table + index * 8,
+                    f"MOT sequence[{index}] pointer",
+                )
+                if not stored:
+                    raise MotionParseError(
+                        f"{c.label}: sequence[{index}] has a null pointer"
+                    )
+                sequences.append(
+                    self._parse_sequence(
+                        c,
+                        base,
+                        physical_end,
+                        base + stored,
+                        index,
+                        object_data,
+                    )
+                )
+
         return Motion(
             name=name,
             end_frame=end_frame,
@@ -213,8 +255,74 @@ class WotsMotParser:
             raw_end_frame=raw_end,
             skeleton=skeleton,
             animation_nodes=nodes,
+            sequences=sequences,
+            character_path=character_path,
             source_joint_count=joint_count,
         )
+
+    def _parse_sequence(
+        self,
+        c: ReadContext,
+        base: int,
+        physical_end: int,
+        offset: int,
+        index: int,
+        object_data: bytes,
+    ) -> SequenceData:
+        c.require(offset, 0x40, f"SequenceData[{index}]")
+        clip_stored = c.u64(offset + 8, f"SequenceData[{index}] CLIP pointer")
+        tracks_stored = c.u64(offset + 0x10, f"SequenceData[{index}] tracks pointer")
+        attributes = c.u32(offset + 0x18, f"SequenceData[{index}] attributes")
+        track_count = c.u32(offset + 0x1C, f"SequenceData[{index}] track count")
+        use_flags = c.u32(offset + 0x20, f"SequenceData[{index}] use flags")
+        raw_category = c.u32(offset + 0x24, f"SequenceData[{index}] category")
+        if attributes:
+            raise MotionParseError(
+                f"{c.label}: SequenceData[{index}] attributes 0x{attributes:X} "
+                f"at 0x{offset + 0x18 - base:X} are unsupported"
+            )
+        if use_flags != 1:
+            raise MotionParseError(
+                f"{c.label}: SequenceData[{index}] use flags 0x{use_flags:X} "
+                f"at 0x{offset + 0x20 - base:X} are unsupported"
+            )
+        try:
+            category = SequenceCategory(raw_category)
+        except ValueError as exc:
+            raise MotionParseError(
+                f"{c.label}: SequenceData[{index}] category {raw_category} "
+                f"at 0x{offset + 0x24 - base:X} is unsupported"
+            ) from exc
+        clip_offset = base + clip_stored
+        tracks_offset = base + tracks_stored
+        if clip_offset != offset + 0x40:
+            raise MotionParseError(
+                f"{c.label}: SequenceData[{index}] compact CLIP does not begin "
+                f"at wrapper +0x40 (0x{clip_offset - base:X})"
+            )
+        c.require(tracks_offset, track_count * 0x1C, f"SequenceData[{index}] tracks")
+        clip = self.clip_parser.parse(
+            object_data,
+            clip_offset - base,
+            tracks_offset - base,
+            label=f"{c.label} SequenceData[{index}]",
+        )
+        tracks = [
+            SequenceTrack(
+                c.u32(tracks_offset + row * 0x1C, "TracksData authored ID"),
+                c.u32(tracks_offset + row * 0x1C + 4, "TracksData filter page 0"),
+                c.u32(tracks_offset + row * 0x1C + 8, "TracksData filter page 1"),
+                c.u32(tracks_offset + row * 0x1C + 0xC, "TracksData filter page 2"),
+            )
+            for row in range(track_count)
+        ]
+        child_count = len(clip.root.children)
+        if track_count < child_count:
+            raise MotionParseError(
+                f"{c.label}: SequenceData[{index}] has {track_count} track metadata "
+                f"rows for {child_count} timeline tracks"
+            )
+        return SequenceData(category, clip, tracks[:child_count])
 
     @staticmethod
     def _clone_skeleton(source: Skeleton | None) -> Skeleton | None:

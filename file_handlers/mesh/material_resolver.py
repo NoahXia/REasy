@@ -376,18 +376,24 @@ class MeshMaterialResolver:
 
     @staticmethod
     def pick_primary_texture(material: MatData) -> TexHeader | None:
-        first_preferred_non_null: TexHeader | None = None
+        # MDF texture order is not semantic priority. WOTS mantle materials,
+        # for example, list WrinkleBlend_ALBDMap before BaseDielectricMap.
+        # Honor PREFERRED_ALBEDO_TEXTURE_TYPES order so the neutral base color
+        # wins and wrinkle/face layers remain fallbacks only.
         first_preferred: TexHeader | None = None
-        for tex in material.textures:
-            tex_path = (tex.tex_path or "").strip()
-            if not tex_path:
-                continue
-            if tex.tex_type in PREFERRED_ALBEDO_TEXTURE_TYPES:
+        first_preferred_non_null: TexHeader | None = None
+        for texture_type in PREFERRED_ALBEDO_TEXTURE_TYPES:
+            for tex in material.textures:
+                tex_path = (tex.tex_path or "").strip()
+                if not tex_path or tex.tex_type != texture_type:
+                    continue
                 if first_preferred is None:
                     first_preferred = tex
                 if "null" not in tex_path.lower():
                     first_preferred_non_null = tex
                     break
+            if first_preferred_non_null is not None:
+                break
         chosen = first_preferred_non_null or first_preferred
         if chosen is None:
             return None

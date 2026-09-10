@@ -249,6 +249,14 @@ class MotionPlaybackControls(QWidget):
         self._sync_frame_controls()
         self.render_requested.emit(False)
 
+    def seek(self, frame: float) -> None:
+        """Seek from an auxiliary timeline while keeping every control in sync."""
+        if not self.controller.ready:
+            return
+        self.controller.set_frame(frame)
+        self._sync_frame_controls()
+        self.render_requested.emit(False)
+
     def cleanup(self) -> None:
         self.stop()
 

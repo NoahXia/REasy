@@ -425,6 +425,7 @@ class _MeshGLWidget(ScenePreviewWidget):
             initial_rotation=(0.0, 0.0),
             initial_distance=3.0,
             background=(0.1, 0.1, 0.1, 1.0),
+            show_ground_grid=False,
         )
         self.set_vertex_colors_enabled(use_vertex_colors, refresh=False)
         self.set_scene(

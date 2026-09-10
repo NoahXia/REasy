@@ -177,7 +177,6 @@ from .scene_buffers import (
     display_colors,
     mesh_bounds_points,
     point_bounds,
-    scene_bounds,
     scene_index_buffers,
     scene_key_index_buffers,
     triangle_line_indices,
@@ -251,6 +250,44 @@ HOVER_PICK_MIN_PIXELS = 4.0
 HOVER_DETECT_KEY = Qt.Key_H
 GL_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FE
 GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FF
+GROUND_GRID_SPACING = 1.0
+GROUND_GRID_MIN_RADIUS = 10
+GROUND_GRID_MAX_RADIUS = 100
+
+
+def _orbit_pan_delta(
+    dx: float,
+    dy: float,
+    *,
+    viewport_height: float,
+    distance: float,
+    scale: float,
+    pitch_degrees: float,
+    yaw_degrees: float,
+) -> np.ndarray:
+    """Return a world-space target delta for a screen-space orbit-camera pan."""
+    yaw = np.deg2rad(yaw_degrees)
+    pitch = np.deg2rad(pitch_degrees)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    view_rotation = np.array(
+        (
+            (cy, 0.0, sy),
+            (sp * sy, cp, -sp * cy),
+            (-cp * sy, sp, cp * cy),
+        ),
+        dtype=np.float32,
+    )
+    right = view_rotation.T @ np.array((1.0, 0.0, 0.0), dtype=np.float32)
+    up = view_rotation.T @ np.array((0.0, 1.0, 0.0), dtype=np.float32)
+    world_per_pixel = (
+        2.0
+        * max(float(distance), 0.01)
+        * float(np.tan(np.deg2rad(22.5)))
+        / max(float(viewport_height), 1.0)
+        / max(float(scale), 1e-6)
+    )
+    return (-float(dx) * right + float(dy) * up) * world_per_pixel
 
 
 class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
@@ -302,6 +339,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         initial_rotation: tuple[float, float] = (20.0, -30.0),
         initial_distance: float = 8.0,
         background: tuple[float, float, float, float] = (0.08, 0.08, 0.08, 1.0),
+        show_ground_grid: bool = True,
     ):
         fmt = mesh_surface_format()
         super().__init__(parent)
@@ -310,6 +348,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._settings = settings if isinstance(settings, dict) else None
         self._controls = controls
         self._background = self._load_background_color(background)
+        self._show_ground_grid = bool(show_ground_grid)
         self._init_orbit_camera(
             rot_x=float(initial_rotation[0]),
             rot_y=float(initial_rotation[1]),
@@ -318,6 +357,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.scale = 1.0
         self.extent = 1.0
         self.center = np.zeros(3, dtype=np.float32)
+        self._ground_y = 0.0
         self.freecam = FreecamController()
         self._cursor_lock_pos = self._fullscreen_restore = None
         self._fullscreen_content: QWidget | None = None
@@ -790,6 +830,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         )
         self._add_tone_controls(layout)
         self._add_highlight_filter_control(layout)
+        self._add_orbit_camera_help(layout)
 
     def _add_scene_mode_control(self, layout: QVBoxLayout):
         modes = (
@@ -943,6 +984,17 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.bone_labels_check.setChecked(self.show_bone_labels)
         self.bone_labels_check.toggled.connect(self._set_show_bone_labels)
         self._add_control_row(layout, self.bone_labels_check)
+        self._add_orbit_camera_help(layout)
+
+    def _add_orbit_camera_help(self, layout: QVBoxLayout) -> None:
+        note = QLabel(
+            self.tr("LMB drag: orbit · RMB drag: pan · Wheel: zoom"),
+            self.overlay,
+        )
+        note.setStyleSheet(
+            "color:#7f8b96; background-color:transparent; font-size:10px;"
+        )
+        layout.addWidget(note)
 
     def _setting_value(self, key: str):
         if self._settings is None:
@@ -985,7 +1037,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._hover_key = self._hover_block_key = ""
         self._recompute_bounds()
         self._refresh_selection_bounds()
-        if reset_camera:
+        if reset_camera and self._controls not in {"mesh", "motion"}:
             self.freecam.reset(self.center, self.extent, self.camera_speed)
         self._upload_buffers()
         self.update()
@@ -1538,6 +1590,12 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
 
     def mousePressEvent(self, event):
         self.setFocus(Qt.MouseFocusReason)
+        if self._controls in {"mesh", "motion"}:
+            if event.button() in (Qt.LeftButton, Qt.RightButton):
+                self.last_pos = event.position()
+                event.accept()
+                return
+            return super().mousePressEvent(event)
         if self._controls != "mesh" and event.button() == Qt.LeftButton:
             if self._begin_gizmo_drag(event):
                 event.accept()
@@ -1559,8 +1617,22 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._drag_gizmo(event)
             event.accept()
             return
-        if self._controls == "mesh":
-            return super().mouseMoveEvent(event)
+        if self._controls in {"mesh", "motion"}:
+            if self.last_pos is None:
+                return super().mouseMoveEvent(event)
+            dx = event.position().x() - self.last_pos.x()
+            dy = event.position().y() - self.last_pos.y()
+            buttons = event.buttons()
+            if buttons & Qt.LeftButton:
+                self.rot_x = max(-89.0, min(89.0, self.rot_x + dy * 0.5))
+                self.rot_y += dx * 0.5
+                self._update_after_camera_change()
+            elif buttons & Qt.RightButton:
+                self._pan_orbit_camera(dx, dy)
+                self._update_after_camera_change()
+            self.last_pos = event.position()
+            event.accept()
+            return
         buttons = event.buttons()
         if not (buttons & Qt.RightButton):
             self._update_scene_hover(self._screen_pos(event)) if self._hover_detect_down else self._set_hover_key("")
@@ -1583,14 +1655,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._finish_gizmo_drag(commit=True)
             event.accept()
             return
-        if self._controls == "mesh":
-            return super().mouseReleaseEvent(event)
+        if self._controls in {"mesh", "motion"}:
+            self.last_pos = None
+            event.accept()
+            return
         if not (event.buttons() & Qt.RightButton):
             self._unlock_scene_cursor()
         event.accept()
 
     def wheelEvent(self, event):
-        if self._controls == "mesh":
+        if self._controls in {"mesh", "motion"}:
             super().wheelEvent(event)
             return
         steps = event.angleDelta().y() / 120.0
@@ -1604,7 +1678,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._toggle_view_fullscreen()
             event.accept()
             return
-        if self._controls != "mesh" and event.key() == HOVER_DETECT_KEY:
+        if self._controls not in {"mesh", "motion"} and event.key() == HOVER_DETECT_KEY:
             if not event.isAutoRepeat():
                 self._hover_detect_down, self._last_hover_pick_time, self._last_hover_pick_pos = True, 0.0, None
                 pos = self.mapFromGlobal(QCursor.pos())
@@ -1613,31 +1687,31 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             event.accept()
             return
         action = self.freecam.key_action(event)
-        if self._controls != "mesh" and action:
+        if self._controls not in {"mesh", "motion"} and action:
             self.freecam.keys.add(action)
             event.accept()
             self._update_after_camera_change()
             return
-        if self._controls != "mesh" and event.key() in self.freecam.MOD_KEYS:
+        if self._controls not in {"mesh", "motion"} and event.key() in self.freecam.MOD_KEYS:
             self.freecam.mods.add(event.key())
             event.accept()
             return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        if self._controls != "mesh" and event.key() == HOVER_DETECT_KEY:
+        if self._controls not in {"mesh", "motion"} and event.key() == HOVER_DETECT_KEY:
             if not event.isAutoRepeat():
                 self._hover_detect_down, self._last_hover_pick_pos = False, None
                 self._set_hover_key("")
             event.accept()
             return
         action = self.freecam.key_action(event)
-        if self._controls != "mesh" and action:
+        if self._controls not in {"mesh", "motion"} and action:
             if not event.isAutoRepeat():
                 self.freecam.keys.discard(action)
             event.accept()
             return
-        if self._controls != "mesh" and event.key() in self.freecam.MOD_KEYS:
+        if self._controls not in {"mesh", "motion"} and event.key() in self.freecam.MOD_KEYS:
             if not event.isAutoRepeat():
                 self.freecam.mods.discard(event.key())
             event.accept()
@@ -1658,7 +1732,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         super().leaveEvent(event)
 
     def event(self, event):
-        if event.type() == QEvent.HoverMove and getattr(self, "_hover_detect_down", False) and getattr(self, "_controls", "mesh") != "mesh" and getattr(self, "_gizmo_drag", None) is None and getattr(self, "_cursor_lock_pos", None) is None:
+        if event.type() == QEvent.HoverMove and getattr(self, "_hover_detect_down", False) and getattr(self, "_controls", "mesh") not in {"mesh", "motion"} and getattr(self, "_gizmo_drag", None) is None and getattr(self, "_cursor_lock_pos", None) is None:
             self._update_scene_hover(self._screen_pos(event))
             return True
         return super().event(event)
@@ -1692,6 +1766,18 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         if buttons & Qt.RightButton:
             self.freecam.look(dx, dy, self.camera_look)
 
+    def _pan_orbit_camera(self, dx: float, dy: float) -> None:
+        """Pan the orbit target in camera-local horizontal and vertical axes."""
+        self.center += _orbit_pan_delta(
+            dx,
+            dy,
+            viewport_height=self.height(),
+            distance=self.distance,
+            scale=self.scale,
+            pitch_degrees=self.rot_x,
+            yaw_degrees=self.rot_y,
+        )
+
     def _lock_scene_cursor(self, pos) -> None:
         self._cursor_lock_pos = pos
         self.setCursor(Qt.BlankCursor)
@@ -1711,7 +1797,9 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.update()
 
     def _recompute_bounds(self):
-        self.center, self.extent = scene_bounds(self._meshes)
+        points = mesh_bounds_points(self._meshes)
+        self.center, self.extent = point_bounds(points)
+        self._ground_y = float(points[:, 1].min()) if len(points) else 0.0
         self.scale = 1.0 / self.extent if self.extent > 1e-6 else 1.0
 
     def _refresh_selection_bounds(self) -> None:
@@ -3489,7 +3577,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         glLineWidth(1.0)
 
     def _apply_camera_transform(self):
-        if self._controls == "mesh":
+        if self._controls in {"mesh", "motion"}:
             glTranslatef(0.0, 0.0, -self.distance)
             glRotatef(self.rot_x, 1.0, 0.0, 0.0)
             glRotatef(self.rot_y, 0.0, 1.0, 0.0)
@@ -3500,6 +3588,55 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         glRotatef(-self.freecam.pitch, 1.0, 0.0, 0.0)
         glRotatef(-self.freecam.yaw, 0.0, 1.0, 0.0)
         glTranslatef(-self.freecam.pos[0], -self.freecam.pos[1], -self.freecam.pos[2])
+
+    def _draw_ground_grid(self) -> None:
+        """Draw a world-space XZ ground grid with one-unit (one-meter) cells."""
+        if not self._show_ground_grid:
+            return
+        radius = int(
+            max(
+                GROUND_GRID_MIN_RADIUS,
+                min(GROUND_GRID_MAX_RADIUS, np.ceil(self.extent * 1.5)),
+            )
+        )
+        center_x = int(np.floor(float(self.center[0])))
+        center_z = int(np.floor(float(self.center[2])))
+        start_x, end_x = center_x - radius, center_x + radius
+        start_z, end_z = center_z - radius, center_z + radius
+        y = self._ground_y
+
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(False)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        for x in range(start_x, end_x + 1):
+            if x == 0:
+                glColor4f(0.82, 0.28, 0.24, 0.85)
+            elif x % 5 == 0:
+                glColor4f(0.52, 0.58, 0.64, 0.48)
+            else:
+                glColor4f(0.42, 0.47, 0.52, 0.25)
+            glVertex3f(float(x), y, float(start_z))
+            glVertex3f(float(x), y, float(end_z))
+        for z in range(start_z, end_z + 1):
+            if z == 0:
+                glColor4f(0.24, 0.42, 0.86, 0.85)
+            elif z % 5 == 0:
+                glColor4f(0.52, 0.58, 0.64, 0.48)
+            else:
+                glColor4f(0.42, 0.47, 0.52, 0.25)
+            glVertex3f(float(start_x), y, float(z))
+            glVertex3f(float(end_x), y, float(z))
+        glEnd()
+        glDepthMask(True)
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        self._apply_render_state()
 
     def _bind_arrays(self, buffer_set: _GlBufferSet, *, use_textures: bool):
         buffer_set.vertices_vbo.bind()
@@ -4202,6 +4339,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             QTimer.singleShot(0, self, lambda kind=kind, key=key: self._finish_scene_pick(kind, key))
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             self._prepare_scene_view()
+        self._draw_ground_grid()
         if scene_matrix is not None:
             glPushMatrix()
             glMultMatrixf(np.ascontiguousarray(scene_matrix.T, dtype=np.float32))

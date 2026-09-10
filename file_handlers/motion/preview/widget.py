@@ -4,13 +4,17 @@ from collections import Counter
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
+    QFrame,
     QInputDialog,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +37,7 @@ from .animation_browser import MotionEntryList
 from .controller import MotionPreviewController
 from .controls import MotionPlaybackControls
 from .editor_layout import MotionEditorPane, MotionEditorWorkspace
+from .event_timeline import MotionEventTimeline
 from .model import (
     MotionPreviewError,
     snapshot_diagnostic_messages,
@@ -90,6 +95,15 @@ class MotListPreviewWidget(QWidget):
             resource_context=getattr(handler, "resource_context", None),
         )
         self._build_ui(viewport_factory)
+        self.play_pause_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Space),
+            self,
+        )
+        self.play_pause_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.play_pause_shortcut.activated.connect(self.playback.toggle)
+        self.playback.play_button.setToolTip(self.tr("Play / pause (Space)"))
         self.playback.set_frame_driver(
             self.viewport.set_frame_callback,
         )
@@ -190,18 +204,42 @@ class MotListPreviewWidget(QWidget):
         )
         self.blend_shapes_toggle.toggled.connect(self._on_blend_shapes_toggled)
         self.rig_pane.add_widget(self.blend_shapes_toggle)
-        self.rig_pane.body_layout.addStretch(1)
+        event_details_title = QLabel(self.tr("SELECTED TIMELINE EVENT"))
+        event_details_title.setObjectName("motionInspectorLabel")
+        self.rig_pane.add_widget(event_details_title)
+        self.event_details = QPlainTextEdit(self.rig_pane)
+        self.event_details.setReadOnly(True)
+        self.event_details.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.event_details.setPlaceholderText(
+            self.tr("Click an event bar or marker to inspect its configuration.")
+        )
+        self.event_details.setMinimumHeight(150)
+        self.rig_pane.add_widget(self.event_details, 1)
 
         self.viewport = viewport_factory(
             self.viewport_pane,
             controls="motion",
             settings=settings if isinstance(settings, dict) else None,
+            initial_distance=3.0,
         )
         self.viewport.setMinimumHeight(320)
         self.viewport.set_bone_name_labels_visible(
             self.bone_names_toggle.isChecked()
         )
         self.viewport_pane.add_widget(self.viewport, 1)
+        self.event_timeline = MotionEventTimeline(self.viewport_pane)
+        self.event_timeline.frame_requested.connect(self.playback.seek)
+        self.event_timeline.scrub_started.connect(self.playback.stop)
+        self.event_timeline.details_requested.connect(
+            self.event_details.setPlainText
+        )
+        self.event_timeline_scroll = QScrollArea(self.viewport_pane)
+        self.event_timeline_scroll.setWidgetResizable(True)
+        self.event_timeline_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.event_timeline_scroll.setMinimumHeight(150)
+        self.event_timeline_scroll.setMaximumHeight(280)
+        self.event_timeline_scroll.setWidget(self.event_timeline)
+        self.viewport_pane.add_widget(self.event_timeline_scroll)
         self.viewport_pane.add_widget(self.status_label)
 
         self.workspace.add_pane(self.animation_pane, 0)
@@ -305,6 +343,7 @@ class MotListPreviewWidget(QWidget):
         if motion is None:
             self._clear_scene(self.tr("No motion is selected."))
             return
+        self.event_timeline.set_motion(motion)
         self.controller.clear()
         try:
             if self._using_source_rig or self._target is None:
@@ -330,12 +369,12 @@ class MotListPreviewWidget(QWidget):
                     deformation_targets if not self._using_source_rig else ()
                 ),
             ):
-                self._clear_scene(self.controller.error_message)
+                self._clear_scene(self.controller.error_message, clear_timeline=False)
                 return
             self.playback.configure()
             self._render(reset_camera=reset_camera)
         except (MotionPreviewError, ValueError) as exc:
-            self._clear_scene(str(exc))
+            self._clear_scene(str(exc), clear_timeline=False)
 
     def set_target(self, target: RigPreviewTarget) -> None:
         self._materials.clear()
@@ -458,7 +497,7 @@ class MotListPreviewWidget(QWidget):
         try:
             snapshot = self.controller.sample()
         except MotionPreviewError as exc:
-            self._clear_scene(str(exc))
+            self._clear_scene(str(exc), clear_timeline=False)
             return
         target = None if self._using_source_rig else self._target
         try:
@@ -468,9 +507,10 @@ class MotListPreviewWidget(QWidget):
                 reset_camera=reset_camera,
             )
         except (ValueError, RuntimeError) as exc:
-            self._clear_scene(str(exc))
+            self._clear_scene(str(exc), clear_timeline=False)
             return
         status = self._status_text(snapshot)
+        self.event_timeline.set_current_frame(snapshot.frame)
         if status != self.status_label.text():
             self.status_label.setText(status)
 
@@ -512,15 +552,18 @@ class MotListPreviewWidget(QWidget):
     def _show_error(self, message: str) -> None:
         self.status_label.setText(message)
 
-    def _clear_scene(self, message: str) -> None:
+    def _clear_scene(self, message: str, *, clear_timeline: bool = True) -> None:
         self.playback.clear()
+        if clear_timeline:
+            self.event_timeline.clear()
         self._scene_renderer.clear(reset_camera=True)
         self.status_label.setText(message)
 
     def _on_render_failure(self, message: str) -> None:
         if not self._cleaned:
             self._clear_scene(
-                self.tr("Material preview failed: {error}").format(error=message)
+                self.tr("Material preview failed: {error}").format(error=message),
+                clear_timeline=False,
             )
 
     def cleanup(self) -> None:

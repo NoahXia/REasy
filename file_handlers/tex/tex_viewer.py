@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QT_TRANSLATE_NOOP, Qt, Signal, QPoint, QTimer
 import numpy as np
 from PySide6.QtGui import QImage, QPixmap, QCursor, QMouseEvent, QWheelEvent
@@ -11,6 +13,20 @@ from PySide6.QtWidgets import (
 from .texture_decoder import decode_dds_mip, decode_tex_mip
 
 _EXPORT_TEX_TITLE = QT_TRANSLATE_NOOP("TexViewer", "Export TEX")
+
+
+def _default_png_path(source_path: str, image_index: int, mip_index: int) -> str:
+    if not source_path:
+        return "texture.png"
+    source = Path(source_path)
+    name = source.name
+    lower_name = name.casefold()
+    markers = [position for position in (lower_name.find(".tex"), lower_name.find(".dds")) if position > 0]
+    stem = name[:min(markers)] if markers else source.stem
+    suffix = ""
+    if image_index or mip_index:
+        suffix = f"_image{image_index}_mip{mip_index}"
+    return str(source.with_name(f"{stem}{suffix}.png"))
 
 
 class DraggableLabel(QLabel):
@@ -162,6 +178,10 @@ class TexViewer(QWidget):
         self.export_dds_btn.clicked.connect(self._export_dds)
         exp.addWidget(self.export_dds_btn)
 
+        self.export_png_btn = QPushButton(self.tr("Export PNG"))
+        self.export_png_btn.clicked.connect(self._export_png)
+        exp.addWidget(self.export_png_btn)
+
         exp.addStretch()
         layout.addLayout(exp)
 
@@ -173,6 +193,7 @@ class TexViewer(QWidget):
         is_dds = raw[:4] == b'DDS '
 
         self.export_dds_btn.setVisible(is_tex)
+        self.export_png_btn.setVisible(is_tex or is_dds)
         #self.export_tex_btn.setVisible(is_dds)
 
         self.image_index.blockSignals(True)
@@ -347,4 +368,42 @@ class TexViewer(QWidget):
 
         with open(path, 'wb') as f:
             f.write(dds)
+
+    def _export_png(self):
+        if not self.source_rgba or self.source_width <= 0 or self.source_height <= 0:
+            QMessageBox.warning(
+                self,
+                self.tr("Export PNG"),
+                self.tr("No decoded texture data loaded."),
+            )
+            return
+
+        default_path = _default_png_path(
+            str(getattr(self.handler, "filepath", "") or ""),
+            self.image_index.value(),
+            self.mip_index.value(),
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.tr("Save PNG"),
+            default_path,
+            self.tr("PNG images (*.png)"),
+        )
+        if not path:
+            return
+        if not path.casefold().endswith(".png"):
+            path += ".png"
+
+        image = QImage(
+            self.source_rgba,
+            self.source_width,
+            self.source_height,
+            QImage.Format_RGBA8888,
+        ).copy()
+        if not image.save(path, "PNG"):
+            QMessageBox.critical(
+                self,
+                self.tr("Export PNG Failed"),
+                self.tr("Could not write PNG file:\n{path}").format(path=path),
+            )
 

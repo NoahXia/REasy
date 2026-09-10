@@ -44,6 +44,36 @@ WOTS_DETAIL_MASK_ROLES = (
 WOTS_STCM_ROLES = (
     "SSSTranslucentCavityDetailMaskMap",
 )
+# Texture parameters used by WOTS' specialised character shaders.  Keep the
+# MDF parameter names here: the Unreal material bundle can then bind them
+# without losing the distinction between the face, eye, hair and transparent
+# shader families.  Common weather/VFX overlays are intentionally excluded.
+WOTS_SPECIALIZED_TEXTURE_ROLES = (
+    "MicroSkin_MaskTex",
+    "MicroSkin_NRRC",
+    "EyeAwake_Face_NRRM",
+    "EyeAwake_Face_EMI",
+    "EyeAwake_Face_ColorGradient",
+    "SweatMaskMap",
+    "Wrinkle_ALBMap01",
+    "Wrinkle_ALBMap02",
+    "Wrinkle_NRMMap01",
+    "Wrinkle_NRMMap02",
+    "Wrinkle_MaskMap01",
+    "Wrinkle_MaskMap02",
+    "CavityMap",
+    "HairFlowMap",
+    "Hair_Height_SpecMask_Shift_Map",
+    "Eye_FlatHeightMap",
+    "EyeAwake_Eyes_ALBD",
+    "EyeAwake_Eyes_NRRO",
+    "EmissiveMap",
+    "SecondAlphaMap",
+    "EventDissolve_AlphaMap",
+    "FakeHigLightInGameMap",
+    "FakeHighLightMap",
+    "StealthMap",
+)
 WRINKLE_DIFFUSE_MAPS = tuple(
     f"WrinkleDiffuseMap{index}"
     for index in range(1, 4)
@@ -240,7 +270,7 @@ def wots_material_texture_paths(
             "",
         )
 
-    return {
+    paths = {
         role: path
         for role, path in (
             (WOTS_NRRO_TEXTURE, first(WOTS_NRRO_ROLES)),
@@ -253,6 +283,12 @@ def wots_material_texture_paths(
         )
         if path
     }
+    paths.update(
+        (role, path)
+        for role in WOTS_SPECIALIZED_TEXTURE_ROLES
+        if (path := first((role,)))
+    )
+    return paths
 
 
 def wots_material_parameters(

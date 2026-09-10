@@ -194,6 +194,7 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
         WOTS_NORMAL_TEXTURE,
         WOTS_NRRO_TEXTURE,
         WOTS_RCTO_TEXTURE,
+        WOTS_SPECIALIZED_TEXTURE_ROLES,
         WOTS_STCM_TEXTURE,
         wots_material_parameters,
         wots_material_texture_paths,
@@ -240,20 +241,11 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
             texture.texture_type: texture.texture_path
             for texture in surface.textures
         }
-        missing = sorted(
+        missing = sorted({
             path
-            for path in (
-                surface.texture_path,
-                role_paths.get(WOTS_NRRO_TEXTURE, ""),
-                role_paths.get(WOTS_NORMAL_TEXTURE, ""),
-                role_paths.get(WOTS_RCTO_TEXTURE, ""),
-                role_paths.get(WOTS_ALPHA_TEXTURE, ""),
-                role_paths.get(WOTS_DETAIL_NRRC_TEXTURE, ""),
-                role_paths.get(WOTS_DETAIL_MASK_TEXTURE, ""),
-                role_paths.get(WOTS_STCM_TEXTURE, ""),
-            )
+            for path in (surface.texture_path, *role_paths.values())
             if path and _decoded_texture(handler, path, texture_cache) is None
-        )
+        })
         reasy_extras = {
             "gameVersion": surface.game_version,
             "mmtrPath": surface.mmtr_path,
@@ -278,6 +270,14 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
             )
             if image is not None
         }
+        for parameter_name in WOTS_SPECIALIZED_TEXTURE_ROLES:
+            image = _decoded_texture(
+                handler,
+                role_paths.get(parameter_name, ""),
+                texture_cache,
+            )
+            if image is not None:
+                raw_textures[parameter_name] = image
         unreal_master = _wots_unreal_master(
             name,
             surface.mmtr_path,
@@ -431,7 +431,12 @@ def _add_texture(
     builder: _GltfBuilder,
     image: GltfTextureImage,
     name: str,
+    cache: dict[tuple[str, int, int, bytes], int] | None = None,
 ) -> int:
+    source_key = str(image.source_path or "").replace("\\", "/").casefold()
+    cache_key = (source_key, int(image.width), int(image.height), image.rgba)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     view = builder.blob(_encode_png(image))
     image_index = len(document["images"])
     document["images"].append(
@@ -444,6 +449,8 @@ def _add_texture(
     )
     texture_index = len(document["textures"])
     document["textures"].append({"source": image_index})
+    if cache is not None:
+        cache[cache_key] = texture_index
     return texture_index
 
 
@@ -451,6 +458,7 @@ def _material_document(
     document: dict,
     builder: _GltfBuilder,
     asset: GltfMaterialAsset,
+    texture_cache: dict[tuple[str, int, int, bytes], int] | None = None,
 ) -> dict:
     pbr = {
         "baseColorFactor": list(asset.base_color_factor),
@@ -467,6 +475,7 @@ def _material_document(
                 builder,
                 image,
                 f"{asset.name}_{parameter_name}",
+                texture_cache,
             )
         base_index = texture_indices.get("BaseColorTexture")
         if base_index is not None:
@@ -518,6 +527,17 @@ def _source_texture_export_name(image: GltfTextureImage) -> str:
     return f"{_safe_export_name(source_name)}.png" if source_name else "texture.png"
 
 
+_WOTS_SRGB_TEXTURE_PARAMETERS = frozenset({
+    "BaseColorTexture",
+    "Wrinkle_ALBMap01",
+    "Wrinkle_ALBMap02",
+    "EyeAwake_Eyes_ALBD",
+    "EyeAwake_Face_ColorGradient",
+    "EmissiveMap",
+    "FakeHigLightInGameMap",
+})
+
+
 def _write_wots_unreal_bundle(
     gltf_path: Path,
     material_assets: dict[str, GltfMaterialAsset] | None,
@@ -550,10 +570,10 @@ def _write_wots_unreal_bundle(
             texture_files[parameter_name] = {
                 "file": f"{texture_dir.name}/{filename}",
                 "source": image.source_path,
-                "sRGB": parameter_name == "BaseColorTexture",
+                "sRGB": parameter_name in _WOTS_SRGB_TEXTURE_PARAMETERS,
                 "compression": (
                     "TC_Default"
-                    if parameter_name == "BaseColorTexture"
+                    if parameter_name in _WOTS_SRGB_TEXTURE_PARAMETERS
                     else "TC_Masks"
                 ),
                 "flipGreenChannel": False,
@@ -612,6 +632,7 @@ def _base_document(
         "skins": [],
         "animations": [],
     }
+    texture_cache: dict[tuple[str, int, int, bytes], int] = {}
     joint_nodes = []
     if rig is not None:
         for joint in rig.joints:
@@ -705,7 +726,7 @@ def _base_document(
                 material_indices[name] = len(document["materials"])
                 asset = (material_assets or {}).get(name)
                 document["materials"].append(
-                    _material_document(document, builder, asset)
+                    _material_document(document, builder, asset, texture_cache)
                     if asset is not None
                     else {"name": name}
                 )

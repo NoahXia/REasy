@@ -226,15 +226,21 @@ WOTS_PROFILE = MotionFormatProfile(
     mot=MotLayout(
         version=973,
         header_size=0x7C,
-        sequence_wrapper_size=0,
-        sequence_clip_offset=0,
-        tracks_data_size=0x14,
-        sequence_categories=frozenset(),
+        sequence_wrapper_size=0x40,
+        sequence_clip_offset=0x40,
+        tracks_data_size=0x1C,
+        sequence_categories=frozenset(range(10)),
         skeleton_topology_index=SkeletonTopologyIndexStrategy(
             indexed_parented_joint_types=frozenset(),
         ),
     ),
-    mot_clip=CompactClipLayout(version=0, header_size=0, node_size=0, property_size=0, key_size=0),
+    mot_clip=CompactClipLayout(
+        version=89,
+        header_size=0x98,
+        node_size=0x28,
+        property_size=0x38,
+        key_size=0x20,
+    ),
     mot_tree=MotTreeLayout(
         version=21,
         parameter_tables=MotTreeParameterTableStrategy(

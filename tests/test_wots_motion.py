@@ -18,6 +18,15 @@ from file_handlers.motion.mot.model import (
     Skeleton,
     TrackFamily,
 )
+from file_handlers.motion.mot_clip.model import (
+    ClipInterpolation,
+    ClipKey,
+    ClipNode,
+    ClipProperty,
+    ClipPropertyType,
+    CompactMotClip,
+)
+from file_handlers.motion.sequence.model import SequenceCategory, SequenceData
 from file_handlers.motion.preview.catalog import (
     MotionPreviewCatalog,
     _rebind_motion_skeleton,
@@ -45,6 +54,90 @@ def _minimal_mot(name: str = "idle") -> bytes:
     struct.pack_into("<H", data, 0x78, 60)
     data[0x7C:] = encoded
     return bytes(data)
+
+
+def _minimal_mot_with_timeline() -> bytes:
+    data = bytearray(0x300)
+    struct.pack_into("<I4s", data, 0, 973, b"mot ")
+    data[0x7C:0x8A] = "attack".encode("utf-16le") + b"\0\0"
+    struct.pack_into("<Q", data, 0x30, 0xA0)
+    struct.pack_into("<Q", data, 0x58, 0x7C)
+    struct.pack_into("<ffff", data, 0x60, 20.0, -1.0, 0.0, 20.0)
+    struct.pack_into("<B", data, 0x74, 1)
+    struct.pack_into("<H", data, 0x78, 60)
+
+    sequence = 0xB0
+    clip = sequence + 0x40
+    node_table = clip + 0x98
+    property_table = node_table + 2 * 0x28
+    bool_table = property_table + 0x38
+    strings8 = bool_table + 0x10
+    strings16 = strings8 + 4
+    strings16_data = (
+        "Root\0app.motion_track.AttackCollision_Wp\0".encode("utf-16le")
+    )
+    tracks = (strings16 + len(strings16_data) + 0xF) & ~0xF
+    end = tracks + 0x1C
+
+    struct.pack_into("<Q", data, 0xA0, sequence)
+    struct.pack_into("<QQ", data, sequence + 8, clip, tracks)
+    struct.pack_into("<II", data, sequence + 0x1C, 1, 1)
+    struct.pack_into("<I", data, sequence + 0x24, 0)
+
+    struct.pack_into("<IIfIIII", data, clip, 0x50494C43, 89, 20.0, 2, 1, 0, 2)
+    struct.pack_into("<II", data, clip + 0x1C, 0, 0)
+    pointers = (
+        node_table,
+        property_table,
+        bool_table,
+        bool_table,
+        strings8,
+        strings8,
+        strings8,
+        strings8,
+        strings8,
+        strings8,
+        strings8,
+        strings16,
+        tracks,
+        tracks,
+    )
+    struct.pack_into("<14Q", data, clip + 0x28, *pointers)
+
+    struct.pack_into("<HHIIIQQQ", data, node_table, 1, 0, 0, 0, 0, 0, 1, 0)
+    struct.pack_into(
+        "<HHIIIQQQ",
+        data,
+        node_table + 0x28,
+        0,
+        1,
+        0,
+        0,
+        0,
+        5,
+        0,
+        0,
+    )
+    struct.pack_into("<ffIIQ", data, property_table, 10.0, 20.0, 0, 0, 0)
+    struct.pack_into(
+        "<QHhBBBBQ",
+        data,
+        property_table + 0x20,
+        0,
+        2,
+        -1,
+        0,
+        1,
+        0,
+        0x10,
+        0,
+    )
+    struct.pack_into("<fI", data, bool_table, 10.0, 1 | (13 << 1) | (10 << 10))
+    struct.pack_into("<fI", data, bool_table + 8, 20.0, 1 | (1 << 1))
+    data[strings8:strings8 + 4] = b"_On\0"
+    data[strings16:strings16 + len(strings16_data)] = strings16_data
+    struct.pack_into("<I", data, tracks, 0xFFFFFFFF)
+    return bytes(data[:end])
 
 
 def _minimal_motlist(payload: bytes, motion_id: int = 42) -> bytes:
@@ -175,6 +268,96 @@ class TestWotsMotion(unittest.TestCase):
         self.assertEqual(motion.name, "walk")
         self.assertEqual(motion.end_frame, 1.0)
         self.assertFalse(motion.looping)
+
+    def test_v973_embedded_clip_v89_timeline(self):
+        motion = WOTS_MOTION_FORMAT_CODEC.parse_mot(
+            _minimal_mot_with_timeline(), label="fixture"
+        )
+        self.assertEqual(len(motion.sequences), 1)
+        sequence = motion.sequences[0]
+        self.assertEqual(sequence.category.name, "GAME")
+        self.assertEqual(sequence.clip.total_frame, 20.0)
+        track = sequence.clip.root.children[0]
+        self.assertEqual(track.name, "app.motion_track.AttackCollision_Wp")
+        event = track.properties[0]
+        self.assertEqual((event.start_frame, event.end_frame), (10.0, 20.0))
+        self.assertEqual([key.value for key in event.keys], [True, True])
+        self.assertEqual(event.keys[0].interpolation, ClipInterpolation.RANGE)
+        from file_handlers.motion.preview.event_timeline import motion_timeline_lanes
+
+        lanes = motion_timeline_lanes(motion)
+        self.assertEqual(len(lanes), 1)
+        self.assertEqual(lanes[0].category, "GAME")
+        self.assertEqual(lanes[0].intervals, ((10.0, 20.0),))
+        self.assertIn("_On  [10–20]", lanes[0].details)
+        self.assertEqual(lanes[0].name, "Attack Collision · Weapon")
+        self.assertIn("Attack Collision (Weapon)", lanes[0].details)
+
+    def test_player_cancel_timeline_exposes_semantic_phase_ranges(self):
+        phase = ClipProperty(
+            "_Phase",
+            ClipPropertyType.ENUM,
+            start_frame=20.0,
+            end_frame=216.0,
+            keys=[
+                ClipKey(
+                    frame=20.0,
+                    interpolation=ClipInterpolation.DISCRETE_TO_END,
+                    value="PRE",
+                ),
+                ClipKey(
+                    frame=40.0,
+                    interpolation=ClipInterpolation.DISCRETE_TO_END,
+                    value="ACTUAL",
+                ),
+                ClipKey(
+                    frame=216.0,
+                    interpolation=ClipInterpolation.DISCRETE,
+                    value="ACTUAL",
+                ),
+            ],
+        )
+        group = ClipProperty(
+            "_DodgeGroupCancel",
+            ClipPropertyType.NATIVE_CLASS,
+            start_frame=0.0,
+            end_frame=216.0,
+            children=[phase],
+        )
+        node = ClipNode(
+            "app.motion_track.PlayerCommandCancel",
+            properties=[group],
+        )
+        clip = CompactMotClip(
+            total_frame=216.0,
+            root=ClipNode("Root", children=[node]),
+        )
+        motion = Motion(
+            "cancel",
+            sequences=[SequenceData(SequenceCategory.GAME, clip)],
+        )
+
+        from file_handlers.motion.preview.event_timeline import (
+            _timeline_interval_is_active,
+            motion_timeline_lanes,
+            timeline_lane_details,
+        )
+
+        lanes = motion_timeline_lanes(motion)
+        self.assertEqual(len(lanes), 1)
+        lane = lanes[0]
+        self.assertEqual(lane.name, "Cancel · Dodge")
+        self.assertEqual(
+            [(item.start, item.end, item.state) for item in lane.segments],
+            [(20.0, 40.0, "PRE"), (40.0, 216.0, "ACTUAL")],
+        )
+        details = timeline_lane_details(lane, 30.0, None)
+        self.assertIn("CURRENT STATE: PRE", details)
+        self.assertIn("Frames 20–40  PRE", details)
+        self.assertNotIn("seconds", details)
+        self.assertNotIn("216: ACTUAL", details)
+        self.assertTrue(_timeline_interval_is_active(30.0, 20.0, 40.0, 216.0))
+        self.assertFalse(_timeline_interval_is_active(40.0, 20.0, 40.0, 216.0))
 
     def test_v21_mottree_resolves_bank_and_motion_reference(self):
         model = WOTS_MOTION_FORMAT_CODEC.parse(

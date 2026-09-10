@@ -13,8 +13,10 @@ import numpy as np
 from file_handlers.gltf_export import (
     GltfMaterialAsset,
     GltfTextureImage,
+    _GltfBuilder,
     _converted_trs,
     _encode_png,
+    _material_document,
     export_gltf,
 )
 from file_handlers.mesh.mesh_file import MeshMainVersion
@@ -209,6 +211,9 @@ class TestGltfExport(unittest.TestCase):
             "AlphaTexture": GltfTextureImage(
                 1, 1, bytes((64, 0, 0, 255)), "body_alp.tex"
             ),
+            "Wrinkle_ALBMap02": GltfTextureImage(
+                1, 1, bytes((30, 40, 50, 255)), "face_wrinkle_02.tex"
+            ),
         }
         material = GltfMaterialAsset(
             name="body",
@@ -249,13 +254,78 @@ class TestGltfExport(unittest.TestCase):
         self.assertNotIn("metallicRoughnessTexture", exported["pbrMetallicRoughness"])
         indices = exported["extras"]["REasy"]["unreal"]["textureIndices"]
         self.assertEqual(set(indices), set(textures))
-        self.assertEqual(len(document["images"]), 3)
+        self.assertEqual(len(document["images"]), 4)
         self.assertEqual(manifest["schema"], "REasy.WOTS.UnrealMaterials/1")
         self.assertEqual(
             manifest["materials"][0]["masterMaterial"],
             "/Game/Prototype/Demo/Onimusha/Materials/M_WOTS_Masked",
         )
+        exported_textures = manifest["materials"][0]["textures"]
+        self.assertTrue(exported_textures["BaseColorTexture"]["sRGB"])
+        self.assertTrue(exported_textures["Wrinkle_ALBMap02"]["sRGB"])
+        self.assertFalse(exported_textures["NRROTexture"]["sRGB"])
         self.assertEqual(raw_nrro, _encode_png(textures["NRROTexture"]))
+
+    def test_wots_glb_reuses_same_source_texture_across_materials(self):
+        pixel = GltfTextureImage(
+            1,
+            1,
+            bytes((10, 20, 30, 255)),
+            "natives/stm/streaming/body_albd.tex.1",
+        )
+        first = GltfMaterialAsset(
+            name="first",
+            wots_textures={"BaseColorTexture": pixel},
+        )
+        second = GltfMaterialAsset(
+            name="second",
+            wots_textures={"BaseColorTexture": pixel},
+        )
+        document = {"images": [], "textures": []}
+        builder = _GltfBuilder()
+        cache = {}
+
+        first_doc = _material_document(document, builder, first, cache)
+        second_doc = _material_document(document, builder, second, cache)
+
+        self.assertEqual(len(document["images"]), 1)
+        self.assertEqual(len(document["textures"]), 1)
+        self.assertEqual(
+            first_doc["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+            second_doc["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+        )
+
+    def test_wots_glb_embeds_specialized_character_textures(self):
+        pixel = GltfTextureImage(
+            1,
+            1,
+            bytes((10, 20, 30, 255)),
+            "face_micro_skin.tex",
+        )
+        asset = GltfMaterialAsset(
+            name="face",
+            wots_textures={
+                "BaseColorTexture": pixel,
+                "MicroSkin_NRRC": pixel,
+                "Wrinkle_MaskMap01": pixel,
+                "Eye_FlatHeightMap": pixel,
+            },
+        )
+        document = {"images": [], "textures": []}
+        builder = _GltfBuilder()
+        material = _material_document(document, builder, asset, {})
+
+        indices = material["extras"]["REasy"]["unreal"]["textureIndices"]
+        self.assertEqual(
+            set(indices),
+            {
+                "BaseColorTexture",
+                "MicroSkin_NRRC",
+                "Wrinkle_MaskMap01",
+                "Eye_FlatHeightMap",
+            },
+        )
+        self.assertEqual(len(document["images"]), 1)
 
     def test_skin_and_json_sidecar_export(self):
         influences = SimpleNamespace(
