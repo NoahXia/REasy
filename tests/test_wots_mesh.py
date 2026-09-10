@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import inspect
 import struct
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -14,9 +16,32 @@ from file_handlers.mesh.mesh_file import (
     _decode_skin_weights,
     get_mesh_version,
 )
+from file_handlers.mesh.material_resolver import MdfSurfaceProfile
+from ui.scene.gpu_skinning import GpuSkinningDeformer
+from ui.scene.scene_preview import ScenePreviewWidget
+from ui.scene.studio_material import StudioMaterialRenderer
 
 
 class TestWotsMesh(unittest.TestCase):
+    def test_preview_material_arguments_match_both_renderers(self):
+        preview = SimpleNamespace(
+            _material_profiles={
+                "face": MdfSurfaceProfile(
+                    material_name="face",
+                    game_version="ONIWOTS",
+                    parameters={"UseDetail": (1.0,), "SSSScale": (0.5,)},
+                )
+            },
+            _texture_ids={},
+        )
+        arguments = ScenePreviewWidget._wots_material_inputs(preview, "face")
+        self.assertNotIn("use_detail", arguments)
+        for renderer in (StudioMaterialRenderer.bind, GpuSkinningDeformer.bind):
+            self.assertLessEqual(
+                set(arguments),
+                set(inspect.signature(renderer).parameters),
+            )
+
     def test_version_pair(self):
         self.assertEqual(
             get_mesh_version(250203152, 260209350),

@@ -1465,9 +1465,22 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self.update()
 
     def _wots_material_inputs(self, material_name: str) -> dict[str, object]:
-        parameters = wots_material_parameters(
-            self._material_profiles.get(material_name)
-        )
+        parameters = wots_material_parameters(self._material_profiles.get(material_name))
+        # The shared material parser also exposes export-only detail/SSS
+        # metadata. Keep the preview contract explicit so new metadata cannot
+        # become an unexpected keyword argument to either renderer backend.
+        parameters = {
+            key: parameters[key]
+            for key in (
+                "wots_material",
+                "roughness_scale",
+                "occlusion_scale",
+                "alpha_adjust",
+                "alpha_threshold",
+                "alpha_test",
+            )
+            if key in parameters
+        }
         return {
             **parameters,
             "nrro_texture_id": self._texture_ids.get(

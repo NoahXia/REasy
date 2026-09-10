@@ -194,8 +194,12 @@ class RszHandler(BaseFileHandler):
         viewer.tree.setStyleSheet(get_tree_stylesheet(colors))
         viewer._initialize_editor_services()
         viewer.populate_tree()
+        from file_handlers.rsz.btable_preview import create_btable_preview
         from file_handlers.motion.preview.integration import create_pfb_motion_preview
 
+        btable_preview = create_btable_preview(self)
+        if btable_preview is not None:
+            viewer.add_preview_tab(btable_preview, viewer.tr("BTable Graph"))
         motion_preview = create_pfb_motion_preview(self)
         if motion_preview is not None:
             viewer.add_preview_tab(motion_preview, viewer.tr("3D"))

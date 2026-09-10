@@ -71,6 +71,15 @@ _MDF_PARSE_POOL: ProcessPoolExecutor | None = None
 _TWO_SIDED_FLAGS = (1 << 0) | (1 << 8)
 
 
+def shutdown_mdf_parse_pool() -> None:
+    """Stop the frozen-app worker before PyInstaller removes its temp tree."""
+    global _MDF_PARSE_POOL
+    pool = _MDF_PARSE_POOL
+    _MDF_PARSE_POOL = None
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def _extract_surface_profiles(
     mdf_data: bytes,
     actual_path: str,

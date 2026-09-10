@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from collections.abc import MutableMapping
@@ -114,7 +115,10 @@ class MeshMaterialSession(QObject):
             else resource_scope
         )
         self.texture_quality = normalize_texture_quality(texture_quality)
-        self.parse_in_subprocess = parse_in_subprocess
+        # A ProcessPool worker keeps PyInstaller's one-file extraction tree
+        # loaded after the Qt process exits on Windows. Parse MDF data in the
+        # main process in frozen builds so the bootloader can remove `_MEI`.
+        self.parse_in_subprocess = parse_in_subprocess and not getattr(sys, "frozen", False)
         self.resolved_mdf: ResolvedMdf | None = None
         self.bindings: list[MeshMaterialBinding] = []
         self.profiles: dict[str, object] = {}

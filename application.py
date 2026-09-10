@@ -74,6 +74,9 @@ def main(argv=None) -> int:
     LanguageManager.instance().initialize(settings)
 
     window = REasyEditorApp()
+    from file_handlers.mesh.material_resolver import shutdown_mdf_parse_pool
+
+    app.aboutToQuit.connect(shutdown_mdf_parse_pool)
     if len(argv) > 1 and not str(argv[1]).startswith("-"):
         filename = argv[1]
         try:
@@ -86,4 +89,7 @@ def main(argv=None) -> int:
             )
 
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        shutdown_mdf_parse_pool()

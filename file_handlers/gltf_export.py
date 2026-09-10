@@ -189,9 +189,12 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
     """Resolve MDF/TEX resources into portable glTF PBR material inputs."""
     from file_handlers.mesh.material_effects import (
         WOTS_ALPHA_TEXTURE,
+        WOTS_DETAIL_MASK_TEXTURE,
+        WOTS_DETAIL_NRRC_TEXTURE,
         WOTS_NORMAL_TEXTURE,
         WOTS_NRRO_TEXTURE,
         WOTS_RCTO_TEXTURE,
+        WOTS_STCM_TEXTURE,
         wots_material_parameters,
         wots_material_texture_paths,
     )
@@ -220,6 +223,15 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
         rcto = _decoded_texture(
             handler, role_paths.get(WOTS_RCTO_TEXTURE, ""), texture_cache
         )
+        detail_nrrc = _decoded_texture(
+            handler, role_paths.get(WOTS_DETAIL_NRRC_TEXTURE, ""), texture_cache
+        )
+        detail_mask = _decoded_texture(
+            handler, role_paths.get(WOTS_DETAIL_MASK_TEXTURE, ""), texture_cache
+        )
+        stcm = _decoded_texture(
+            handler, role_paths.get(WOTS_STCM_TEXTURE, ""), texture_cache
+        )
         alpha_adjust = float(parameters.get("alpha_adjust", 1.0))
         roughness_scale = float(parameters.get("roughness_scale", 1.0))
         occlusion_scale = float(parameters.get("occlusion_scale", 1.0))
@@ -236,6 +248,9 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
                 role_paths.get(WOTS_NORMAL_TEXTURE, ""),
                 role_paths.get(WOTS_RCTO_TEXTURE, ""),
                 role_paths.get(WOTS_ALPHA_TEXTURE, ""),
+                role_paths.get(WOTS_DETAIL_NRRC_TEXTURE, ""),
+                role_paths.get(WOTS_DETAIL_MASK_TEXTURE, ""),
+                role_paths.get(WOTS_STCM_TEXTURE, ""),
             )
             if path and _decoded_texture(handler, path, texture_cache) is None
         )
@@ -257,6 +272,9 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
                 ("NormalTexture", normal_source),
                 ("RCTOTexture", rcto),
                 ("AlphaTexture", alpha),
+                ("Detail_NRRC", detail_nrrc),
+                ("DetailMaskMap", detail_mask),
+                ("SSSTranslucentCavityDetailMaskMap", stcm),
             )
             if image is not None
         }
@@ -273,10 +291,16 @@ def resolve_gltf_materials(handler, resolved_mdf=None) -> dict[str, GltfMaterial
                 "RoughnessScale": roughness_scale,
                 "OcclusionScale": occlusion_scale,
                 "AlphaAdjust": alpha_adjust,
+                "Detail_Tiling": float(parameters.get("detail_tiling", 1.0)),
+                "Normal_BlendRate": float(parameters.get("normal_blend_rate", 1.0)),
+                "Roughness_BlendRate": float(parameters.get("roughness_blend_rate", 0.0)),
+                "Cavity_BlendRate": float(parameters.get("cavity_blend_rate", 0.0)),
+                "SSSScale": float(parameters.get("sss_scale", 0.0)),
             },
             "staticSwitchParameters": {
                 "UseRCTO": rcto is not None,
                 "UseStandaloneNormal": normal_source is not None and nrro is None,
+                "UseDetail": bool(parameters.get("use_detail", False)) and detail_nrrc is not None,
             },
             "vectorParameters": {
                 "BaseColorTint": list(surface.tint),
@@ -482,6 +506,18 @@ def _safe_export_name(value: str) -> str:
     return cleaned or "material"
 
 
+def _source_texture_export_name(image: GltfTextureImage) -> str:
+    """Keep the original RE texture basename while changing it to PNG."""
+    source_name = Path(str(image.source_path or "")).name
+    lower_name = source_name.casefold()
+    tex_marker = lower_name.find(".tex")
+    if tex_marker > 0:
+        source_name = source_name[:tex_marker]
+    elif source_name:
+        source_name = Path(source_name).stem
+    return f"{_safe_export_name(source_name)}.png" if source_name else "texture.png"
+
+
 def _write_wots_unreal_bundle(
     gltf_path: Path,
     material_assets: dict[str, GltfMaterialAsset] | None,
@@ -492,17 +528,25 @@ def _write_wots_unreal_bundle(
 
     texture_dir = gltf_path.with_name(f"{gltf_path.stem}_wots_textures")
     texture_dir.mkdir(parents=True, exist_ok=True)
+    exported_files: dict[str, tuple[str, bytes]] = {}
     materials = []
     for material_name, asset in assets.items():
         if not asset.wots_textures:
             continue
         texture_files = {}
         for parameter_name, image in asset.wots_textures.items():
-            filename = (
-                f"{_safe_export_name(material_name)}__"
-                f"{_safe_export_name(parameter_name)}.png"
-            )
-            (texture_dir / filename).write_bytes(_encode_png(image))
+            payload = _encode_png(image)
+            filename = _source_texture_export_name(image)
+            source_key = str(image.source_path or "").replace("\\", "/").casefold()
+            previous = exported_files.get(filename.casefold())
+            if previous is not None and previous != (source_key, payload):
+                # Preserve the original basename in the ordinary case. Only a
+                # genuine same-name collision receives a stable content suffix.
+                suffix = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
+                filename = f"{Path(filename).stem}__{suffix}.png"
+            if filename.casefold() not in exported_files:
+                (texture_dir / filename).write_bytes(payload)
+                exported_files[filename.casefold()] = (source_key, payload)
             texture_files[parameter_name] = {
                 "file": f"{texture_dir.name}/{filename}",
                 "source": image.source_path,

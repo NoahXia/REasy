@@ -241,7 +241,7 @@ class TestGltfExport(unittest.TestCase):
             )
             raw_nrro = (
                 path.with_name("material_wots_textures")
-                / "body__NRROTexture.png"
+                / "body_nrro.png"
             ).read_bytes()
 
         exported = document["materials"][0]

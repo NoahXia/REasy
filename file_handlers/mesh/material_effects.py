@@ -14,6 +14,9 @@ WOTS_NRRO_TEXTURE = "WOTS_NormalRoughnessOcclusion"
 WOTS_NORMAL_TEXTURE = "WOTS_Normal"
 WOTS_RCTO_TEXTURE = "WOTS_RoughnessCavityTranslucentOcclusion"
 WOTS_ALPHA_TEXTURE = "WOTS_Alpha"
+WOTS_DETAIL_NRRC_TEXTURE = "Detail_NRRC"
+WOTS_DETAIL_MASK_TEXTURE = "DetailMaskMap"
+WOTS_STCM_TEXTURE = "SSSTranslucentCavityDetailMaskMap"
 WOTS_GAME_VERSIONS = frozenset({"ONIMUSHAWOTS", "ONIWOTS", "WOTS"})
 WOTS_NRRO_ROLES = (
     "NormalRoughnessOcclusionMap",
@@ -31,6 +34,15 @@ WOTS_NORMAL_ROLES = (
 WOTS_RCTO_ROLES = (
     "RoughnessCavityTranslucentOcclusionMap",
     "TexChange_RoughnessCavityTranslucentOcclusionMap",
+)
+WOTS_DETAIL_NRRC_ROLES = (
+    "Detail_NRRC",
+)
+WOTS_DETAIL_MASK_ROLES = (
+    "DetailMaskMap",
+)
+WOTS_STCM_ROLES = (
+    "SSSTranslucentCavityDetailMaskMap",
 )
 WRINKLE_DIFFUSE_MAPS = tuple(
     f"WrinkleDiffuseMap{index}"
@@ -235,6 +247,9 @@ def wots_material_texture_paths(
             (WOTS_NORMAL_TEXTURE, first(WOTS_NORMAL_ROLES)),
             (WOTS_RCTO_TEXTURE, first(WOTS_RCTO_ROLES)),
             (WOTS_ALPHA_TEXTURE, first(WOTS_ALPHA_ROLES)),
+            (WOTS_DETAIL_NRRC_TEXTURE, first(WOTS_DETAIL_NRRC_ROLES)),
+            (WOTS_DETAIL_MASK_TEXTURE, first(WOTS_DETAIL_MASK_ROLES)),
+            (WOTS_STCM_TEXTURE, first(WOTS_STCM_ROLES)),
         )
         if path
     }
@@ -264,6 +279,12 @@ def wots_material_parameters(
         "alpha_adjust": scalar("AlphaAdjust", 1.0),
         "alpha_threshold": scalar("AlphaTestThreshold", 0.5),
         "alpha_test": scalar("IsAlphaTest", 0.0) >= 0.5,
+        "use_detail": scalar("UseDetail", 0.0) >= 0.5,
+        "detail_tiling": scalar("Detail_Tiling", 1.0),
+        "normal_blend_rate": scalar("Normal_BlendRate", 1.0),
+        "roughness_blend_rate": scalar("Roughness_BlendRate", 0.0),
+        "cavity_blend_rate": scalar("Cavity_BlendRate", 0.0),
+        "sss_scale": scalar("SSSScale", 0.0),
     }
 
 
