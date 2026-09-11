@@ -2,98 +2,16 @@ from __future__ import annotations
 
 """Read-only WOTS attack-parameter lookup used by the motion preview."""
 
-from copy import deepcopy
 from dataclasses import dataclass
 import re
 from typing import Iterable
 
 from file_handlers.rsz.rsz_file import RszFile
+from file_handlers.rsz.wots_registry import WotsTypeRegistry, apply_wots_registry_overlay
 from utils.enum_manager import EnumManager
 
 
-_ATTACK_PARAM_TYPES = {
-    "app.cAttackParamDataEnemy": "cdee5bcd",
-    "app.cAttackParamDataPlayer": "b25b515f",
-}
-
-
-def _float_field(name: str) -> dict:
-    return {
-        "align": 4,
-        "array": False,
-        "name": name,
-        "native": False,
-        "original_type": "System.Single",
-        "size": 4,
-        "type": "F32",
-    }
-
-
-class _AttackParameterRegistry:
-    """Registry overlay for fields missing from the current WOTS dump.
-
-    The application-wide registry is intentionally not mutated: these layout
-    corrections are only required when reading the two WOTS attack tables.
-    """
-
-    def __init__(self, base):
-        self.base = base
-        self.json_path = getattr(base, "json_path", "")
-        self._patched_by_id: dict[int, dict] = {}
-        self._patched_by_name: dict[str, tuple[dict, int]] = {}
-        for name, crc in _ATTACK_PARAM_TYPES.items():
-            info, type_id = base.find_type_by_name(name)
-            if info is None or type_id is None:
-                continue
-            patched = deepcopy(info)
-            fields = list(patched.get("fields", ()))
-            self._insert_after(fields, "_FireDamage", _float_field("_MiasmaDamage"))
-            self._insert_after(
-                fields,
-                "_MiasmaDamage",
-                _float_field("_MiasmaOutsideDamage"),
-            )
-            self._insert_after(fields, "_MiasmaOutsideDamage", _float_field("_OilDamage"))
-            self._insert_after(
-                fields,
-                "_OniEnergyAttack",
-                _float_field("_OniChangeEnergyAttack"),
-            )
-            if name.endswith("Player"):
-                self._insert_after(
-                    fields,
-                    "_AddSoulBoostGauge",
-                    _float_field("_AddSkill5Gauge"),
-                )
-            patched["fields"] = fields
-            patched["crc"] = crc
-            self._patched_by_id[int(type_id)] = patched
-            self._patched_by_name[name] = (patched, int(type_id))
-
-    @staticmethod
-    def _insert_after(fields: list[dict], anchor: str, field: dict) -> None:
-        if any(item.get("name") == field["name"] for item in fields):
-            return
-        for index, item in enumerate(fields):
-            if item.get("name") == anchor:
-                fields.insert(index + 1, field)
-                return
-        raise ValueError(f"WOTS attack-parameter registry is missing {anchor}")
-
-    def get_type_info(self, type_id: int):
-        return self._patched_by_id.get(int(type_id)) or self.base.get_type_info(
-            type_id
-        )
-
-    def find_type_by_name(self, type_name: str):
-        return self._patched_by_name.get(type_name) or self.base.find_type_by_name(
-            type_name
-        )
-
-    def pre_cache_types(self, type_ids) -> None:
-        pre_cache = getattr(self.base, "pre_cache_types", None)
-        if callable(pre_cache):
-            pre_cache(type_ids)
+_AttackParameterRegistry = WotsTypeRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +80,9 @@ def load_attack_parameter_source(
             rsz = RszFile()
             rsz.filepath = resolved_path
             rsz.game_version = "OnimushaWOTS"
-            rsz.type_registry = _AttackParameterRegistry(type_registry)
+            rsz.type_registry = apply_wots_registry_overlay(
+                type_registry, "OnimushaWOTS"
+            )
             rsz.read(data, validate_type_registry=True)
             records = _index_attack_parameters(rsz)
             if not records:

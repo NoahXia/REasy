@@ -141,6 +141,9 @@ class RszHandler(BaseFileHandler):
         if registry is None:
             json_path = self._resolve_type_registry_path()
             registry = RegistryManager.instance().get_registry(json_path) if json_path else None
+        from .wots_registry import apply_wots_registry_overlay
+
+        registry = apply_wots_registry_overlay(registry, self._infer_registry_game())
         self.type_registry = registry
         if self.type_registry and (
             self.type_registry.registry.get("metadata", {}).get("complete", False)
@@ -281,8 +284,12 @@ class RszHandler(BaseFileHandler):
         viewer._initialize_editor_services()
         viewer.populate_tree()
         from file_handlers.rsz.btable_preview import create_btable_preview
+        from file_handlers.rsz.data_table_preview import create_data_table_preview
         from file_handlers.motion.preview.integration import create_pfb_motion_preview
 
+        data_table_preview = create_data_table_preview(self)
+        if data_table_preview is not None:
+            viewer.add_preview_tab(data_table_preview, viewer.tr("Data Table"))
         btable_preview = create_btable_preview(self)
         if btable_preview is not None:
             viewer.add_preview_tab(btable_preview, viewer.tr("BTable Graph"))
