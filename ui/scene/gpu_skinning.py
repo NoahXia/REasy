@@ -99,6 +99,29 @@ class GpuSkinningDeformer:
     def keys(self) -> set[str]:
         return set(self._states)
 
+    @staticmethod
+    def binding_requirements(binding: SceneSkinningBinding) -> tuple[int, int]:
+        """Return the vertex-attribute and matrix-palette requirements."""
+        active = binding.weights > 0.0
+        palette_size = len(np.unique(binding.joint_indices[active]))
+        return 4 + binding.group_count * 2, palette_size
+
+    def supports_binding(self, binding: SceneSkinningBinding) -> bool:
+        """Whether the current OpenGL context can draw one skin binding."""
+        required_attributes, required_palette = self.binding_requirements(binding)
+        palette_limit = max(
+            0,
+            (
+                self._integer_limit(GL_MAX_VERTEX_UNIFORM_COMPONENTS)
+                - _GENERIC_VERTEX_UNIFORM_COMPONENTS
+            )
+            // 12,
+        )
+        return (
+            self._integer_limit(GL_MAX_VERTEX_ATTRIBS) >= required_attributes
+            and palette_limit >= required_palette
+        )
+
     def vertex_count(self, key: str) -> int:
         return len(self._state(key).binding.positions)
 

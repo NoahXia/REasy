@@ -6,9 +6,18 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 from file_handlers.motion.binary import ReadContext
-from file_handlers.motion.evaluation.model import EvaluatedPose, Transform
+from file_handlers.motion.evaluation.model import (
+    EvaluatedPose,
+    Rig,
+    RigJoint,
+    Transform,
+)
+from file_handlers.motion.evaluation.shared_rig import SharedRigPoseMapper
 from file_handlers.motion.errors import MotionParseError, MotionWriteError
 from file_handlers.motion.format_registry import find_motion_format
 from file_handlers.motion.mot.model import (
@@ -32,8 +41,23 @@ from file_handlers.motion.preview.catalog import (
     _rebind_motion_skeleton,
     _select_shared_skeleton,
 )
+from file_handlers.motion.preview.controller import MotionPreviewController
 from file_handlers.motion.preview.model import MotionPreviewSnapshot
 from file_handlers.motion.preview.renderer import MotionPreviewRenderer
+from file_handlers.motion.preview.support_registry import entity_motion_support_for_format
+from file_handlers.motion.preview.target import (
+    WOTS_MESH_PREVIEW_PRESETS,
+    load_re_engine_mesh_preset_target,
+)
+from file_handlers.motion.preview.attack_collision import (
+    AttackCollisionOverlay,
+    AttackCollisionSource,
+    active_attack_collisions,
+    attack_collision_geometry_diagnostic,
+    attack_rcol_resource_candidates,
+    collision_type_label,
+    load_attack_collision_resource,
+)
 from file_handlers.motion.preview.resolution import (
     MotionListDocument,
     MotionPreviewResolver,
@@ -41,8 +65,10 @@ from file_handlers.motion.preview.resolution import (
 )
 from file_handlers.motion.wots_codec import WOTS_MOTION_FORMAT_CODEC, WotsMotParser
 from file_handlers.motbank.motbank_file import MotbankFile, MotlistItem
+from file_handlers.rcol.shape_types import Sphere
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
+from utils.type_registry import TypeRegistry
 
 
 def _minimal_mot(name: str = "idle") -> bytes:
@@ -219,12 +245,56 @@ def _preview_snapshot(
 
 
 class _PreviewViewport:
-    def __init__(self):
+    def __init__(self, gpu_palette_limit=None):
         self.labels = ()
         self.positions = ()
+        self.scene = []
+        self.wireframe_overlays = []
+        self.skinning = {}
+        self.geometry_updates = set()
+        self.scene_update_count = 0
+        self.gpu_palette_limit = gpu_palette_limit
 
-    def set_scene(self, _meshes, *, reset_camera=True):
+    def set_scene(self, meshes, *, reset_camera=True):
+        self.scene = list(meshes)
         self.reset_camera = reset_camera
+        self.scene_update_count += 1
+
+    def set_wireframe_overlays(self, meshes):
+        self.wireframe_overlays = list(meshes)
+
+    def update_wireframe_overlay_geometries(self, geometries):
+        by_key = {mesh.key: mesh for mesh in self.wireframe_overlays}
+        for key, vertices in geometries.items():
+            mesh = by_key.get(key)
+            if mesh is not None:
+                mesh.vertices = np.asarray(vertices, dtype=np.float32)
+                self.geometry_updates.add(key)
+
+    def set_mesh_skinning(self, key, binding):
+        self.skinning[key] = binding
+
+    def can_use_gpu_skinning(self, binding):
+        if self.gpu_palette_limit is None:
+            return True
+        active = binding.weights > 0.0
+        return (
+            len(np.unique(binding.joint_indices[active]))
+            <= self.gpu_palette_limit
+        )
+
+    def update_mesh_skinning(self, _key, _matrices):
+        pass
+
+    def update_mesh_skinning_source(self, _key, _positions, _normals):
+        pass
+
+    def clear_mesh_skinning(self, keys=None):
+        if keys is None:
+            self.skinning.clear()
+        else:
+            for key in keys:
+                self.skinning.pop(key, None)
 
     def set_bone_name_labels(self, names, positions):
         self.labels = tuple(names)
@@ -235,6 +305,17 @@ class _PreviewViewport:
         self.positions = ()
 
     def update_mesh_transforms(self, _matrices, *, recompute_bounds=True):
+        self.recompute_bounds = recompute_bounds
+
+    def update_mesh_geometry(
+        self,
+        key,
+        _vertices,
+        _normals=None,
+        *,
+        recompute_bounds=True,
+    ):
+        self.geometry_updates.add(key)
         self.recompute_bounds = recompute_bounds
 
 
@@ -251,6 +332,28 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_shared_rig_root_can_follow_an_owner_attachment_joint(self):
+        owner = Rig([
+            RigJoint("root"),
+            RigJoint("R_Wep", 0),
+        ])
+        weapon = Rig([
+            RigJoint("root"),
+            RigJoint("Base", 0),
+        ])
+        mapper = SharedRigPoseMapper(
+            owner,
+            weapon,
+            np.identity(4, dtype=np.float32),
+            root_attachment_joint="R_Wep",
+        )
+        root = np.identity(4, dtype=np.float32)
+        hand = np.identity(4, dtype=np.float32)
+        hand[3, :3] = (1.0, 2.0, 3.0)
+        world = mapper.world_matrices((root, hand))
+        np.testing.assert_allclose(world[0], hand)
+        np.testing.assert_allclose(world[1], hand)
+
     def test_v1036_dispatch_and_read_only(self):
         codec = find_motion_format(_minimal_motlist(_minimal_mot()))
         self.assertIs(codec, WOTS_MOTION_FORMAT_CODEC)
@@ -289,9 +392,8 @@ class TestWotsMotion(unittest.TestCase):
         self.assertEqual(len(lanes), 1)
         self.assertEqual(lanes[0].category, "GAME")
         self.assertEqual(lanes[0].intervals, ((10.0, 20.0),))
-        self.assertIn("_On  [10–20]", lanes[0].details)
+        self.assertEqual(lanes[0].properties[0].name, "_On")
         self.assertEqual(lanes[0].name, "Attack Collision · Weapon")
-        self.assertIn("Attack Collision (Weapon)", lanes[0].details)
 
     def test_player_cancel_timeline_exposes_semantic_phase_ranges(self):
         phase = ClipProperty(
@@ -340,6 +442,7 @@ class TestWotsMotion(unittest.TestCase):
         from file_handlers.motion.preview.event_timeline import (
             _timeline_interval_is_active,
             motion_timeline_lanes,
+            timeline_event_selection,
             timeline_lane_details,
         )
 
@@ -352,12 +455,262 @@ class TestWotsMotion(unittest.TestCase):
             [(20.0, 40.0, "PRE"), (40.0, 216.0, "ACTUAL")],
         )
         details = timeline_lane_details(lane, 30.0, None)
-        self.assertIn("CURRENT STATE: PRE", details)
-        self.assertIn("Frames 20–40  PRE", details)
-        self.assertNotIn("seconds", details)
-        self.assertNotIn("216: ACTUAL", details)
+        self.assertIn("EventName: Cancel · Dodge", details)
+        self.assertIn("StartFrame: 20", details)
+        self.assertIn("EndFrame: 40", details)
+        self.assertIn("FrameCount: 20", details)
+        self.assertNotIn("RAW TRACK DATA", details)
+        selection = timeline_event_selection(lane, 30.0, None)
+        self.assertEqual(selection.properties[0].name, "_Phase")
+        self.assertEqual((selection.start_frame, selection.end_frame), (20.0, 40.0))
         self.assertTrue(_timeline_interval_is_active(30.0, 20.0, 40.0, 216.0))
         self.assertFalse(_timeline_interval_is_active(40.0, 20.0, 40.0, 216.0))
+
+    def test_timeline_uses_playable_motion_duration(self):
+        from file_handlers.motion.preview.event_timeline import (
+            TimelineLane,
+            _display_property_name,
+            _format_frame,
+            _humanize_identifier,
+            _timeline_end_frame,
+        )
+
+        lanes = (
+            TimelineLane("VFX", "VFXRange", 347.0, ((15.0, 25.0),), (), ""),
+        )
+        motion = Motion("attack", end_frame=184.0)
+        self.assertEqual(_timeline_end_frame(motion, lanes), 184.0)
+
+        motion.end_frame = 0.0
+        self.assertEqual(_timeline_end_frame(motion, lanes), 347.0)
+        self.assertEqual(_format_frame(24.0), "24")
+        self.assertEqual(_format_frame(24.25), "24.25")
+        self.assertEqual(_display_property_name("_AttackParamID"), "AttackParamID")
+        self.assertEqual(_display_property_name("__Internal"), "Internal")
+        self.assertEqual(
+            _display_property_name("_<BlendRate>k__BackingField"),
+            "BlendRate",
+        )
+        self.assertEqual(
+            _humanize_identifier("VFXTrigger_Wp"),
+            "VFX Trigger Wp",
+        )
+
+    def test_attack_collision_semantics_and_rcol_resource_selection(self):
+        on = ClipProperty(
+            "_On",
+            ClipPropertyType.BOOL,
+            start_frame=10.0,
+            end_frame=20.0,
+            keys=[ClipKey(frame=10.0, value=True)],
+        )
+        request = ClipProperty(
+            "_RequestSetID",
+            ClipPropertyType.U32,
+            start_frame=0.0,
+            end_frame=30.0,
+            keys=[ClipKey(frame=0.0, value=120)],
+        )
+        attack = ClipProperty(
+            "_AttackParamID",
+            ClipPropertyType.U32,
+            start_frame=0.0,
+            end_frame=30.0,
+            keys=[ClipKey(frame=0.0, value=42)],
+        )
+        collision = ClipProperty(
+            "_CollisionType",
+            ClipPropertyType.U32,
+            start_frame=0.0,
+            end_frame=30.0,
+            keys=[ClipKey(frame=0.0, value=2)],
+        )
+        motion = Motion(
+            "attack",
+            end_frame=30.0,
+            sequences=[SequenceData(
+                SequenceCategory.GAME,
+                CompactMotClip(
+                    total_frame=30.0,
+                    root=ClipNode(
+                        "Root",
+                        children=[ClipNode(
+                            "app.motion_track.AttackCollision_Wp",
+                            properties=[request, on, attack, collision],
+                        )],
+                    ),
+                ),
+            )],
+        )
+        self.assertEqual(active_attack_collisions(motion, 9.0), ())
+        active = active_attack_collisions(motion, 12.0)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].request_set_id, 120)
+        self.assertEqual(active[0].attack_param_id, 42)
+        self.assertEqual(active[0].collision_type_name, "MAIN_WEAPON")
+        self.assertEqual(collision_type_label(8), "SUB7_WEAPON")
+        self.assertEqual(
+            attack_rcol_resource_candidates(
+                "natives/stm/Motion/Player/Weapon/test.motlist.1036"
+            ),
+            (
+                "natives/stm/GameDesign/Action/Player/Collision/Collider/PlayerAttack.rcol.37",
+            ),
+        )
+
+    def test_attack_overlay_prefers_authored_request_set_id(self):
+        payload = Sphere()
+        payload.center = [0.0, 1.0, 0.0]
+        payload.radius = 0.25
+        shape = SimpleNamespace(
+            shape=payload,
+            info=SimpleNamespace(
+                primary_joint_name_str="root",
+                secondary_joint_name_str="",
+                primary_joint_name_hash=0,
+                secondary_joint_name_hash=0,
+            ),
+        )
+        authored_group = SimpleNamespace(shapes=[shape], extra_shapes=[])
+        fallback_group = SimpleNamespace(shapes=[], extra_shapes=[])
+        source = AttackCollisionSource(
+            "fixture.rcol.37",
+            SimpleNamespace(request_sets=[
+                SimpleNamespace(
+                    info=SimpleNamespace(field0=120, id=37),
+                    group=authored_group,
+                ),
+                SimpleNamespace(
+                    info=SimpleNamespace(field0=999, id=120),
+                    group=fallback_group,
+                ),
+            ]),
+        )
+        self.assertIs(source.request_set(120).group, authored_group)
+
+        event_motion = Motion(
+            "attack",
+            end_frame=30.0,
+            sequences=[SequenceData(
+                SequenceCategory.GAME,
+                CompactMotClip(
+                    total_frame=30.0,
+                    root=ClipNode(
+                        "Root",
+                        children=[ClipNode(
+                            "app.motion_track.AttackCollision_Body",
+                            properties=[
+                                ClipProperty(
+                                    "_RequestSetID",
+                                    ClipPropertyType.U32,
+                                    0.0,
+                                    30.0,
+                                    keys=[ClipKey(frame=0.0, value=120)],
+                                ),
+                                ClipProperty(
+                                    "_On",
+                                    ClipPropertyType.BOOL,
+                                    5.0,
+                                    15.0,
+                                    keys=[ClipKey(frame=5.0, value=True)],
+                                ),
+                                ClipProperty(
+                                    "_AttackParamID",
+                                    ClipPropertyType.U32,
+                                    0.0,
+                                    30.0,
+                                    keys=[ClipKey(frame=0.0, value=7)],
+                                ),
+                            ],
+                        )],
+                    ),
+                ),
+            )],
+        )
+        snapshot = _preview_snapshot(((0.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
+        snapshot = MotionPreviewSnapshot(
+            frame=10.0,
+            end_frame=snapshot.end_frame,
+            pose=snapshot.pose,
+            joint_names=snapshot.joint_names,
+            joint_positions=snapshot.joint_positions,
+            bone_pairs=snapshot.bone_pairs,
+            node_weights=snapshot.node_weights,
+            root_deltas=snapshot.root_deltas,
+            deformation_weights=snapshot.deformation_weights,
+            diagnostics=snapshot.diagnostics,
+        )
+        overlay = AttackCollisionOverlay(source)
+        meshes = overlay.meshes(event_motion, snapshot)
+        self.assertEqual(overlay.signature(event_motion, 10.0), (120,))
+        self.assertEqual(len(meshes), 1)
+        self.assertTrue(meshes[0].key.startswith(overlay.KEY_PREFIX))
+
+        # Weapon-track RCOL geometry belongs to a separate weapon
+        # ColliderSwitcher. It must never be interpreted in actor-root space.
+        track = event_motion.sequences[0].clip.root.children[0]
+        track.name = "app.motion_track.AttackCollision_Wp"
+        track.properties.append(ClipProperty(
+            "_CollisionType",
+            ClipPropertyType.U32,
+            0.0,
+            30.0,
+            keys=[ClipKey(frame=0.0, value=2)],
+        ))
+        active = active_attack_collisions(event_motion, 10.0)
+        self.assertEqual(len(active), 1)
+        self.assertIn(
+            "weapon-local collider space",
+            attack_collision_geometry_diagnostic(active[0]),
+        )
+        self.assertEqual(overlay.signature(event_motion, 10.0), ())
+        self.assertEqual(overlay.meshes(event_motion, snapshot), [])
+        renderer = MotionPreviewRenderer(_PreviewViewport())
+        renderer.set_attack_collision_source(source)
+        status = renderer.attack_collision_status(event_motion, 10.0)
+        self.assertIn("Attack hitbox not drawn: RequestSet 120", status)
+        self.assertIn("MAIN_WEAPON uses weapon-local collider space", status)
+
+    def test_sound_event_profile_uses_enabled_trigger_keys(self):
+        trigger = ClipProperty(
+            "Trigger",
+            ClipPropertyType.BOOL,
+            start_frame=10.0,
+            end_frame=20.0,
+            keys=[
+                ClipKey(frame=10.0, value=True),
+                ClipKey(frame=20.0, value=False),
+            ],
+        )
+        motion = Motion(
+            "sound",
+            end_frame=30.0,
+            sequences=[
+                SequenceData(
+                    SequenceCategory.SOUND,
+                    CompactMotClip(
+                        total_frame=30.0,
+                        root=ClipNode(
+                            "Root",
+                            children=[
+                                ClipNode(
+                                    "app.snd_mot_track.SoundTriggerTracksApp",
+                                    properties=[trigger],
+                                )
+                            ],
+                        ),
+                    ),
+                )
+            ],
+        )
+
+        from file_handlers.motion.preview.event_timeline import motion_timeline_lanes
+
+        lane = motion_timeline_lanes(motion)[0]
+        self.assertEqual(lane.name, "Sound Trigger")
+        self.assertEqual(lane.intervals, ((10.0, 10.0),))
+        self.assertEqual(lane.markers, (10.0,))
+        self.assertIn("Wwise", lane.details)
 
     def test_v21_mottree_resolves_bank_and_motion_reference(self):
         model = WOTS_MOTION_FORMAT_CODEC.parse(
@@ -526,6 +879,159 @@ class TestWotsMotion(unittest.TestCase):
     os.environ.get("REASY_WOTS_ASSET_ROOT"), "set REASY_WOTS_ASSET_ROOT"
 )
 class TestWotsAssets(unittest.TestCase):
+    def test_ch001_model_preset_composes_character_and_weapon_parts(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        preset = WOTS_MESH_PREVIEW_PRESETS[0]
+        resources = []
+        for resource_path in preset.resource_paths:
+            relative = resource_path.replace("\\", "/")
+            relative = relative.split("natives/stm/", 1)[-1]
+            path = root / Path(relative)
+            resources.append((str(path), path.read_bytes()))
+        target = load_re_engine_mesh_preset_target(preset, tuple(resources))
+        self.assertEqual(len(target.render_parts), 5)
+        self.assertEqual(
+            tuple(part.attachment_joint for part in target.render_parts),
+            ("", "", "", "R_Wep", "Katana_root"),
+        )
+        self.assertEqual(
+            tuple(part.weapon_collision_type for part in target.render_parts),
+            (None, None, None, 2, None),
+        )
+
+        motlist = (
+            root
+            / "Motion/Player/Weapon/plw_KatateAttack/"
+            "plw_KatateAttack.motlist.1036"
+        )
+        model = WOTS_MOTION_FORMAT_CODEC.parse(
+            motlist.read_bytes(),
+            label=str(motlist),
+        )
+        catalog = MotionPreviewCatalog(
+            MotionListDocument(str(motlist), model),
+            WOTS_TREE_MOTION_REFERENCES,
+            WOTS_MOTION_FORMAT_CODEC,
+        )
+        motion = next(
+            entry.resolve_motion()
+            for entry in catalog.refresh().entries
+            if entry.name.casefold() == "plw_katateattack_000"
+        )
+        support = entity_motion_support_for_format(WOTS_MOTION_FORMAT_CODEC)
+        self.assertIsNotNone(support)
+        controller = MotionPreviewController(support.evaluation)
+        self.assertTrue(
+            controller.load(motion, target.rig),
+            controller.error_message,
+        )
+        controller.set_frame(24.0)
+        viewport = _PreviewViewport()
+        renderer = MotionPreviewRenderer(viewport)
+        renderer.present(
+            controller.sample(),
+            target,
+            reset_camera=True,
+            motion=motion,
+        )
+        expected = {
+            "motion-preview:target:0",
+            "motion-preview:target:1",
+            "motion-preview:target:2",
+            "motion-preview:target:3",
+            "motion-preview:target:4",
+        }
+        self.assertEqual({mesh.key for mesh in viewport.scene}, expected)
+        self.assertEqual(set(viewport.skinning), expected)
+
+        limited_viewport = _PreviewViewport(gpu_palette_limit=1)
+        limited_renderer = MotionPreviewRenderer(limited_viewport)
+        limited_renderer.present(
+            controller.sample(),
+            target,
+            reset_camera=True,
+            motion=motion,
+        )
+        oversized = {
+            key
+            for key, deformer in limited_renderer._deformers.items()
+            if len(np.unique(
+                deformer.binding.joint_indices[deformer.binding.weights > 0.0]
+            )) > 1
+        }
+        self.assertTrue(oversized)
+        self.assertTrue(oversized.isdisjoint(limited_viewport.skinning))
+
+        def resource_loader(resource_path):
+            relative = resource_path.replace("\\", "/")
+            relative = relative.split("natives/stm/", 1)[-1]
+            path = root / Path(relative)
+            return (str(path), path.read_bytes()) if path.is_file() else None
+
+        registry = TypeRegistry(str(
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        ))
+        actor_source, actor_errors = load_attack_collision_resource(
+            "natives/stm/GameDesign/Action/Player/Collision/Collider/"
+            "PlayerAttack.rcol.37",
+            resource_loader,
+            type_registry=registry,
+        )
+        weapon_source, weapon_errors = load_attack_collision_resource(
+            preset.weapon_attack_resources[0][1],
+            resource_loader,
+            type_registry=registry,
+        )
+        self.assertFalse(actor_errors)
+        self.assertFalse(weapon_errors)
+        self.assertIsNotNone(actor_source)
+        self.assertIsNotNone(weapon_source)
+
+        collision_viewport = _PreviewViewport()
+        collision_renderer = MotionPreviewRenderer(collision_viewport)
+        collision_renderer.set_attack_collision_source(actor_source)
+        collision_renderer.set_weapon_attack_collision_sources({2: weapon_source})
+        collision_renderer.present(
+            controller.sample(),
+            target,
+            reset_camera=True,
+            motion=motion,
+        )
+        scene_update_count = collision_viewport.scene_update_count
+        controller.set_frame(27.0)
+        snapshot = controller.sample()
+        collision_renderer.present(
+            snapshot,
+            target,
+            reset_camera=False,
+            motion=motion,
+        )
+        hitboxes = [
+            mesh
+            for mesh in collision_viewport.wireframe_overlays
+            if mesh.key.startswith(AttackCollisionOverlay.KEY_PREFIX)
+        ]
+        self.assertEqual(len(hitboxes), 8)
+        self.assertTrue(all(np.isfinite(mesh.vertices).all() for mesh in hitboxes))
+        self.assertTrue(all(mesh.exclude_from_bounds for mesh in hitboxes))
+        self.assertEqual(collision_viewport.scene_update_count, scene_update_count)
+        controller.set_frame(28.0)
+        collision_renderer.present(
+            controller.sample(),
+            target,
+            reset_camera=False,
+            motion=motion,
+        )
+        self.assertEqual(collision_viewport.scene_update_count, scene_update_count)
+        status = collision_renderer.attack_collision_status(
+            motion,
+            snapshot.frame,
+        )
+        self.assertIn("RequestSet 0, 36", status)
+        self.assertIn("MAIN_WEAPON, BODY", status)
+        self.assertNotIn("not drawn", status)
+
     def test_all_motion_assets_parse(self):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
         motlists = list(root.rglob("*.motlist.1036"))

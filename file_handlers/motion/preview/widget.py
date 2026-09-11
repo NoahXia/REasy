@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QInputDialog,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
 from ui.scene.scene_preview import ScenePreviewWidget
 from settings import save_settings
 from utils.resource_file_utils import resolve_handler_resource_data
+from utils.app_paths import resource_path
+from utils.registry_manager import RegistryManager
 from file_handlers.mesh.material_session import (
     MeshMaterialCollection,
     MeshMaterialSession,
@@ -34,10 +37,14 @@ from ..mot.model import Motion
 from .catalog import MotionPreviewCatalog
 from .blend_shapes import mesh_blend_shape_targets
 from .animation_browser import MotionEntryList
+from .attack_collision import (
+    load_attack_collision_resource,
+    load_attack_collision_source,
+)
 from .controller import MotionPreviewController
 from .controls import MotionPlaybackControls
 from .editor_layout import MotionEditorPane, MotionEditorWorkspace
-from .event_timeline import MotionEventTimeline
+from .event_timeline import MotionEventDetailsWidget, MotionEventTimeline
 from .model import (
     MotionPreviewError,
     snapshot_diagnostic_messages,
@@ -50,10 +57,43 @@ from .resolution import (
 )
 from .renderer import MotionPreviewRenderer
 from .support_registry import entity_motion_support_for_format
-from .target import RigPreviewTarget, load_re_engine_mesh_target
+from .target import (
+    RigPreviewTarget,
+    WOTS_MESH_PREVIEW_PRESETS,
+    load_re_engine_mesh_preset_target,
+    load_re_engine_mesh_target,
+)
 
 
 ViewportFactory = Callable[..., QWidget]
+
+
+def _wots_type_registry(handler):
+    """Resolve the WOTS registry in both source and frozen distributions."""
+    app = getattr(handler, "app", None)
+    override = getattr(app, "_rsz_type_registry_override", None)
+    if (
+        override is not None
+        and Path(str(getattr(override, "json_path", ""))).name.casefold()
+        == "rszoniwots.json"
+    ):
+        return override
+
+    settings = getattr(app, "settings", {}) or {}
+    configured = Path(str(settings.get("rcol_json_path", "") or ""))
+    candidates = []
+    if configured.name.casefold() == "rszoniwots.json":
+        candidates.append(configured)
+    candidates.extend((
+        resource_path("resources/data/dumps/rszoniwots.json"),
+        resource_path("rszoniwots.json"),
+    ))
+    for candidate in candidates:
+        if candidate.is_file():
+            registry = RegistryManager.instance().get_registry(str(candidate.resolve()))
+            if registry is not None:
+                return registry
+    return None
 
 
 class MotListPreviewWidget(QWidget):
@@ -61,6 +101,7 @@ class MotListPreviewWidget(QWidget):
 
     modified_changed = Signal(bool)
     BONE_NAMES_SETTING = "motion_preview_show_bone_names"
+    ATTACK_HITBOXES_SETTING = "motion_preview_show_attack_hitboxes"
 
     def __init__(
         self,
@@ -83,8 +124,11 @@ class MotListPreviewWidget(QWidget):
         self._motions: list[PreviewMotionEntry] = []
         self._target: RigPreviewTarget | None = None
         self._target_material_session: MeshMaterialSession | None = None
+        self._target_material_sessions: dict[str, MeshMaterialSession] = {}
         self._using_source_rig = True
         self._cleaned = False
+        self._attack_collision_diagnostics: tuple[str, ...] = ()
+        self._weapon_attack_collision_diagnostics: tuple[str, ...] = ()
         root_path = str(getattr(handler, "filepath", "") or handler.model.name)
         self._catalog = MotionPreviewCatalog(
             MotionListDocument(root_path, handler.model),
@@ -116,6 +160,16 @@ class MotListPreviewWidget(QWidget):
             self._materials.set_texture_quality
         )
         self._scene_renderer = MotionPreviewRenderer(self.viewport)
+        type_registry = _wots_type_registry(handler)
+        attack_source, self._attack_collision_diagnostics = load_attack_collision_source(
+            root_path,
+            self._catalog.resources.resource_data,
+            type_registry=type_registry,
+        )
+        self._scene_renderer.set_attack_collision_source(attack_source)
+        self._scene_renderer.set_attack_hitboxes_enabled(
+            self.attack_hitboxes_toggle.isChecked()
+        )
         self._populate_motions()
 
     def _build_ui(self, viewport_factory: ViewportFactory) -> None:
@@ -171,6 +225,19 @@ class MotListPreviewWidget(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self.rig_pane.add_widget(self.rig_label)
+        preset_title = QLabel(self.tr("MODEL PRESET"))
+        preset_title.setObjectName("motionInspectorLabel")
+        self.rig_pane.add_widget(preset_title)
+        self.model_preset_combo = QComboBox(self.rig_pane)
+        for preset in WOTS_MESH_PREVIEW_PRESETS:
+            self.model_preset_combo.addItem(self.tr(preset.label), preset.key)
+        self.model_preset_combo.setToolTip(
+            self.tr("Load all character mesh parts in the selected preview preset")
+        )
+        self.rig_pane.add_widget(self.model_preset_combo)
+        self.load_preset_button = QPushButton(self.tr("Load Model Preset"))
+        self.load_preset_button.clicked.connect(self._load_model_preset)
+        self.rig_pane.add_widget(self.load_preset_button)
         self.load_resource_button = QPushButton(self.tr("Load Mesh Resource…"))
         self.load_resource_button.clicked.connect(self._load_mesh_resource)
         self.rig_pane.add_widget(self.load_resource_button)
@@ -195,6 +262,22 @@ class MotListPreviewWidget(QWidget):
         )
         self.bone_names_toggle.toggled.connect(self._on_bone_names_toggled)
         self.rig_pane.add_widget(self.bone_names_toggle)
+        self.attack_hitboxes_toggle = QCheckBox(self.tr("Show attack hitboxes"))
+        self.attack_hitboxes_toggle.setChecked(
+            bool(settings.get(self.ATTACK_HITBOXES_SETTING, True))
+            if isinstance(settings, dict)
+            else True
+        )
+        self.attack_hitboxes_toggle.setToolTip(
+            self.tr(
+                "Draw active AttackCollision request sets from the actor and "
+                "loaded preset weapons in the animated pose."
+            )
+        )
+        self.attack_hitboxes_toggle.toggled.connect(
+            self._on_attack_hitboxes_toggled
+        )
+        self.rig_pane.add_widget(self.attack_hitboxes_toggle)
         self.blend_shapes_toggle = QCheckBox(self.tr("Blend shapes"))
         self.blend_shapes_toggle.setChecked(True)
         self.blend_shapes_toggle.setEnabled(False)
@@ -204,15 +287,7 @@ class MotListPreviewWidget(QWidget):
         )
         self.blend_shapes_toggle.toggled.connect(self._on_blend_shapes_toggled)
         self.rig_pane.add_widget(self.blend_shapes_toggle)
-        event_details_title = QLabel(self.tr("SELECTED TIMELINE EVENT"))
-        event_details_title.setObjectName("motionInspectorLabel")
-        self.rig_pane.add_widget(event_details_title)
-        self.event_details = QPlainTextEdit(self.rig_pane)
-        self.event_details.setReadOnly(True)
-        self.event_details.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.event_details.setPlaceholderText(
-            self.tr("Click an event bar or marker to inspect its configuration.")
-        )
+        self.event_details = MotionEventDetailsWidget(self.rig_pane)
         self.event_details.setMinimumHeight(150)
         self.rig_pane.add_widget(self.event_details, 1)
 
@@ -231,7 +306,7 @@ class MotListPreviewWidget(QWidget):
         self.event_timeline.frame_requested.connect(self.playback.seek)
         self.event_timeline.scrub_started.connect(self.playback.stop)
         self.event_timeline.details_requested.connect(
-            self.event_details.setPlainText
+            self.event_details.set_event
         )
         self.event_timeline_scroll = QScrollArea(self.viewport_pane)
         self.event_timeline_scroll.setWidgetResizable(True)
@@ -264,6 +339,7 @@ class MotListPreviewWidget(QWidget):
         enabled = bool(self._motions)
         self.source_rig_button.setEnabled(enabled)
         self.load_resource_button.setEnabled(enabled)
+        self.load_preset_button.setEnabled(enabled)
         origins = Counter(entry.origin for entry in self._motions)
         summary = self.tr(
             "{total} playable · {embedded} embedded · {inherited} inherited"
@@ -333,6 +409,15 @@ class MotListPreviewWidget(QWidget):
             settings[self.BONE_NAMES_SETTING] = bool(enabled)
             save_settings(settings)
 
+    def _on_attack_hitboxes_toggled(self, enabled: bool) -> None:
+        self._scene_renderer.set_attack_hitboxes_enabled(enabled)
+        app = getattr(self.handler, "app", None)
+        settings = getattr(app, "settings", None)
+        if isinstance(settings, dict):
+            settings[self.ATTACK_HITBOXES_SETTING] = bool(enabled)
+            save_settings(settings)
+        self._render()
+
     def _load_current_motion(self, *, reset_camera: bool) -> None:
         deformation_targets = self._mesh_deformation_targets()
         self.blend_shapes_toggle.setVisible(bool(deformation_targets))
@@ -376,26 +461,44 @@ class MotListPreviewWidget(QWidget):
         except (MotionPreviewError, ValueError) as exc:
             self._clear_scene(str(exc), clear_timeline=False)
 
-    def set_target(self, target: RigPreviewTarget) -> None:
+    def set_target(
+        self,
+        target: RigPreviewTarget,
+        *,
+        weapon_attack_sources=None,
+        weapon_attack_diagnostics: tuple[str, ...] = (),
+    ) -> None:
         self._materials.clear()
         self._target_material_session = None
+        self._target_material_sessions.clear()
         self._target = target
+        self._weapon_attack_collision_diagnostics = tuple(
+            weapon_attack_diagnostics
+        )
+        self._scene_renderer.set_weapon_attack_collision_sources(
+            weapon_attack_sources
+        )
         self._using_source_rig = False
-        if target.handler is not None:
-            self._target_material_session = MeshMaterialSession(
-                target.handler,
+        for index, part in enumerate(target.render_parts):
+            key = part.material_scope or "target"
+            session = MeshMaterialSession(
+                part.handler,
+                material_scope=part.material_scope,
                 texture_quality=self._materials.texture_quality,
                 parent=self._materials,
             )
-            self._materials.add("target", self._target_material_session)
+            self._target_material_sessions[key] = session
+            self._materials.add(key, session)
+            if index == 0:
+                self._target_material_session = session
         self.target_rig_button.setEnabled(bool(self._motions))
         self.playback.stop()
         self._load_current_motion(reset_camera=True)
 
     def use_source_rig(self) -> None:
         self._using_source_rig = True
-        if self._target_material_session is not None:
-            self._materials.set_enabled("target", False)
+        for key in self._target_material_sessions:
+            self._materials.set_enabled(key, False)
         self.playback.stop()
         self._load_current_motion(reset_camera=True)
 
@@ -403,8 +506,8 @@ class MotListPreviewWidget(QWidget):
         if self._target is None:
             return
         self._using_source_rig = False
-        if self._target_material_session is not None:
-            self._materials.set_enabled("target", True)
+        for key in self._target_material_sessions:
+            self._materials.set_enabled(key, True)
         self.playback.stop()
         self._load_current_motion(reset_camera=True)
 
@@ -443,6 +546,59 @@ class MotListPreviewWidget(QWidget):
         except ValueError as exc:
             self._show_error(
                 self.tr("Could not load target mesh: {error}").format(error=exc)
+            )
+
+    def _load_model_preset(self) -> None:
+        preset_key = str(self.model_preset_combo.currentData() or "")
+        preset = next(
+            (item for item in WOTS_MESH_PREVIEW_PRESETS if item.key == preset_key),
+            None,
+        )
+        if preset is None:
+            self._show_error(self.tr("No model preset is selected."))
+            return
+        resources = []
+        missing = []
+        for resource_path in preset.resource_paths:
+            hit = resolve_handler_resource_data(self.handler, resource_path, self)
+            if hit is None:
+                missing.append(resource_path)
+            else:
+                resources.append(hit)
+        if missing:
+            self._show_error(
+                self.tr("Model preset is missing resource(s): {paths}").format(
+                    paths=", ".join(missing)
+                )
+            )
+            return
+        try:
+            target = load_re_engine_mesh_preset_target(
+                preset,
+                tuple(resources),
+                app=getattr(self.handler, "app", None),
+                resource_context=getattr(self.handler, "resource_context", None),
+            )
+            weapon_sources = {}
+            weapon_diagnostics = []
+            type_registry = _wots_type_registry(self.handler)
+            for collision_type, resource_path in preset.weapon_attack_resources:
+                source, diagnostics = load_attack_collision_resource(
+                    resource_path,
+                    self._catalog.resources.resource_data,
+                    type_registry=type_registry,
+                )
+                weapon_diagnostics.extend(diagnostics)
+                if source is not None:
+                    weapon_sources[int(collision_type)] = source
+            self.set_target(
+                target,
+                weapon_attack_sources=weapon_sources,
+                weapon_attack_diagnostics=tuple(weapon_diagnostics),
+            )
+        except ValueError as exc:
+            self._show_error(
+                self.tr("Could not load model preset: {error}").format(error=exc)
             )
 
     def _export_gltf(self) -> None:
@@ -505,6 +661,7 @@ class MotListPreviewWidget(QWidget):
                 snapshot,
                 target,
                 reset_camera=reset_camera,
+                motion=self.current_motion,
             )
         except (ValueError, RuntimeError) as exc:
             self._clear_scene(str(exc), clear_timeline=False)
@@ -538,16 +695,36 @@ class MotListPreviewWidget(QWidget):
             )
         messages.extend(snapshot_diagnostic_messages(snapshot))
         messages.extend(self._catalog.messages)
+        collision_status = self._scene_renderer.attack_collision_status(
+            motion,
+            snapshot.frame,
+        )
+        if collision_status:
+            messages.append(collision_status)
+        if collision_status and self._attack_collision_diagnostics:
+            messages.extend(self._attack_collision_diagnostics)
+        if collision_status and self._weapon_attack_collision_diagnostics:
+            messages.extend(self._weapon_attack_collision_diagnostics)
         return "  ".join(messages)
 
     def _mesh_deformation_targets(self):
-        if self._target is None or self._target.mesh is None:
+        if self._target is None:
             return ()
-        return mesh_blend_shape_targets(
-            self._target.mesh,
-            self.evaluation_profile.property_name_hash,
-            motion_name_key=(self.evaluation_profile.joint_binding.motion_name_key),
-        )
+        targets = []
+        seen = set()
+        for part in self._target.render_parts:
+            for target in mesh_blend_shape_targets(
+                part.mesh,
+                self.evaluation_profile.property_name_hash,
+                motion_name_key=(
+                    self.evaluation_profile.joint_binding.motion_name_key
+                ),
+            ):
+                key = (target.binding_key, target.name, target.property_hash)
+                if key not in seen:
+                    seen.add(key)
+                    targets.append(target)
+        return tuple(targets)
 
     def _show_error(self, message: str) -> None:
         self.status_label.setText(message)

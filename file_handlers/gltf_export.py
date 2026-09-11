@@ -666,12 +666,34 @@ def _base_document(
         attributes = {
             "POSITION": builder.accessor(positions, "VEC3", target=34962, bounds=True)
         }
+        normals = None
         if scene.normals is not None:
-            normals = np.asarray(scene.normals, dtype=np.float32).copy()
+            normals = _normalized_directions(scene.normals, "normal")
             attributes["NORMAL"] = builder.accessor(normals, "VEC3", target=34962)
+        tangents = _mesh_tangent_frames(
+            mesh,
+            normals=normals,
+            include_auxiliary_groups=include_auxiliary_groups,
+        )
+        if tangents is not None:
+            if len(tangents) != len(positions):
+                raise ValueError(
+                    "LOD0 tangent count does not match the exported vertex count"
+                )
+            attributes["TANGENT"] = builder.accessor(
+                tangents,
+                "VEC4",
+                target=34962,
+            )
         if scene.uvs is not None:
             attributes["TEXCOORD_0"] = builder.accessor(
                 np.asarray(scene.uvs, dtype=np.float32),
+                "VEC2",
+                target=34962,
+            )
+        if scene.uvs1 is not None:
+            attributes["TEXCOORD_1"] = builder.accessor(
+                np.asarray(scene.uvs1, dtype=np.float32),
                 "VEC2",
                 target=34962,
             )
@@ -740,6 +762,73 @@ def _base_document(
         document["nodes"].append(node)
         document["scenes"][0]["nodes"].append(mesh_node)
     return document, builder, joint_nodes
+
+
+def _normalized_directions(values, semantic: str) -> np.ndarray:
+    vectors = np.asarray(values, dtype=np.float32).reshape(-1, 3).copy()
+    lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+    if np.any(~np.isfinite(lengths)) or np.any(lengths <= 1e-8):
+        raise ValueError(f"LOD0 contains an invalid zero-length {semantic}")
+    return (vectors / lengths).astype(np.float32, copy=False)
+
+
+def _mesh_tangent_frames(
+    mesh,
+    *,
+    normals: np.ndarray | None = None,
+    include_auxiliary_groups: bool = False,
+) -> np.ndarray | None:
+    """Build normalized glTF tangent frames for the exported LOD0 vertices."""
+    submeshes = mesh_lod0_submeshes(
+        mesh,
+        include_auxiliary_groups=include_auxiliary_groups,
+    )
+    records = mesh_scene_payloads(mesh, submeshes)
+    xyz_chunks: list[np.ndarray] = []
+    sign_chunks: list[np.ndarray] = []
+    missing: list[int] = []
+    for record in records:
+        raw_xyz = getattr(record.payload, "tangents", ())
+        raw_w = getattr(record.payload, "tangent_ws", ())
+        if not raw_xyz and not raw_w:
+            missing.append(record.buffer_index)
+            continue
+        if not raw_xyz or not raw_w:
+            raise ValueError(
+                f"Incomplete tangent frame in mesh buffer {record.buffer_index}"
+            )
+        xyz = np.asarray(raw_xyz, dtype=np.float32).reshape(-1)
+        ws = np.asarray(raw_w, dtype=np.uint8).reshape(-1)
+        required = record.vertex_count * 3
+        if xyz.size < required or ws.size < record.vertex_count:
+            raise ValueError(
+                f"Malformed tangents in mesh buffer {record.buffer_index}"
+            )
+        xyz_chunks.append(xyz[:required].reshape(-1, 3))
+        signed_w = ws[: record.vertex_count].view(np.int8)
+        sign_chunks.append(
+            np.where(signed_w < 0, -1.0, 1.0).astype(np.float32)
+        )
+    if not xyz_chunks:
+        return None
+    if missing:
+        raise ValueError(f"Missing tangents in mesh buffers {missing}")
+
+    xyz = _normalized_directions(np.concatenate(xyz_chunks), "tangent")
+    if normals is not None:
+        normal_vectors = np.asarray(normals, dtype=np.float32).reshape(-1, 3)
+        if len(normal_vectors) != len(xyz):
+            raise ValueError(
+                "LOD0 normal count does not match the exported tangent count"
+            )
+        xyz = xyz - normal_vectors * np.sum(
+            xyz * normal_vectors,
+            axis=1,
+            keepdims=True,
+        )
+        xyz = _normalized_directions(xyz, "orthogonalized tangent")
+    signs = np.concatenate(sign_chunks).reshape(-1, 1)
+    return np.concatenate((xyz, signs), axis=1).astype(np.float32, copy=False)
 
 
 def _add_animation(document, builder, motion, rig, profile, joint_nodes):

@@ -373,6 +373,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._gizmo_projection = None
         self._regular_set: _GlBufferSet | None = None
         self._solid_set: _GlBufferSet | None = None
+        self._wireframe_overlay_set: _GlBufferSet | None = None
         self._selection_regular_set: _GlBufferSet | None = None
         self._selection_solid_set: _GlBufferSet | None = None
         self._hover_key = self._hover_block_key = ""
@@ -384,6 +385,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._scene_matrix = IDENTITY4.copy()
         self._regular_data: SceneBufferSet | None = None
         self._solid_data: SceneBufferSet | None = None
+        self._wireframe_overlay_meshes: list[SceneDrawMesh] = []
+        self._wireframe_overlay_data: SceneBufferSet | None = None
         self._texture_ids: dict[str, int] = {}
         self._texture_sources: dict[str, str] = {}
         self._texture_source_ids: dict[str, int] = {}
@@ -1042,6 +1045,79 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._upload_buffers()
         self.update()
 
+    def set_wireframe_overlays(self, meshes: list[SceneDrawMesh]) -> None:
+        """Replace transient debug geometry without rebuilding the main scene."""
+        self._wireframe_overlay_meshes = list(meshes)
+        self._wireframe_overlay_data = build_scene_buffer_set(
+            self._wireframe_overlay_meshes,
+            set(),
+            show_only_highlighted=False,
+            force_solid=True,
+        )
+        if self.context() is None:
+            self.update()
+            return
+        if not self._make_current_or_queue_upload():
+            return
+        self._delete_buffer_set(self._wireframe_overlay_set)
+        self._wireframe_overlay_set = self._upload_buffer_set(
+            self._wireframe_overlay_data
+        )
+        self.doneCurrent()
+        self.update()
+
+    def update_wireframe_overlay_geometries(
+        self,
+        geometries: dict[str, np.ndarray],
+    ) -> None:
+        """Batch-update transient wireframes without touching model buffers."""
+        if not geometries or self._wireframe_overlay_data is None:
+            return
+        meshes = {mesh.key: mesh for mesh in self._wireframe_overlay_meshes}
+        data = self._wireframe_overlay_data
+        changed_spans: list[tuple[int, int]] = []
+        for key, value in geometries.items():
+            mesh = meshes.get(key)
+            if mesh is None:
+                continue
+            vertices = np.asarray(value, dtype=np.float32).reshape(-1, 3)
+            if len(mesh.vertices) != len(vertices):
+                raise ValueError(
+                    f"dynamic wireframe {key!r} has {len(vertices)} vertices; "
+                    f"expected {len(mesh.vertices)}"
+                )
+            spans = list(data.key_vertex_spans.get(key, ()))
+            if sum(count for _offset, count in spans) != len(vertices):
+                raise ValueError(
+                    f"dynamic wireframe {key!r} does not match its buffered span"
+                )
+            mesh.vertices = vertices
+            source_offset = 0
+            for offset, count in spans:
+                source_end = source_offset + count
+                data.vertices[offset : offset + count] = vertices[
+                    source_offset:source_end
+                ]
+                source_offset = source_end
+            changed_spans.extend(spans)
+        buffer_set = self._wireframe_overlay_set
+        if changed_spans and buffer_set is not None and self.context() is not None:
+            made_current = False
+            try:
+                self.makeCurrent()
+                made_current = True
+                self._upload_changed_spans(
+                    buffer_set,
+                    self._merged_spans(changed_spans),
+                )
+            except Exception:
+                self._delete_buffer_set(buffer_set, delete_gl=False)
+                self._wireframe_overlay_set = None
+            finally:
+                if made_current:
+                    self.doneCurrent()
+        self.update()
+
     def set_bone_name_labels(self, names, positions) -> None:
         """Set dynamic world-space labels used by motion skeleton previews."""
         labels = tuple(str(name) for name in names)
@@ -1083,6 +1159,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._gpu_skinning.set_binding(key, binding)
         self._skinned_draw_sets_dirty = True
         self.update()
+
+    def can_use_gpu_skinning(self, binding: SceneSkinningBinding) -> bool:
+        """Check a binding against the active context before registering it."""
+        if self.context() is None:
+            return False
+        self.makeCurrent()
+        try:
+            return self._gpu_skinning.supports_binding(binding)
+        finally:
+            self.doneCurrent()
 
     def update_mesh_skinning(
         self,
@@ -3396,6 +3482,10 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._delete_skinned_draw_sets(delete_gl=made_current)
         self._delete_buffer_set(self._regular_set, delete_gl=made_current)
         self._delete_buffer_set(self._solid_set, delete_gl=made_current)
+        self._delete_buffer_set(
+            self._wireframe_overlay_set,
+            delete_gl=made_current,
+        )
         self._delete_selection_buffer_sets(delete_gl=made_current)
         if made_current:
             with suppress(Exception):
@@ -3408,8 +3498,13 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 self._cleanup_extra_gl()
             with suppress(Exception):
                 self.doneCurrent()
-        self._regular_set = self._solid_set = self._gl_cleanup_context = None
-        self._needs_gl_upload = self._regular_data is not None or self._solid_data is not None
+        self._regular_set = self._solid_set = None
+        self._wireframe_overlay_set = self._gl_cleanup_context = None
+        self._needs_gl_upload = (
+            self._regular_data is not None
+            or self._solid_data is not None
+            or self._wireframe_overlay_data is not None
+        )
 
     @Slot()
     def _on_gl_context_about_to_be_destroyed(self):
@@ -3428,6 +3523,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._unlock_scene_cursor()
         self.freecam.clear_input()
         self._meshes.clear()
+        self._wireframe_overlay_meshes.clear()
         self._gpu_skinning.clear()
         self._skinned_draw_sets.clear()
         self._rigid_draw_sets.clear()
@@ -3461,6 +3557,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         self._pending_scene_pick = self._last_hover_pick_pos = None
         self._selection_center = self._gizmo_drag = self._gizmo_projection = None
         self._regular_data = self._solid_data = None
+        self._wireframe_overlay_data = None
         self._scene_matrix = IDENTITY4.copy()
         self._needs_gl_upload = self._colors_dirty = False
 
@@ -3509,6 +3606,9 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             self._rebuild_buffer_data()
         self._regular_set = self._upload_buffer_set(self._regular_data)
         self._solid_set = self._upload_buffer_set(self._solid_data)
+        self._wireframe_overlay_set = self._upload_buffer_set(
+            self._wireframe_overlay_data
+        )
         self._refresh_selection_buffer_sets(current=True)
         self._colors_dirty = self._uses_probe_shading()
         self._sync_gl_textures()
@@ -4318,9 +4418,17 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
     def _restore_gl_content(self) -> None:
         missing_regular = self._regular_set is None and self._regular_data is not None
         missing_solid = self._solid_set is None and self._solid_data is not None
+        missing_wireframe_overlay = (
+            self._wireframe_overlay_set is None
+            and self._wireframe_overlay_data is not None
+        )
         if self._needs_gl_upload or missing_regular or missing_solid:
             self._upload_buffers(rebuild=False, current=True)
             self._sync_gl_textures()
+        if missing_wireframe_overlay:
+            self._wireframe_overlay_set = self._upload_buffer_set(
+                self._wireframe_overlay_data
+            )
         if self._skinned_draw_sets_dirty:
             self._rebuild_skinned_draw_sets()
 
@@ -4345,6 +4453,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             glMultMatrixf(np.ascontiguousarray(scene_matrix.T, dtype=np.float32))
         self._draw_regular_scene()
         self._draw_scene_triangles(self._solid_set, force_solid=True, use_textures=False)
+        self._draw_lines(self._wireframe_overlay_set, overlay=True)
         if not self._draw_deferred_selection():
             self._draw_selection_glow()
         self._draw_hover_glow()

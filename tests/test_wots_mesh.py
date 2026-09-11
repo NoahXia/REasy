@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from file_handlers.mdf.shader_types import material_shader_names
 from file_handlers.mesh.mesh_file import (
     MeshDependencyMissingError,
     MeshFile,
@@ -23,6 +24,12 @@ from ui.scene.studio_material import StudioMaterialRenderer
 
 
 class TestWotsMesh(unittest.TestCase):
+    def test_wots_material_shader_names_do_not_use_legacy_indices(self):
+        shader_names = material_shader_names("onimusha_wots")
+        self.assertEqual(shader_names[16], "ExpensiveTransparent")
+        self.assertEqual(shader_names[19], "PostProcess")
+        self.assertEqual(shader_names[34], "EyeballPostProcess")
+
     def test_preview_material_arguments_match_both_renderers(self):
         preview = SimpleNamespace(
             _material_profiles={

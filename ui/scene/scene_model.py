@@ -22,11 +22,13 @@ class SceneDrawMesh:
     ignore_highlight_filter: bool = False
     normals: np.ndarray | None = None
     uvs: np.ndarray | None = None
+    uvs1: np.ndarray | None = None
     colors: np.ndarray | None = None
     material_name: str = ""
     batches: list[SceneDrawBatch] = field(default_factory=list)
     transform_matrix: np.ndarray | None = None
     geometry_key: str = ""
+    exclude_from_bounds: bool = False
 
 
 @dataclass(frozen=True, slots=True)

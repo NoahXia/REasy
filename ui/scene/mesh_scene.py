@@ -116,7 +116,7 @@ def _merge_attribute(records, name: str, width: int, dtype) -> np.ndarray | None
     chunks = []
     missing = []
     for buffer_index, payload, vertex_count in records:
-        values = getattr(payload, name)
+        values = getattr(payload, name, ())
         if not values:
             missing.append(buffer_index)
             continue
@@ -177,6 +177,7 @@ def build_mesh_scene(
     if colors is not None:
         colors = colors.astype(np.float32) / 255.0
     uvs = _merge_attribute(records, "uv0", 2, np.float32)
+    uvs1 = _merge_attribute(records, "uv1", 2, np.float32)
 
     index_chunks: list[np.ndarray] = []
     batches: list[SceneDrawBatch] = []
@@ -235,6 +236,7 @@ def build_mesh_scene(
             ignore_highlight_filter=ignore_highlight_filter,
             normals=normals,
             uvs=uvs,
+            uvs1=uvs1,
             colors=colors,
             batches=batches,
         )

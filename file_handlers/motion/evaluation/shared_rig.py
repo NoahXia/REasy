@@ -16,6 +16,8 @@ class SharedRigPoseMapper:
         owner_rig: Rig,
         constrained_rig: Rig,
         pose_to_constrained_matrix: Sequence[float] | np.ndarray,
+        *,
+        root_attachment_joint: str = "",
     ):
         self.owner_rig = owner_rig
         self.constrained_rig = constrained_rig
@@ -33,9 +35,20 @@ class SharedRigPoseMapper:
                 "pose-to-constrained model transform contains a non-finite value"
             )
         owner_by_name = self._unique_joint_names(owner_rig, "owner")
-        self._owner_indices = tuple(
+        owner_indices = [
             owner_by_name.get(joint.name) for joint in constrained_rig.joints
-        )
+        ]
+        if root_attachment_joint:
+            try:
+                attachment_index = owner_by_name[root_attachment_joint]
+            except KeyError as exc:
+                raise ValueError(
+                    f"owner rig has no attachment joint {root_attachment_joint!r}"
+                ) from exc
+            for index, joint in enumerate(constrained_rig.joints):
+                if joint.parent_index is None:
+                    owner_indices[index] = attachment_index
+        self._owner_indices = tuple(owner_indices)
         if not any(index is not None for index in self._owner_indices):
             raise ValueError("constrained rig has no joints in common with its owner")
         self._local_matrices = tuple(
@@ -113,6 +126,25 @@ class SharedRigPoseMapper:
                     delta @ self._pose_to_constrained[:3, :3]
                 )
         return skin
+
+    def display_world_matrices(
+        self,
+        owner_world_matrices: Sequence[Matrix4],
+        root_deltas: Sequence[tuple[int, Vector3]] = (),
+    ) -> np.ndarray:
+        """Return constrained joint worlds in the same locked-root space as the mesh."""
+        world = self.world_matrices(owner_world_matrices)
+        deltas = {
+            int(root): np.asarray(delta, dtype=np.float32)
+            for root, delta in root_deltas
+        }
+        for index, root in enumerate(self._display_roots):
+            delta = deltas.get(root) if root is not None else None
+            if delta is not None:
+                world[index, 3, :3] -= (
+                    delta @ self._pose_to_constrained[:3, :3]
+                )
+        return world
 
     @staticmethod
     def _unique_joint_names(rig: Rig, label: str) -> dict[str, int]:

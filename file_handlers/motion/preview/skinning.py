@@ -100,6 +100,7 @@ def build_shared_rig_deformer(
     bind_indices: np.ndarray | None = None,
     *,
     pose_to_constrained_matrix: np.ndarray,
+    root_attachment_joint: str = "",
     handler=None,
     explicit_mdf_path: str = "",
 ) -> "SharedRigSkinningDeformer":
@@ -117,6 +118,7 @@ def build_shared_rig_deformer(
             owner_rig,
             constrained_rig,
             pose_to_constrained_matrix,
+            root_attachment_joint=root_attachment_joint,
         ),
     )
 
@@ -155,6 +157,12 @@ class SharedRigSkinningDeformer:
 
     def skin_matrices(self, snapshot: MotionPreviewSnapshot) -> np.ndarray:
         return self.pose_mapper.skin_matrices(
+            snapshot.pose.world_matrices,
+            snapshot.root_deltas,
+        )
+
+    def world_matrices(self, snapshot: MotionPreviewSnapshot) -> np.ndarray:
+        return self.pose_mapper.display_world_matrices(
             snapshot.pose.world_matrices,
             snapshot.root_deltas,
         )

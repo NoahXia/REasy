@@ -55,8 +55,11 @@ class TestGltfExport(unittest.TestCase):
     def _triangle_payload(*, skin_weights=None):
         return SimpleNamespace(
             positions=array("f", [0, 0, 1, 1, 0, 1, 0, 1, 1]),
-            normals=array("f", [0, 0, 1] * 3),
+            normals=array("f", [0, 0, 2] * 3),
+            tangents=array("f", [2, 0, 1, 0, 3, 0, -4, 0, 0]),
+            tangent_ws=array("B", [127, 128, 127]),
             uv0=array("d", [0, 0, 1, 0, 0, 1]),
+            uv1=array("d", [0.25, 0.25, 0.75, 0.25, 0.25, 0.75]),
             colors=array("B", [255, 255, 255, 255] * 3),
             faces=array("H", [0, 1, 2]),
             integer_faces=None,
@@ -127,6 +130,48 @@ class TestGltfExport(unittest.TestCase):
         )
         self.assertEqual(positions[:3], (0.0, 0.0, 1.0))
         self.assertEqual(positions[3:6], (1.0, 0.0, 1.0))
+        normal_accessor = document["accessors"][
+            primitive["attributes"]["NORMAL"]
+        ]
+        normal_view = document["bufferViews"][normal_accessor["bufferView"]]
+        normals = np.frombuffer(
+            binary,
+            dtype="<f4",
+            count=normal_accessor["count"] * 3,
+            offset=normal_view["byteOffset"],
+        ).reshape(-1, 3)
+        np.testing.assert_allclose(
+            normals,
+            np.array([[0.0, 0.0, 1.0]] * 3, dtype=np.float32),
+        )
+        self.assertIn("TANGENT", primitive["attributes"])
+        tangent_accessor = document["accessors"][
+            primitive["attributes"]["TANGENT"]
+        ]
+        tangent_view = document["bufferViews"][tangent_accessor["bufferView"]]
+        tangents = np.frombuffer(
+            binary,
+            dtype="<f4",
+            count=tangent_accessor["count"] * 4,
+            offset=tangent_view["byteOffset"],
+        ).reshape(-1, 4)
+        np.testing.assert_allclose(
+            tangents,
+            np.array(
+                [
+                    [1.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, -1.0],
+                    [-1.0, 0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            ),
+        )
+        self.assertIn("TEXCOORD_0", primitive["attributes"])
+        self.assertIn("TEXCOORD_1", primitive["attributes"])
+        uv1_accessor = document["accessors"][primitive["attributes"]["TEXCOORD_1"]]
+        uv1_view = document["bufferViews"][uv1_accessor["bufferView"]]
+        uv1 = struct.unpack_from("<6f", binary, uv1_view["byteOffset"])
+        self.assertEqual(uv1, (0.25, 0.25, 0.75, 0.25, 0.25, 0.75))
 
     def test_coordinate_conversion_preserves_wots_handedness(self):
         translation, rotation, scale = _converted_trs(

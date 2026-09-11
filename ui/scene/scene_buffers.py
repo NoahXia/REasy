@@ -37,6 +37,8 @@ def mesh_bounds_points(meshes: Iterable[SceneDrawMesh]) -> np.ndarray:
     chunks = []
     local_corners: dict[int, np.ndarray] = {}
     for mesh in meshes:
+        if mesh.exclude_from_bounds:
+            continue
         if not len(mesh.vertices):
             continue
         cache_key = id(mesh.vertices)

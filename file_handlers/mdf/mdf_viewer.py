@@ -12,6 +12,7 @@ from utils.hash_util import murmur3_hash_utf16le
 from utils.number_format import format_display_value
 from .mdf_clipboard import MdfClipboard
 from .mdf_template_manager import MdfTemplateManager
+from .shader_types import material_shader_names
 from ui.mdf_template_export_dialog import MdfTemplateExportDialog
 from ui.widgets_utils import get_color_preview_brush
 
@@ -183,12 +184,8 @@ class MdfViewer(QWidget):
 		ov.addWidget(self.mmtr_edit, 1, 1, 1, 3)
 		ov.addWidget(QLabel("ShaderType"), 2, 0)
 		self.shader_combo = QComboBox()
-		self._shader_names = [
-			"Standard","Decal","DecalWithMetallic","DecalNRMR","Transparent","Distortion",
-			"PrimitiveMesh","PrimitiveSolidMesh","Water","SpeedTree","GUI","GUIMesh",
-			"GUIMeshTransparent","ExpensiveTransparent","Forward","RenderTarget","PostProcess",
-			"PrimitiveMaterial","PrimitiveSolidMaterial","SpineMaterial","ReflectiveTransparent"
-		]
+		mdf_layout = getattr(self.handler.mdf, "layout", "standard")
+		self._shader_names = list(material_shader_names(mdf_layout))
 		self.shader_combo.addItems(self._shader_names)
 		self.shader_combo.currentIndexChanged.connect(self._on_shader_changed)
 		ov.addWidget(self.shader_combo, 2, 1)
