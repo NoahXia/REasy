@@ -150,9 +150,16 @@ from PySide6.QtWidgets import (
 
 from file_handlers.mesh.material_effects import (
     WOTS_ALPHA_TEXTURE,
+    WOTS_DETAIL_MASK_TEXTURE,
+    WOTS_DETAIL_NRRC_TEXTURE,
+    WOTS_EMISSIVE_TEXTURE,
+    WOTS_HAIR_FLOW_TEXTURE,
+    WOTS_HAIR_HSS_TEXTURE,
     WOTS_NORMAL_TEXTURE,
     WOTS_NRRO_TEXTURE,
     WOTS_RCTO_TEXTURE,
+    WOTS_SECOND_ALPHA_TEXTURE,
+    WOTS_STCM_TEXTURE,
     material_texture_key,
     riglogic_material_effect,
     wots_material_parameters,
@@ -181,6 +188,7 @@ from .scene_buffers import (
     scene_key_index_buffers,
     triangle_line_indices,
     transform_normals,
+    transform_tangents,
     transform_points,
 )
 from .lightprobe_preview import SceneLightProbeInstance
@@ -201,9 +209,11 @@ class _GlBufferSet:
     data: SceneBufferSet
     vertices_vbo: object | None = None
     normals_vbo: object | None = None
+    tangents_vbo: object | None = None
     colors: np.ndarray | None = None
     colors_vbo: object | None = None
     uvs_vbo: object | None = None
+    uvs1_vbo: object | None = None
     span_indices_vbo: object | None = None
     indices_vbo: object | None = None
     line_indices_vbo: object | None = None
@@ -1616,6 +1626,29 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 "alpha_adjust",
                 "alpha_threshold",
                 "alpha_test",
+                "hair_material",
+                "material_family",
+                "use_secondary_uv",
+                "face_uv_scale",
+                "use_separate_alpha",
+                "use_detail",
+                "detail_tiling",
+                "normal_blend_rate",
+                "roughness_blend_rate",
+                "cavity_blend_rate",
+                "use_flow_map",
+                "secondary_specular_intensity",
+                "primary_spec_sharpness",
+                "secondary_spec_sharpness",
+                "primary_specular_shift_offset",
+                "secondary_specular_shift_offset",
+                "hair_height_depth",
+                "specular",
+                "primary_specular_level",
+                "ao_exp",
+                "sss_scale",
+                "emissive_intensity",
+                "translucent_scale",
             )
             if key in parameters
         }
@@ -1632,6 +1665,27 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             ),
             "alpha_texture_id": self._texture_ids.get(
                 material_texture_key(material_name, WOTS_ALPHA_TEXTURE), 0
+            ),
+            "hair_flow_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_HAIR_FLOW_TEXTURE), 0
+            ),
+            "hair_hss_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_HAIR_HSS_TEXTURE), 0
+            ),
+            "detail_nrrc_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_DETAIL_NRRC_TEXTURE), 0
+            ),
+            "detail_mask_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_DETAIL_MASK_TEXTURE), 0
+            ),
+            "stcm_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_STCM_TEXTURE), 0
+            ),
+            "emissive_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_EMISSIVE_TEXTURE), 0
+            ),
+            "second_alpha_texture_id": self._texture_ids.get(
+                material_texture_key(material_name, WOTS_SECOND_ALPHA_TEXTURE), 0
             ),
         }
 
@@ -2218,6 +2272,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             "indices": vertices,
             "vertices": buffer_set.data.vertices[vertices].copy(),
             "normals": buffer_set.data.normals[vertices].copy() if buffer_set.data.normals is not None else None,
+            "tangents": buffer_set.data.tangents[vertices].copy() if buffer_set.data.tangents is not None else None,
         }
 
     def _buffer_space_matrix(self, matrix: np.ndarray) -> np.ndarray:
@@ -2252,6 +2307,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         buffer_set.data.vertices[indices] = transform_points(snapshot["vertices"], matrix)
         if snapshot["normals"] is not None and buffer_set.data.normals is not None:
             buffer_set.data.normals[indices] = transform_normals(snapshot["normals"], matrix)
+        if (
+            snapshot["tangents"] is not None
+            and buffer_set.data.tangents is not None
+            and buffer_set.data.normals is not None
+        ):
+            buffer_set.data.tangents[indices] = transform_tangents(
+                snapshot["tangents"],
+                buffer_set.data.normals[indices],
+                matrix,
+            )
         if self.context() is not None:
             if not current:
                 self.makeCurrent()
@@ -2321,6 +2386,16 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                         normals,
                         normal_matrices,
                     )
+                if (
+                    buffer_set.data.tangents is not None
+                    and buffer_set.data.normals is not None
+                ):
+                    for row_index, (_offset, matrix) in enumerate(entries):
+                        buffer_set.data.tangents[rows[row_index]] = transform_tangents(
+                            buffer_set.data.tangents[rows[row_index]],
+                            buffer_set.data.normals[rows[row_index]],
+                            matrix,
+                        )
                 changed_spans.extend((int(offset), count) for offset in offsets)
 
             for rows, matrix in fallback:
@@ -2330,6 +2405,15 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 if buffer_set.data.normals is not None:
                     buffer_set.data.normals[rows] = transform_normals(
                         buffer_set.data.normals[rows], matrix
+                    )
+                if (
+                    buffer_set.data.tangents is not None
+                    and buffer_set.data.normals is not None
+                ):
+                    buffer_set.data.tangents[rows] = transform_tangents(
+                        buffer_set.data.tangents[rows],
+                        buffer_set.data.normals[rows],
+                        matrix,
                     )
                 changed_spans.extend(
                     (start, end - start)
@@ -2742,7 +2826,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
     def _delete_buffer_set(self, buffer_set: _GlBufferSet | None, *, delete_gl: bool = True):
         if buffer_set is None:
             return
-        for name in ("vertices_vbo", "normals_vbo", "colors_vbo", "uvs_vbo", "span_indices_vbo"):
+        for name in ("vertices_vbo", "normals_vbo", "tangents_vbo", "colors_vbo", "uvs_vbo", "uvs1_vbo", "span_indices_vbo"):
             self._dispose_vbo(getattr(buffer_set, name), delete_gl=delete_gl)
             setattr(buffer_set, name, None)
         buffer_set.colors = None
@@ -2991,10 +3075,12 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         buffer_set = _GlBufferSet(data=data)
         buffer_set.vertices_vbo = self._array_vbo(data.vertices) if len(data.vertices) else None
         buffer_set.normals_vbo = self._array_vbo(data.normals) if data.normals is not None else None
+        buffer_set.tangents_vbo = self._array_vbo(data.tangents) if data.tangents is not None else None
         colors = self._display_colors(data)
         buffer_set.colors = colors
         buffer_set.colors_vbo = self._array_vbo(colors) if colors is not None else None
         buffer_set.uvs_vbo = self._array_vbo(data.uvs) if data.uvs is not None else None
+        buffer_set.uvs1_vbo = self._array_vbo(data.uvs1) if data.uvs1 is not None else None
         self._upload_index_vbos(buffer_set)
         return buffer_set
 
@@ -3005,9 +3091,11 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
             data=source.data,
             vertices_vbo=source.vertices_vbo,
             normals_vbo=source.normals_vbo,
+            tangents_vbo=source.tangents_vbo,
             colors=source.colors,
             colors_vbo=source.colors_vbo,
             uvs_vbo=source.uvs_vbo,
+            uvs1_vbo=source.uvs1_vbo,
         )
         need_lines = self._needs_line_indices()
         indices, batches, line_indices = scene_key_index_buffers(
@@ -3242,7 +3330,11 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
     def _upload_changed_geometry(self, buffer_set: _GlBufferSet | None, vertices: np.ndarray | None) -> None:
         if buffer_set is None or vertices is None or not len(vertices):
             return
-        for handle, data in ((buffer_set.vertices_vbo, buffer_set.data.vertices), (buffer_set.normals_vbo, buffer_set.data.normals)):
+        for handle, data in (
+            (buffer_set.vertices_vbo, buffer_set.data.vertices),
+            (buffer_set.normals_vbo, buffer_set.data.normals),
+            (buffer_set.tangents_vbo, buffer_set.data.tangents),
+        ):
             self._upload_changed_array(handle, data, vertices)
 
     def _upload_changed_spans(
@@ -3253,6 +3345,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
         for handle, data in (
             (buffer_set.vertices_vbo, buffer_set.data.vertices),
             (buffer_set.normals_vbo, buffer_set.data.normals),
+            (buffer_set.tangents_vbo, buffer_set.data.tangents),
         ):
             if handle is None or data is None:
                 continue
@@ -3806,6 +3899,18 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     else:
                         glColor4f(1.0, 1.0, 1.0, 1.0)
                         has_texture = bool(textured and tex_id)
+                        wots_inputs = self._wots_material_inputs(material_name)
+                        wots_inputs["use_secondary_uv"] = bool(
+                            wots_inputs.get("use_secondary_uv")
+                            and buffer_set.uvs1_vbo is not None
+                        )
+                        translucent = wots_inputs.get("material_family", 0) in {
+                            8, 9, 10
+                        }
+                        if translucent:
+                            glEnable(GL_BLEND)
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                            glDepthMask(False)
                         self._studio_material.bind(
                             tint=tint,
                             ambient=self.ambient,
@@ -3814,8 +3919,10 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                             gamma=self.gamma,
                             textured=has_texture,
                             texture_id=tex_id or 0,
+                            tangents_vbo=buffer_set.tangents_vbo,
+                            uvs1_vbo=buffer_set.uvs1_vbo,
                             lit=self.lighting_mode == "fixed",
-                            **self._wots_material_inputs(material_name),
+                            **wots_inputs,
                         )
                         studio_bound = True
                     batch_vbo.bind()
@@ -3825,6 +3932,9 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                         self._riglogic_material.unbind()
                     elif studio_bound:
                         self._studio_material.unbind()
+                        if translucent:
+                            glDepthMask(True)
+                            glDisable(GL_BLEND)
                 glEnable(GL_CULL_FACE)
                 glColor4f(1.0, 1.0, 1.0, 1.0)
             else:
@@ -3837,6 +3947,8 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     exposure=self.exposure,
                     gamma=self.gamma,
                     textured=False,
+                    tangents_vbo=buffer_set.tangents_vbo,
+                    uvs1_vbo=buffer_set.uvs1_vbo,
                     lit=self.lighting_mode == "fixed",
                 )
                 studio_bound = True
@@ -3887,9 +3999,23 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     continue
                 tex_id = self._texture_ids.get(material_name)
                 has_texture = bool(not effect_program and use_textures and tex_id)
+                wots_inputs = self._wots_material_inputs(material_name)
+                wots_inputs["use_secondary_uv"] = bool(
+                    wots_inputs.get("use_secondary_uv")
+                    and draw_set.source.uvs1_vbo is not None
+                )
+                translucent = (
+                    not effect_program
+                    and wots_inputs.get("material_family", 0) in {8, 9, 10}
+                )
+                if translucent:
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                    glDepthMask(False)
                 self._gpu_skinning.bind(
                     draw_set.key,
                     uvs_vbo=draw_set.source.uvs_vbo,
+                    uvs1_vbo=draw_set.source.uvs1_vbo,
                     colors_vbo=draw_set.source.colors_vbo,
                     vertex_offset=draw_set.vertex_offset,
                     program=effect_program,
@@ -3901,7 +4027,7 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                     lit=self.lighting_mode == "fixed",
                     textured=has_texture,
                     texture_id=tex_id or 0,
-                    **self._wots_material_inputs(material_name),
+                    **wots_inputs,
                 )
                 if effect_program:
                     glDisable(GL_TEXTURE_2D)
@@ -3911,6 +4037,9 @@ class ScenePreviewWidget(OrbitCameraMixin, QOpenGLWidget):
                 glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, None)
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
                 self._gpu_skinning.unbind()
+                if translucent:
+                    glDepthMask(True)
+                    glDisable(GL_BLEND)
                 if effect_program:
                     self._riglogic_material.unbind()
             glPopMatrix()

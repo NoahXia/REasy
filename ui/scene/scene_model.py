@@ -21,6 +21,7 @@ class SceneDrawMesh:
     force_solid: bool = False
     ignore_highlight_filter: bool = False
     normals: np.ndarray | None = None
+    tangents: np.ndarray | None = None
     uvs: np.ndarray | None = None
     uvs1: np.ndarray | None = None
     colors: np.ndarray | None = None
@@ -39,6 +40,7 @@ class SceneSkinningBinding:
     normals: np.ndarray | None
     joint_indices: np.ndarray
     weights: np.ndarray
+    tangents: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         positions = np.ascontiguousarray(
@@ -52,6 +54,11 @@ class SceneSkinningBinding:
         )
         joints = np.ascontiguousarray(self.joint_indices, dtype=np.uint16)
         weights = np.ascontiguousarray(self.weights, dtype=np.float32)
+        tangents = (
+            np.ascontiguousarray(self.tangents, dtype=np.float32).reshape(-1, 4)
+            if self.tangents is not None
+            else None
+        )
         if joints.ndim != 2 or weights.shape != joints.shape:
             raise ValueError(
                 "skin joint indices and weights must have the same 2D layout"
@@ -66,12 +73,18 @@ class SceneSkinningBinding:
             raise ValueError(
                 "bind-pose normals must match the vertex count"
             )
+        if tangents is not None and len(tangents) != len(positions):
+            raise ValueError(
+                "bind-pose tangents must match the vertex count"
+            )
         if joints.shape[1] < 1:
             raise ValueError("skinned vertices need at least one influence")
         if not np.isfinite(positions).all() or not np.isfinite(weights).all():
             raise ValueError("skinning data contains a non-finite value")
         if normals is not None and not np.isfinite(normals).all():
             raise ValueError("skinning normals contain a non-finite value")
+        if tangents is not None and not np.isfinite(tangents).all():
+            raise ValueError("skinning tangents contain a non-finite value")
         if np.any(weights < 0.0) or np.any(np.sum(weights, axis=1) <= 0.0):
             raise ValueError(
                 "every skinned vertex must have positive influence weight"
@@ -80,6 +93,7 @@ class SceneSkinningBinding:
         object.__setattr__(self, "normals", normals)
         object.__setattr__(self, "joint_indices", joints)
         object.__setattr__(self, "weights", weights)
+        object.__setattr__(self, "tangents", tangents)
 
     @property
     def group_count(self) -> int:

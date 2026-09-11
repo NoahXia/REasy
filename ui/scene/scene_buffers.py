@@ -20,8 +20,10 @@ class SceneTriangleChunk:
 class SceneBufferSet:
     vertices: np.ndarray
     normals: np.ndarray | None
+    tangents: np.ndarray | None
     base_colors: np.ndarray | None
     uvs: np.ndarray | None
+    uvs1: np.ndarray | None
     indices: np.ndarray
     batches: list[tuple[str, np.ndarray]]
     triangle_chunks: list[SceneTriangleChunk]
@@ -246,6 +248,25 @@ def transform_normals(normals: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return (normals @ normal_matrix.T).astype(np.float32)
 
 
+def transform_tangents(
+    tangents: np.ndarray,
+    normals: np.ndarray,
+    matrix: np.ndarray,
+) -> np.ndarray:
+    """Transform and re-orthogonalize tangent frames, preserving handedness."""
+    matrix = np.asarray(matrix, dtype=np.float32)
+    tangents = np.asarray(tangents, dtype=np.float32).reshape(-1, 4)
+    xyz = tangents[:, :3] @ matrix[:3, :3].T
+    xyz -= normals * np.sum(xyz * normals, axis=1, keepdims=True)
+    lengths = np.linalg.norm(xyz, axis=1, keepdims=True)
+    safe = np.zeros_like(xyz)
+    np.divide(xyz, lengths, out=safe, where=lengths > 1e-8)
+    signs = tangents[:, 3:4].copy()
+    if np.linalg.det(matrix[:3, :3]) < 0.0:
+        signs *= -1.0
+    return np.concatenate((safe, signs), axis=1).astype(np.float32, copy=False)
+
+
 class _SceneBufferBuilder:
     def __init__(self, highlighted_keys: set[str], show_only_highlighted: bool, force_solid: bool):
         self.highlighted_keys = highlighted_keys
@@ -253,14 +274,18 @@ class _SceneBufferBuilder:
         self.force_solid = force_solid
         self.vertex_chunks: list[np.ndarray] = []
         self.normal_chunks: list[np.ndarray] = []
+        self.tangent_chunks: list[np.ndarray | None] = []
         self.color_chunks: list[np.ndarray | None] = []
         self.uv_chunks: list[np.ndarray] = []
+        self.uv1_chunks: list[np.ndarray] = []
         self.index_chunks: list[np.ndarray] = []
         self.draw_batches: dict[str, list[np.ndarray]] = {}
         self.triangle_chunks: list[SceneTriangleChunk] = []
         self.key_spans: dict[str, list[tuple[int, int]]] = {}
         self.key_vertex_spans: dict[str, list[tuple[int, int]]] = {}
         self.any_uvs = False
+        self.any_uvs1 = False
+        self.any_tangents = False
         self.base = self.index_base = 0
 
     def build(self, meshes: Iterable[SceneDrawMesh]) -> SceneBufferSet | None:
@@ -275,8 +300,10 @@ class _SceneBufferBuilder:
         return SceneBufferSet(
             vertices=np.concatenate(self.vertex_chunks, axis=0).astype(np.float32, copy=False),
             normals=np.concatenate(self.normal_chunks, axis=0).astype(np.float32, copy=False),
+            tangents=self._tangents(),
             base_colors=self._base_colors(),
             uvs=np.concatenate(self.uv_chunks, axis=0).astype(np.float32, copy=False) if self.any_uvs else None,
+            uvs1=np.concatenate(self.uv1_chunks, axis=0).astype(np.float32, copy=False) if self.any_uvs1 else None,
             indices=indices,
             batches=[(name, np.concatenate(chunks)) for name, chunks in self.draw_batches.items()],
             triangle_chunks=self.triangle_chunks,
@@ -349,10 +376,26 @@ class _SceneBufferBuilder:
         return np.tile(rgba, (vertex_count, 1))
 
     @staticmethod
-    def _source_uvs(mesh: SceneDrawMesh, vertex_count: int) -> np.ndarray | None:
-        if mesh.uvs is None:
+    def _source_tangents(
+        mesh: SceneDrawMesh,
+        vertex_count: int,
+    ) -> np.ndarray | None:
+        if mesh.tangents is None:
             return None
-        raw = np.asarray(mesh.uvs, dtype=np.float32).reshape(-1)
+        raw = np.asarray(mesh.tangents, dtype=np.float32).reshape(-1)
+        return raw.reshape(-1, 4) if raw.size == vertex_count * 4 else None
+
+    @staticmethod
+    def _source_uvs(
+        mesh: SceneDrawMesh,
+        vertex_count: int,
+        *,
+        secondary: bool = False,
+    ) -> np.ndarray | None:
+        source = mesh.uvs1 if secondary else mesh.uvs
+        if source is None:
+            return None
+        raw = np.asarray(source, dtype=np.float32).reshape(-1)
         return raw.reshape(-1, 2) if raw.size == vertex_count * 2 else None
 
     def _append_single(self, mesh: SceneDrawMesh) -> None:
@@ -371,7 +414,19 @@ class _SceneBufferBuilder:
                 vertices,
                 np.concatenate([indices for _, _, indices in batches]),
             )
-        self._append(vertices, normals, self._source_colors(mesh, len(vertices)), self._source_uvs(mesh, len(vertices)), batches, mesh.key)
+        tangents = self._source_tangents(mesh, len(vertices))
+        if tangents is not None and matrix is not None:
+            tangents = transform_tangents(tangents, normals, matrix)
+        self._append(
+            vertices,
+            normals,
+            tangents,
+            self._source_colors(mesh, len(vertices)),
+            self._source_uvs(mesh, len(vertices)),
+            self._source_uvs(mesh, len(vertices), secondary=True),
+            batches,
+            mesh.key,
+        )
 
     def _append_group(self, group: list[SceneDrawMesh]) -> None:
         mesh = group[0]
@@ -404,11 +459,33 @@ class _SceneBufferBuilder:
             vertices,
             np.concatenate([indices for _, _, indices in expanded]),
         )
+        source_tangents = self._source_tangents(mesh, vertex_count)
+        tangents = (
+            np.concatenate([
+                transform_tangents(
+                    source_tangents,
+                    normals[index * vertex_count:(index + 1) * vertex_count],
+                    matrix,
+                )
+                for index, matrix in enumerate(matrices)
+            ])
+            if source_tangents is not None
+            else None
+        )
         source_colors = self._source_colors(mesh, vertex_count)
         colors = np.tile(source_colors, (len(group), 1)) if source_colors is not None else None
         uvs = self._source_uvs(mesh, vertex_count)
+        uvs1 = self._source_uvs(mesh, vertex_count, secondary=True)
         vertex_base = self.base
-        shifted = self._append(vertices, normals, colors, np.tile(uvs, (len(group), 1)) if uvs is not None else None, expanded)
+        shifted = self._append(
+            vertices,
+            normals,
+            tangents,
+            colors,
+            np.tile(uvs, (len(group), 1)) if uvs is not None else None,
+            np.tile(uvs1, (len(group), 1)) if uvs1 is not None else None,
+            expanded,
+        )
         for group_index, item in enumerate(group):
             self._add_key_vertex_span(
                 item.key,
@@ -452,16 +529,22 @@ class _SceneBufferBuilder:
         self,
         vertices: np.ndarray,
         normals: np.ndarray,
+        tangents: np.ndarray | None,
         colors: np.ndarray | None,
         uvs: np.ndarray | None,
+        uvs1: np.ndarray | None,
         batches: list[tuple[str, int | None, np.ndarray]],
         key: str | None = None,
     ) -> list[tuple[str, int | None, np.ndarray, int]]:
         self.vertex_chunks.append(vertices.astype(np.float32, copy=False))
         self.normal_chunks.append(normals.astype(np.float32, copy=False))
+        self.tangent_chunks.append(tangents.astype(np.float32, copy=False) if tangents is not None else None)
+        self.any_tangents |= tangents is not None
         self.color_chunks.append(colors.astype(np.float32, copy=False) if colors is not None else None)
         self.uv_chunks.append(uvs.astype(np.float32, copy=False) if uvs is not None else np.zeros((len(vertices), 2), dtype=np.float32))
         self.any_uvs |= uvs is not None
+        self.uv1_chunks.append(uvs1.astype(np.float32, copy=False) if uvs1 is not None else np.zeros((len(vertices), 2), dtype=np.float32))
+        self.any_uvs1 |= uvs1 is not None
         if key:
             self._add_key_vertex_span(key, self.base, len(vertices))
         shifted_batches = []
@@ -499,5 +582,17 @@ class _SceneBufferBuilder:
         chunks = [
             chunk if chunk is not None else np.ones((len(vertices), 4), dtype=np.float32)
             for chunk, vertices in zip(self.color_chunks, self.vertex_chunks)
+        ]
+        return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
+
+    def _tangents(self) -> np.ndarray | None:
+        if not self.any_tangents:
+            return None
+        chunks = [
+            chunk if chunk is not None else np.tile(
+                np.array((0.0, 0.0, 0.0, 1.0), dtype=np.float32),
+                (len(vertices), 1),
+            )
+            for chunk, vertices in zip(self.tangent_chunks, self.vertex_chunks)
         ]
         return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)

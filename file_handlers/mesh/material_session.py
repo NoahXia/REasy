@@ -25,9 +25,16 @@ from file_handlers.tex.texture_quality import (
 
 from .material_effects import (
     WOTS_ALPHA_TEXTURE,
+    WOTS_DETAIL_MASK_TEXTURE,
+    WOTS_DETAIL_NRRC_TEXTURE,
+    WOTS_EMISSIVE_TEXTURE,
+    WOTS_HAIR_FLOW_TEXTURE,
+    WOTS_HAIR_HSS_TEXTURE,
     WOTS_NORMAL_TEXTURE,
     WOTS_NRRO_TEXTURE,
     WOTS_RCTO_TEXTURE,
+    WOTS_SECOND_ALPHA_TEXTURE,
+    WOTS_STCM_TEXTURE,
     material_texture_key,
     riglogic_material_effect,
     surface_texture_paths,
@@ -214,6 +221,13 @@ class MeshMaterialSession(QObject):
                         WOTS_NORMAL_TEXTURE,
                         WOTS_RCTO_TEXTURE,
                         WOTS_ALPHA_TEXTURE,
+                        WOTS_HAIR_FLOW_TEXTURE,
+                        WOTS_HAIR_HSS_TEXTURE,
+                        WOTS_DETAIL_NRRC_TEXTURE,
+                        WOTS_DETAIL_MASK_TEXTURE,
+                        WOTS_STCM_TEXTURE,
+                        WOTS_EMISSIVE_TEXTURE,
+                        WOTS_SECOND_ALPHA_TEXTURE,
                     ):
                         continue
                     self._queue.append(_TextureRequest(

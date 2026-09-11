@@ -5,19 +5,28 @@ from dataclasses import dataclass
 
 from OpenGL.GL import (
     GL_FRAGMENT_SHADER,
+    GL_FLOAT,
     GL_TEXTURE0,
     GL_TEXTURE_2D,
     GL_VERTEX_SHADER,
     glActiveTexture,
     glBindTexture,
     glDeleteProgram,
+    glDisableVertexAttribArray,
+    glEnableVertexAttribArray,
+    glGetAttribLocation,
     glGetUniformLocation,
     glUniform1f,
     glUniform1i,
     glUniform4f,
     glUseProgram,
+    glVertexAttrib2f,
+    glVertexAttrib4f,
+    glVertexAttribPointer,
 )
 from OpenGL.GL.shaders import compileProgram, compileShader
+
+from .wots_material import WOTS_FRAGMENT_SHADER
 
 
 @dataclass(slots=True)
@@ -33,6 +42,20 @@ class _Program:
     has_rcto: int
     alpha_texture: int
     has_alpha: int
+    hair_flow_texture: int
+    has_hair_flow: int
+    hair_hss_texture: int
+    has_hair_hss: int
+    detail_nrrc_texture: int
+    has_detail_nrrc: int
+    detail_mask_texture: int
+    has_detail_mask: int
+    stcm_texture: int
+    has_stcm: int
+    emissive_texture: int
+    has_emissive: int
+    second_alpha_texture: int
+    has_second_alpha: int
     tint: int
     ambient: int
     diffuse: int
@@ -45,6 +68,31 @@ class _Program:
     alpha_adjust: int
     alpha_threshold: int
     alpha_test: int
+    hair_material: int
+    material_family: int
+    use_secondary_uv: int
+    use_separate_alpha: int
+    use_flow_map: int
+    secondary_specular_intensity: int
+    primary_spec_sharpness: int
+    secondary_spec_sharpness: int
+    primary_specular_shift_offset: int
+    secondary_specular_shift_offset: int
+    hair_height_depth: int
+    specular: int
+    primary_specular_level: int
+    ao_exp: int
+    sss_scale: int
+    use_detail: int
+    detail_tiling: int
+    normal_blend_rate: int
+    roughness_blend_rate: int
+    cavity_blend_rate: int
+    emissive_intensity: int
+    translucent_scale: int
+    face_uv_scale: int
+    uv1: int
+    tangent: int
 
 
 class StudioMaterialRenderer:
@@ -67,6 +115,15 @@ class StudioMaterialRenderer:
         normal_texture_id: int = 0,
         rcto_texture_id: int = 0,
         alpha_texture_id: int = 0,
+        hair_flow_texture_id: int = 0,
+        hair_hss_texture_id: int = 0,
+        detail_nrrc_texture_id: int = 0,
+        detail_mask_texture_id: int = 0,
+        stcm_texture_id: int = 0,
+        emissive_texture_id: int = 0,
+        second_alpha_texture_id: int = 0,
+        uvs1_vbo=None,
+        tangents_vbo=None,
         lit: bool = True,
         wots_material: bool = False,
         roughness_scale: float = 1.0,
@@ -74,6 +131,29 @@ class StudioMaterialRenderer:
         alpha_adjust: float = 1.0,
         alpha_threshold: float = 0.5,
         alpha_test: bool = False,
+        hair_material: bool = False,
+        material_family: int = 0,
+        use_secondary_uv: bool = False,
+        use_separate_alpha: float = 0.0,
+        use_flow_map: float = 0.0,
+        secondary_specular_intensity: float = 1.0,
+        primary_spec_sharpness: float = 50.0,
+        secondary_spec_sharpness: float = 20.0,
+        primary_specular_shift_offset: float = 0.1,
+        secondary_specular_shift_offset: float = 0.1,
+        hair_height_depth: float = 0.0,
+        specular: float = 0.5,
+        primary_specular_level: float = 0.023529,
+        ao_exp: float = 0.0,
+        sss_scale: float = 0.0,
+        use_detail: bool = False,
+        detail_tiling: float = 1.0,
+        normal_blend_rate: float = 1.0,
+        roughness_blend_rate: float = 0.0,
+        cavity_blend_rate: float = 0.0,
+        emissive_intensity: float = 0.0,
+        translucent_scale: float = 0.0,
+        face_uv_scale: float = 1.0,
     ) -> int:
         program = self._get_program()
         glUseProgram(program.handle)
@@ -83,6 +163,13 @@ class StudioMaterialRenderer:
             (program.normal_texture, normal_texture_id),
             (program.rcto_texture, rcto_texture_id),
             (program.alpha_texture, alpha_texture_id),
+            (program.hair_flow_texture, hair_flow_texture_id),
+            (program.hair_hss_texture, hair_hss_texture_id),
+            (program.detail_nrrc_texture, detail_nrrc_texture_id),
+            (program.detail_mask_texture, detail_mask_texture_id),
+            (program.stcm_texture, stcm_texture_id),
+            (program.emissive_texture, emissive_texture_id),
+            (program.second_alpha_texture, second_alpha_texture_id),
         )):
             glActiveTexture(GL_TEXTURE0 + unit)
             glBindTexture(GL_TEXTURE_2D, int(texture or 0))
@@ -93,6 +180,13 @@ class StudioMaterialRenderer:
         glUniform1i(program.has_normal, int(bool(normal_texture_id)))
         glUniform1i(program.has_rcto, int(bool(rcto_texture_id)))
         glUniform1i(program.has_alpha, int(bool(alpha_texture_id)))
+        glUniform1i(program.has_hair_flow, int(bool(hair_flow_texture_id)))
+        glUniform1i(program.has_hair_hss, int(bool(hair_hss_texture_id)))
+        glUniform1i(program.has_detail_nrrc, int(bool(detail_nrrc_texture_id)))
+        glUniform1i(program.has_detail_mask, int(bool(detail_mask_texture_id)))
+        glUniform1i(program.has_stcm, int(bool(stcm_texture_id)))
+        glUniform1i(program.has_emissive, int(bool(emissive_texture_id)))
+        glUniform1i(program.has_second_alpha, int(bool(second_alpha_texture_id)))
         glUniform4f(program.tint, *tint)
         glUniform1f(program.ambient, float(ambient))
         glUniform1f(program.diffuse, float(diffuse))
@@ -105,11 +199,59 @@ class StudioMaterialRenderer:
         glUniform1f(program.alpha_adjust, float(alpha_adjust))
         glUniform1f(program.alpha_threshold, float(alpha_threshold))
         glUniform1i(program.alpha_test, int(alpha_test))
+        glUniform1i(program.hair_material, int(hair_material))
+        glUniform1i(program.material_family, int(material_family))
+        glUniform1i(program.use_secondary_uv, int(use_secondary_uv))
+        glUniform1f(program.use_separate_alpha, float(use_separate_alpha))
+        glUniform1f(program.use_flow_map, float(use_flow_map))
+        glUniform1f(
+            program.secondary_specular_intensity,
+            float(secondary_specular_intensity),
+        )
+        glUniform1f(program.primary_spec_sharpness, float(primary_spec_sharpness))
+        glUniform1f(program.secondary_spec_sharpness, float(secondary_spec_sharpness))
+        glUniform1f(
+            program.primary_specular_shift_offset,
+            float(primary_specular_shift_offset),
+        )
+        glUniform1f(
+            program.secondary_specular_shift_offset,
+            float(secondary_specular_shift_offset),
+        )
+        glUniform1f(program.hair_height_depth, float(hair_height_depth))
+        glUniform1f(program.specular, float(specular))
+        glUniform1f(program.primary_specular_level, float(primary_specular_level))
+        glUniform1f(program.ao_exp, float(ao_exp))
+        glUniform1f(program.sss_scale, float(sss_scale))
+        glUniform1i(program.use_detail, int(use_detail))
+        glUniform1f(program.detail_tiling, float(detail_tiling))
+        glUniform1f(program.normal_blend_rate, float(normal_blend_rate))
+        glUniform1f(program.roughness_blend_rate, float(roughness_blend_rate))
+        glUniform1f(program.cavity_blend_rate, float(cavity_blend_rate))
+        glUniform1f(program.emissive_intensity, float(emissive_intensity))
+        glUniform1f(program.translucent_scale, float(translucent_scale))
+        glUniform1f(program.face_uv_scale, float(face_uv_scale))
+        if uvs1_vbo is None:
+            glDisableVertexAttribArray(program.uv1)
+            glVertexAttrib2f(program.uv1, 0.0, 0.0)
+        else:
+            uvs1_vbo.bind()
+            glEnableVertexAttribArray(program.uv1)
+            glVertexAttribPointer(program.uv1, 2, GL_FLOAT, False, 0, None)
+        if tangents_vbo is None:
+            glDisableVertexAttribArray(program.tangent)
+            glVertexAttrib4f(program.tangent, 0.0, 0.0, 0.0, 1.0)
+        else:
+            tangents_vbo.bind()
+            glEnableVertexAttribArray(program.tangent)
+            glVertexAttribPointer(program.tangent, 4, GL_FLOAT, False, 0, None)
         return program.handle
 
-    @staticmethod
-    def unbind() -> None:
-        for unit in range(5):
+    def unbind(self) -> None:
+        if self._program is not None:
+            glDisableVertexAttribArray(self._program.uv1)
+            glDisableVertexAttribArray(self._program.tangent)
+        for unit in range(12):
             glActiveTexture(GL_TEXTURE0 + unit)
             glBindTexture(GL_TEXTURE_2D, 0)
         glActiveTexture(GL_TEXTURE0)
@@ -131,16 +273,35 @@ class StudioMaterialRenderer:
         names = (
             "u_texture", "u_textured", "u_nrro_texture", "u_has_nrro",
             "u_normal_texture", "u_has_normal", "u_rcto_texture", "u_has_rcto",
-            "u_alpha_texture", "u_has_alpha", "u_tint", "u_ambient",
+            "u_alpha_texture", "u_has_alpha",
+            "u_hair_flow_texture", "u_has_hair_flow",
+            "u_hair_hss_texture", "u_has_hair_hss",
+            "u_detail_nrrc_texture", "u_has_detail_nrrc",
+            "u_detail_mask_texture", "u_has_detail_mask",
+            "u_stcm_texture", "u_has_stcm",
+            "u_emissive_texture", "u_has_emissive",
+            "u_second_alpha_texture", "u_has_second_alpha",
+            "u_tint", "u_ambient",
             "u_diffuse", "u_exposure", "u_gamma", "u_lit",
             "u_wots_material", "u_roughness_scale", "u_occlusion_scale",
             "u_alpha_adjust", "u_alpha_threshold", "u_alpha_test",
+            "u_hair_material", "u_material_family", "u_use_secondary_uv", "u_use_separate_alpha", "u_use_flow_map",
+            "u_secondary_specular_intensity", "u_primary_spec_sharpness",
+            "u_secondary_spec_sharpness", "u_primary_specular_shift_offset",
+            "u_secondary_specular_shift_offset", "u_hair_height_depth",
+            "u_specular", "u_primary_specular_level", "u_ao_exp", "u_sss_scale",
+            "u_use_detail", "u_detail_tiling", "u_normal_blend_rate",
+            "u_roughness_blend_rate", "u_cavity_blend_rate",
+            "u_emissive_intensity", "u_translucent_scale",
+            "u_face_uv_scale",
         )
         locations = tuple(glGetUniformLocation(handle, name) for name in names)
-        if min(locations) < 0:
+        uv1 = int(glGetAttribLocation(handle, "a_uv1"))
+        tangent = int(glGetAttribLocation(handle, "a_tangent"))
+        if min((*locations, uv1, tangent)) < 0:
             glDeleteProgram(handle)
             raise RuntimeError("Studio preview shader omitted a required uniform")
-        self._program = _Program(handle, *locations)
+        self._program = _Program(handle, *locations, uv1, tangent)
         return self._program
 
 
@@ -148,141 +309,32 @@ _VERTEX_SHADER = """
 #version 120
 
 varying vec2 v_uv;
+varying vec2 v_uv1;
 varying vec3 v_eye_position;
 varying vec3 v_eye_normal;
+varying vec4 v_eye_tangent;
 varying vec4 v_color;
+
+attribute vec4 a_tangent;
+attribute vec2 a_uv1;
 
 void main() {
     vec4 eye = gl_ModelViewMatrix * gl_Vertex;
     gl_Position = gl_ProjectionMatrix * eye;
     v_uv = gl_MultiTexCoord0.xy;
+    v_uv1 = a_uv1;
     v_eye_position = eye.xyz;
     v_eye_normal = normalize(gl_NormalMatrix * gl_Normal);
+    vec3 eyeTangent = gl_NormalMatrix * a_tangent.xyz;
+    v_eye_tangent = vec4(
+        dot(eyeTangent, eyeTangent) > 0.000000000001
+            ? normalize(eyeTangent)
+            : vec3(0.0),
+        a_tangent.w
+    );
     v_color = gl_Color;
 }
 """
 
 
-_FRAGMENT_SHADER = """
-#version 120
-
-uniform sampler2D u_texture;
-uniform bool u_textured;
-uniform sampler2D u_nrro_texture;
-uniform bool u_has_nrro;
-uniform sampler2D u_normal_texture;
-uniform bool u_has_normal;
-uniform sampler2D u_rcto_texture;
-uniform bool u_has_rcto;
-uniform sampler2D u_alpha_texture;
-uniform bool u_has_alpha;
-uniform vec4 u_tint;
-uniform float u_ambient;
-uniform float u_diffuse;
-uniform float u_exposure;
-uniform float u_gamma;
-uniform bool u_lit;
-uniform bool u_wots_material;
-uniform float u_roughness_scale;
-uniform float u_occlusion_scale;
-uniform float u_alpha_adjust;
-uniform float u_alpha_threshold;
-uniform bool u_alpha_test;
-
-varying vec2 v_uv;
-varying vec3 v_eye_position;
-varying vec3 v_eye_normal;
-varying vec4 v_color;
-
-vec3 mappedNormal(vec3 tangentNormal) {
-    vec3 normal = normalize(v_eye_normal);
-    vec3 positionX = dFdx(v_eye_position);
-    vec3 positionY = dFdy(v_eye_position);
-    vec2 uvX = dFdx(v_uv);
-    vec2 uvY = dFdy(v_uv);
-    vec3 positionYPerp = cross(positionY, normal);
-    vec3 positionXPerp = cross(normal, positionX);
-    vec3 tangent = positionYPerp * uvX.x + positionXPerp * uvY.x;
-    vec3 bitangent = positionYPerp * uvX.y + positionXPerp * uvY.y;
-    float scale = max(dot(tangent, tangent), dot(bitangent, bitangent));
-    if (scale < 1e-12) return normal;
-    float inverseScale = inversesqrt(scale);
-    return normalize(
-        tangent * (tangentNormal.x * inverseScale)
-        + bitangent * (tangentNormal.y * inverseScale)
-        + normal * tangentNormal.z
-    );
-}
-
-void main() {
-    vec4 texel = u_textured ? texture2D(u_texture, v_uv) : vec4(1.0);
-    vec4 surface = texel * v_color * u_tint;
-    vec3 normal = normalize(v_eye_normal);
-    float roughness = 1.0;
-    float occlusion = 1.0;
-    if (u_wots_material && u_has_nrro) {
-        vec4 nrro = texture2D(u_nrro_texture, v_uv);
-        vec2 normalXY = nrro.ag * 2.0 - 1.0;
-        vec3 tangentNormal = vec3(
-            normalXY,
-            sqrt(max(1.0 - dot(normalXY, normalXY), 0.0))
-        );
-        normal = mappedNormal(normalize(tangentNormal));
-        roughness = clamp(nrro.r * max(u_roughness_scale, 0.0), 0.04, 1.0);
-        occlusion = clamp(
-            mix(1.0, nrro.b, max(u_occlusion_scale, 0.0)),
-            0.0,
-            1.0
-        );
-    } else if (u_wots_material && u_has_normal) {
-        normal = mappedNormal(
-            normalize(texture2D(u_normal_texture, v_uv).rgb * 2.0 - 1.0)
-        );
-    }
-    if (u_wots_material && u_has_rcto) {
-        vec4 rcto = texture2D(u_rcto_texture, v_uv);
-        roughness = clamp(rcto.r * max(u_roughness_scale, 0.0), 0.04, 1.0);
-        occlusion = clamp(
-            mix(1.0, rcto.a, max(u_occlusion_scale, 0.0)),
-            0.0,
-            1.0
-        );
-    }
-    float alpha = surface.a;
-    if (u_wots_material) {
-        float alphaMask = u_has_alpha
-            ? texture2D(u_alpha_texture, v_uv).r
-            : texel.a;
-        alpha = v_color.a * u_tint.a * pow(
-            clamp(alphaMask, 0.0, 1.0),
-            max(u_alpha_adjust, 0.0001)
-        );
-        if (u_alpha_test && alpha < u_alpha_threshold) discard;
-    }
-    float hemisphere = 0.35 + 0.65 * clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 keyDirection = normalize(vec3(0.45, 0.75, 0.55));
-    vec3 fillDirection = normalize(vec3(-0.70, 0.30, 0.45));
-    vec3 rimDirection = normalize(vec3(0.10, 0.35, -0.95));
-    float key = max(dot(normal, keyDirection), 0.0);
-    float fill = max(dot(normal, fillDirection), 0.0);
-    float rim = pow(max(dot(normal, rimDirection), 0.0), 2.0);
-    float light = u_ambient * hemisphere * occlusion
-        + u_diffuse * (0.72 * key + 0.28 * fill + 0.35 * rim);
-    vec3 litSurface = surface.rgb * light;
-    if (u_wots_material) {
-        vec3 viewDirection = normalize(-v_eye_position);
-        vec3 halfDirection = normalize(keyDirection + viewDirection);
-        float exponent = mix(96.0, 4.0, roughness);
-        float strength = mix(0.42, 0.04, roughness);
-        float specular = pow(max(dot(normal, halfDirection), 0.0), exponent);
-        litSurface += vec3(specular * strength * u_diffuse * occlusion);
-    }
-    vec3 rgb = u_lit
-        ? pow(
-            max(litSurface * max(u_exposure, 0.0), vec3(0.0)),
-            vec3(1.0 / max(u_gamma, 0.01))
-        )
-        : surface.rgb;
-    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), alpha);
-}
-"""
+_FRAGMENT_SHADER = WOTS_FRAGMENT_SHADER

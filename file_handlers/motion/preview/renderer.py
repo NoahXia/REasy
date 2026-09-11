@@ -341,6 +341,7 @@ class MotionPreviewRenderer:
                         target_mesh.vertices,
                         target_mesh.normals,
                         target_mesh.indices,
+                        bind_tangents=target_mesh.tangents,
                         handler=part.handler,
                     )
                 else:
@@ -351,6 +352,7 @@ class MotionPreviewRenderer:
                         target_mesh.vertices,
                         target_mesh.normals,
                         target_mesh.indices,
+                        bind_tangents=target_mesh.tangents,
                         pose_to_constrained_matrix=np.identity(
                             4,
                             dtype=np.float32,
@@ -373,6 +375,7 @@ class MotionPreviewRenderer:
                 if not use_gpu_skinning:
                     vertices, normals = deformer.deform(snapshot)
                     target_mesh.vertices = vertices
+                    target_mesh.tangents = None
                     if normals is not None:
                         target_mesh.normals = normals
                 else:

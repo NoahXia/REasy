@@ -17,11 +17,46 @@ WOTS_ALPHA_TEXTURE = "WOTS_Alpha"
 WOTS_DETAIL_NRRC_TEXTURE = "Detail_NRRC"
 WOTS_DETAIL_MASK_TEXTURE = "DetailMaskMap"
 WOTS_STCM_TEXTURE = "SSSTranslucentCavityDetailMaskMap"
+WOTS_HAIR_FLOW_TEXTURE = "HairFlowMap"
+WOTS_HAIR_HSS_TEXTURE = "Hair_Height_SpecMask_Shift_Map"
+WOTS_EMISSIVE_TEXTURE = "WOTS_Emissive"
+WOTS_SECOND_ALPHA_TEXTURE = "WOTS_SecondAlpha"
 WOTS_GAME_VERSIONS = frozenset({"ONIMUSHAWOTS", "ONIWOTS", "WOTS"})
+WOTS_HAIR_TEMPLATES = frozenset({
+    "v_chara_pl_hair.mmtr",
+    "v_chara_pl_eyebrow.mmtr",
+})
+WOTS_MATERIAL_FAMILY_GENERIC = 0
+WOTS_MATERIAL_FAMILY_SKIN = 1
+WOTS_MATERIAL_FAMILY_FACE = 2
+WOTS_MATERIAL_FAMILY_MOUTH = 3
+WOTS_MATERIAL_FAMILY_HAIR = 4
+WOTS_MATERIAL_FAMILY_EYEBROW = 5
+WOTS_MATERIAL_FAMILY_BODY_HAIR = 6
+WOTS_MATERIAL_FAMILY_EYE = 7
+WOTS_MATERIAL_FAMILY_CORNEA = 8
+WOTS_MATERIAL_FAMILY_EYE_AO = 9
+WOTS_MATERIAL_FAMILY_TEAR = 10
+WOTS_MATERIAL_FAMILY_CLOTH = 11
+WOTS_TEMPLATE_FAMILIES = {
+    "v_chara_pl_skin.mmtr": WOTS_MATERIAL_FAMILY_SKIN,
+    "v_chara_pl_face.mmtr": WOTS_MATERIAL_FAMILY_FACE,
+    "v_chara_pl_mouth.mmtr": WOTS_MATERIAL_FAMILY_MOUTH,
+    "v_chara_pl_hair.mmtr": WOTS_MATERIAL_FAMILY_HAIR,
+    "v_chara_pl_eyebrow.mmtr": WOTS_MATERIAL_FAMILY_EYEBROW,
+    "v_chara_pl_bodyhair.mmtr": WOTS_MATERIAL_FAMILY_BODY_HAIR,
+    "v_chara_pl_eye.mmtr": WOTS_MATERIAL_FAMILY_EYE,
+    "v_chara_cornea.mmtr": WOTS_MATERIAL_FAMILY_CORNEA,
+    "v_chara_eye_ao.mmtr": WOTS_MATERIAL_FAMILY_EYE_AO,
+    "v_chara_tear.mmtr": WOTS_MATERIAL_FAMILY_TEAR,
+    "v_chara_pl_cloth_alp.mmtr": WOTS_MATERIAL_FAMILY_CLOTH,
+    "v_chara_pl_cloth.mmtr": WOTS_MATERIAL_FAMILY_CLOTH,
+}
 WOTS_NRRO_ROLES = (
     "NormalRoughnessOcclusionMap",
     "WrinkleBlend_NRROMap",
     "TexChange_NRRO",
+    "EyeAwake_Eyes_NRRO",
 )
 WOTS_ALPHA_ROLES = (
     "AlphaMap",
@@ -37,12 +72,25 @@ WOTS_RCTO_ROLES = (
 )
 WOTS_DETAIL_NRRC_ROLES = (
     "Detail_NRRC",
+    "MicroSkin_NRRC",
 )
 WOTS_DETAIL_MASK_ROLES = (
     "DetailMaskMap",
+    "MicroSkin_MaskTex",
 )
 WOTS_STCM_ROLES = (
     "SSSTranslucentCavityDetailMaskMap",
+    "CavityMap",
+)
+WOTS_EMISSIVE_ROLES = (
+    "EmissiveMap",
+    "EyeAwake_Face_EMI",
+    "FakeHigLightInGameMap",
+    "FakeHighLightMap",
+)
+WOTS_SECOND_ALPHA_ROLES = (
+    "SecondAlphaMap",
+    "EventDissolve_AlphaMap",
 )
 # Texture parameters used by WOTS' specialised character shaders.  Keep the
 # MDF parameter names here: the Unreal material bundle can then bind them
@@ -280,6 +328,8 @@ def wots_material_texture_paths(
             (WOTS_DETAIL_NRRC_TEXTURE, first(WOTS_DETAIL_NRRC_ROLES)),
             (WOTS_DETAIL_MASK_TEXTURE, first(WOTS_DETAIL_MASK_ROLES)),
             (WOTS_STCM_TEXTURE, first(WOTS_STCM_ROLES)),
+            (WOTS_EMISSIVE_TEXTURE, first(WOTS_EMISSIVE_ROLES)),
+            (WOTS_SECOND_ALPHA_TEXTURE, first(WOTS_SECOND_ALPHA_ROLES)),
         )
         if path
     }
@@ -308,19 +358,78 @@ def wots_material_parameters(
         components = values.get(name.casefold())
         return float(components[0]) if components else float(default)
 
+    def first_scalar(names: tuple[str, ...], default: float) -> float:
+        for name in names:
+            components = values.get(name.casefold())
+            if components:
+                return float(components[0])
+        return float(default)
+
+    template = _template_name(surface.mmtr_path)
+    hair_material = template in WOTS_HAIR_TEMPLATES
+    material_family = WOTS_TEMPLATE_FAMILIES.get(
+        template, WOTS_MATERIAL_FAMILY_GENERIC
+    )
+    micro_skin_rate = scalar("MicroSkin_BlendRate", 0.0)
+    # WOTS face colour/normal textures are 2x2 expression atlases.  The MDF
+    # stores their sub-UV scale as Dummy_UVScale (0.5 for the shipped face
+    # materials).  Neutral preview uses the first tile; expression blending
+    # can select the other tiles once runtime wrinkle weights are available.
+    face_uv_scale = (
+        scalar("Dummy_UVScale", 0.5)
+        if material_family == WOTS_MATERIAL_FAMILY_FACE
+        else 1.0
+    )
     return {
         "wots_material": True,
+        "hair_material": hair_material,
+        "material_family": material_family,
+        # The face atlas itself uses UV0.  UV1 is the continuous secondary UV
+        # used by overlays such as blood/oil, not the wrinkle/base atlas.
+        "use_secondary_uv": False,
+        "face_uv_scale": face_uv_scale,
         "roughness_scale": scalar("RoughnessScale", 1.0),
         "occlusion_scale": scalar("OcclusionScale", 1.0),
         "alpha_adjust": scalar("AlphaAdjust", 1.0),
         "alpha_threshold": scalar("AlphaTestThreshold", 0.5),
         "alpha_test": scalar("IsAlphaTest", 0.0) >= 0.5,
-        "use_detail": scalar("UseDetail", 0.0) >= 0.5,
-        "detail_tiling": scalar("Detail_Tiling", 1.0),
-        "normal_blend_rate": scalar("Normal_BlendRate", 1.0),
-        "roughness_blend_rate": scalar("Roughness_BlendRate", 0.0),
-        "cavity_blend_rate": scalar("Cavity_BlendRate", 0.0),
+        "use_separate_alpha": scalar("UseSeparateAlpha", 0.0),
+        "use_detail": (
+            scalar("UseDetail", 0.0) >= 0.5 or micro_skin_rate > 0.0
+        ),
+        "detail_tiling": first_scalar(
+            ("Detail_Tiling", "MicroSkin_Tiling"), 1.0
+        ),
+        "normal_blend_rate": first_scalar(
+            ("Normal_BlendRate", "MicroSkin_NormalScale"), 1.0
+        ) * (micro_skin_rate if micro_skin_rate > 0.0 else 1.0),
+        "roughness_blend_rate": first_scalar(
+            ("Roughness_BlendRate", "MicroSkin_RoughnessScale"), 0.0
+        ) * (micro_skin_rate if micro_skin_rate > 0.0 else 1.0),
+        "cavity_blend_rate": first_scalar(
+            ("Cavity_BlendRate", "MicroSkin_CavityScale"), 0.0
+        ) * (micro_skin_rate if micro_skin_rate > 0.0 else 1.0),
         "sss_scale": scalar("SSSScale", 0.0),
+        "use_flow_map": scalar("UseFlowMap", 0.0),
+        "secondary_specular_intensity": scalar(
+            "Secondary_Specular_Intensity", 1.0
+        ),
+        "primary_spec_sharpness": scalar("PrimarySpec_Sharpness", 50.0),
+        "secondary_spec_sharpness": scalar(
+            "SecondarySpec_Sharpness", 20.0
+        ),
+        "primary_specular_shift_offset": scalar(
+            "Primary_Specular_ShiftOffset", 0.1
+        ),
+        "secondary_specular_shift_offset": scalar(
+            "Secondary_Specular_ShiftOffset", 0.1
+        ),
+        "hair_height_depth": scalar("Hair_Height_Depth", 0.0),
+        "specular": first_scalar(("Specular", "SpecularScale"), 0.5),
+        "primary_specular_level": scalar("Primary_Specular_Color", 0.023529),
+        "ao_exp": scalar("AOExp", 0.0),
+        "emissive_intensity": scalar("EmissiveIntensity", 0.0),
+        "translucent_scale": scalar("TranslucentScale", 0.0),
     }
 
 

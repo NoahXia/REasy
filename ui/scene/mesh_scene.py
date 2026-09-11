@@ -132,6 +132,34 @@ def _merge_attribute(records, name: str, width: int, dtype) -> np.ndarray | None
     return np.concatenate(chunks)
 
 
+def _merge_tangent_frames(
+    records: list[tuple[int, object, int]],
+    normals: np.ndarray | None,
+) -> np.ndarray | None:
+    xyz = _merge_attribute(records, "tangents", 3, np.float32)
+    signs = _merge_attribute(records, "tangent_ws", 1, np.uint8)
+    if xyz is None and signs is None:
+        return None
+    if xyz is None or signs is None:
+        raise ValueError("Incomplete tangent frame in LOD0 mesh buffers")
+    lengths = np.linalg.norm(xyz, axis=1, keepdims=True)
+    if np.any(~np.isfinite(lengths)) or np.any(lengths <= 1e-8):
+        raise ValueError("LOD0 contains an invalid zero-length tangent")
+    xyz = xyz / lengths
+    if normals is not None:
+        xyz = xyz - normals * np.sum(xyz * normals, axis=1, keepdims=True)
+        lengths = np.linalg.norm(xyz, axis=1, keepdims=True)
+        if np.any(~np.isfinite(lengths)) or np.any(lengths <= 1e-8):
+            raise ValueError("LOD0 contains an invalid tangent frame")
+        xyz = xyz / lengths
+    signed = signs.reshape(-1).view(np.int8)
+    handedness = np.where(signed < 0, -1.0, 1.0).reshape(-1, 1)
+    return np.concatenate((xyz, handedness), axis=1).astype(
+        np.float32,
+        copy=False,
+    )
+
+
 def build_mesh_scene(
     mesh,
     *,
@@ -173,6 +201,10 @@ def build_mesh_scene(
 
     vertices = np.concatenate(vertex_chunks)
     normals = _merge_attribute(records, "normals", 3, np.float32)
+    if normals is not None:
+        normal_lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.maximum(normal_lengths, 1e-8)
+    tangents = _merge_tangent_frames(records, normals)
     colors = _merge_attribute(records, "colors", 4, np.uint8) if include_vertex_colors else None
     if colors is not None:
         colors = colors.astype(np.float32) / 255.0
@@ -235,6 +267,7 @@ def build_mesh_scene(
             force_solid=force_solid,
             ignore_highlight_filter=ignore_highlight_filter,
             normals=normals,
+            tangents=tangents,
             uvs=uvs,
             uvs1=uvs1,
             colors=colors,

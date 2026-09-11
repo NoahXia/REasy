@@ -40,6 +40,7 @@ from OpenGL.GL import (
 from OpenGL.GL.shaders import compileProgram, compileShader
 
 from .scene_model import SceneSkinningBinding
+from .wots_material import WOTS_FRAGMENT_SHADER, WOTS_MATERIAL_UNIFORM_NAMES
 
 
 MAX_SKIN_INFLUENCES = 16
@@ -72,6 +73,7 @@ class _Source:
     state: _State
     positions: object
     normals: object | None
+    tangents: object | None
     influences: object
     source_revision: int = -1
 
@@ -104,7 +106,7 @@ class GpuSkinningDeformer:
         """Return the vertex-attribute and matrix-palette requirements."""
         active = binding.weights > 0.0
         palette_size = len(np.unique(binding.joint_indices[active]))
-        return 4 + binding.group_count * 2, palette_size
+        return 6 + binding.group_count * 2, palette_size
 
     def supports_binding(self, binding: SceneSkinningBinding) -> bool:
         """Whether the current OpenGL context can draw one skin binding."""
@@ -223,7 +225,7 @@ class GpuSkinningDeformer:
         self._sync_sources()
         if not self._states:
             return
-        required_attributes = 4 + max(
+        required_attributes = 6 + max(
             state.binding.group_count * 2 for state in self._states.values()
         )
         palette_limit = max(
@@ -250,6 +252,7 @@ class GpuSkinningDeformer:
         key: str,
         *,
         uvs_vbo=None,
+        uvs1_vbo=None,
         colors_vbo=None,
         vertex_offset: int = 0,
         program: int = 0,
@@ -265,12 +268,42 @@ class GpuSkinningDeformer:
         normal_texture_id: int = 0,
         rcto_texture_id: int = 0,
         alpha_texture_id: int = 0,
+        hair_flow_texture_id: int = 0,
+        hair_hss_texture_id: int = 0,
+        detail_nrrc_texture_id: int = 0,
+        detail_mask_texture_id: int = 0,
+        stcm_texture_id: int = 0,
+        emissive_texture_id: int = 0,
+        second_alpha_texture_id: int = 0,
         wots_material: bool = False,
         roughness_scale: float = 1.0,
         occlusion_scale: float = 1.0,
         alpha_adjust: float = 1.0,
         alpha_threshold: float = 0.5,
         alpha_test: bool = False,
+        hair_material: bool = False,
+        material_family: int = 0,
+        use_secondary_uv: bool = False,
+        use_separate_alpha: float = 0.0,
+        use_flow_map: float = 0.0,
+        secondary_specular_intensity: float = 1.0,
+        primary_spec_sharpness: float = 50.0,
+        secondary_spec_sharpness: float = 20.0,
+        primary_specular_shift_offset: float = 0.1,
+        secondary_specular_shift_offset: float = 0.1,
+        hair_height_depth: float = 0.0,
+        specular: float = 0.5,
+        primary_specular_level: float = 0.023529,
+        ao_exp: float = 0.0,
+        sss_scale: float = 0.0,
+        use_detail: bool = False,
+        detail_tiling: float = 1.0,
+        normal_blend_rate: float = 1.0,
+        roughness_blend_rate: float = 0.0,
+        cavity_blend_rate: float = 0.0,
+        emissive_intensity: float = 0.0,
+        translucent_scale: float = 0.0,
+        face_uv_scale: float = 1.0,
         vertex_colors: bool = True,
     ) -> None:
         state = self._state(key)
@@ -291,8 +324,10 @@ class GpuSkinningDeformer:
             source,
             inputs.attributes,
             uvs_vbo,
+            uvs1_vbo,
             colors_vbo if vertex_colors else None,
             int(vertex_offset),
+            generic=generic,
         )
         if inputs.material is not None:
             for unit, texture in enumerate((
@@ -301,6 +336,13 @@ class GpuSkinningDeformer:
                 normal_texture_id,
                 rcto_texture_id,
                 alpha_texture_id,
+                hair_flow_texture_id,
+                hair_hss_texture_id,
+                detail_nrrc_texture_id,
+                detail_mask_texture_id,
+                stcm_texture_id,
+                emissive_texture_id,
+                second_alpha_texture_id,
             )):
                 glActiveTexture(GL_TEXTURE0 + unit)
                 glBindTexture(GL_TEXTURE_2D, int(texture or 0))
@@ -321,12 +363,55 @@ class GpuSkinningDeformer:
             glUniform1i(inputs.material[13], int(bool(rcto_texture_id)))
             glUniform1i(inputs.material[14], 4)
             glUniform1i(inputs.material[15], int(bool(alpha_texture_id)))
-            glUniform1i(inputs.material[16], int(wots_material))
-            glUniform1f(inputs.material[17], float(roughness_scale))
-            glUniform1f(inputs.material[18], float(occlusion_scale))
-            glUniform1f(inputs.material[19], float(alpha_adjust))
-            glUniform1f(inputs.material[20], float(alpha_threshold))
-            glUniform1i(inputs.material[21], int(alpha_test))
+            glUniform1i(inputs.material[16], 5)
+            glUniform1i(inputs.material[17], int(bool(hair_flow_texture_id)))
+            glUniform1i(inputs.material[18], 6)
+            glUniform1i(inputs.material[19], int(bool(hair_hss_texture_id)))
+            glUniform1i(inputs.material[20], 7)
+            glUniform1i(inputs.material[21], int(bool(detail_nrrc_texture_id)))
+            glUniform1i(inputs.material[22], 8)
+            glUniform1i(inputs.material[23], int(bool(detail_mask_texture_id)))
+            glUniform1i(inputs.material[24], 9)
+            glUniform1i(inputs.material[25], int(bool(stcm_texture_id)))
+            glUniform1i(inputs.material[26], 10)
+            glUniform1i(inputs.material[27], int(bool(emissive_texture_id)))
+            glUniform1i(inputs.material[28], 11)
+            glUniform1i(inputs.material[29], int(bool(second_alpha_texture_id)))
+            glUniform1i(inputs.material[30], int(wots_material))
+            glUniform1i(inputs.material[31], int(hair_material))
+            glUniform1i(inputs.material[32], int(material_family))
+            glUniform1i(inputs.material[33], int(use_secondary_uv))
+            glUniform1f(inputs.material[34], float(roughness_scale))
+            glUniform1f(inputs.material[35], float(occlusion_scale))
+            glUniform1f(inputs.material[36], float(alpha_adjust))
+            glUniform1f(inputs.material[37], float(alpha_threshold))
+            glUniform1i(inputs.material[38], int(alpha_test))
+            for index, value in enumerate((
+                use_separate_alpha,
+                use_flow_map,
+                secondary_specular_intensity,
+                primary_spec_sharpness,
+                secondary_spec_sharpness,
+                primary_specular_shift_offset,
+                secondary_specular_shift_offset,
+                hair_height_depth,
+                specular,
+                primary_specular_level,
+                ao_exp,
+                sss_scale,
+            ), start=39):
+                glUniform1f(inputs.material[index], float(value))
+            glUniform1i(inputs.material[51], int(use_detail))
+            for index, value in enumerate((
+                detail_tiling,
+                normal_blend_rate,
+                roughness_blend_rate,
+                cavity_blend_rate,
+                emissive_intensity,
+                translucent_scale,
+            ), start=52):
+                glUniform1f(inputs.material[index], float(value))
+            glUniform1f(inputs.material[58], float(face_uv_scale))
         self._bound = inputs.attributes
 
     def unbind(self) -> None:
@@ -335,7 +420,7 @@ class GpuSkinningDeformer:
         for location in self._bound:
             glDisableVertexAttribArray(location)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-        for unit in range(5):
+        for unit in range(12):
             glActiveTexture(GL_TEXTURE0 + unit)
             glBindTexture(GL_TEXTURE_2D, 0)
         glActiveTexture(GL_TEXTURE0)
@@ -373,6 +458,7 @@ class GpuSkinningDeformer:
             state,
             self._array_vbo(state.positions, dynamic=True),
             self._array_vbo(state.normals, dynamic=True) if state.normals is not None else None,
+            self._array_vbo(state.binding.tangents) if state.binding.tangents is not None else None,
             self._array_vbo(influences),
         )
 
@@ -381,8 +467,11 @@ class GpuSkinningDeformer:
         source: _Source,
         locations: tuple[int, ...],
         uvs_vbo,
+        uvs1_vbo,
         colors_vbo,
         vertex_offset: int,
+        *,
+        generic: bool,
     ) -> None:
         self._bind_attribute(source.positions, locations[0], 3)
         if source.normals is None:
@@ -399,11 +488,31 @@ class GpuSkinningDeformer:
                 (glVertexAttrib2f if width == 2 else glVertexAttrib4f)(location, *default)
             else:
                 self._bind_attribute(handle, location, width, offset=offset)
+        influence_base = 4
+        if generic:
+            tangent_location = locations[4]
+            if source.tangents is None:
+                glDisableVertexAttribArray(tangent_location)
+                glVertexAttrib4f(tangent_location, 0.0, 0.0, 0.0, 1.0)
+            else:
+                self._bind_attribute(source.tangents, tangent_location, 4)
+            uv1_location = locations[5]
+            if uvs1_vbo is None:
+                glDisableVertexAttribArray(uv1_location)
+                glVertexAttrib2f(uv1_location, 0.0, 0.0)
+            else:
+                self._bind_attribute(
+                    uvs1_vbo,
+                    uv1_location,
+                    2,
+                    offset=vertex_offset * 8,
+                )
+            influence_base = 6
         source.influences.bind()
         stride = source.state.binding.group_count * 32
         for group in range(source.state.binding.group_count):
             for lane, offset in enumerate((group * 32, group * 32 + 16)):
-                location = locations[4 + group * 2 + lane]
+                location = locations[influence_base + group * 2 + lane]
                 glEnableVertexAttribArray(location)
                 glVertexAttribPointer(location, 4, GL_FLOAT, False, stride, c_void_p(offset))
 
@@ -457,7 +566,10 @@ class GpuSkinningDeformer:
         inputs = self._inputs.get(key)
         if inputs is not None:
             return inputs
-        names = ["a_position", "a_normal", "a_uv", "a_color"] + [
+        names = ["a_position", "a_normal", "a_uv", "a_color"]
+        if generic:
+            names.extend(("a_tangent", "a_uv1"))
+        names += [
             name
             for group in range(groups)
             for name in (f"a_joints{group}", f"a_weights{group}")
@@ -467,15 +579,7 @@ class GpuSkinningDeformer:
         material = (
             tuple(
                 int(glGetUniformLocation(program, name))
-                for name in (
-                    "u_tint", "u_ambient", "u_diffuse", "u_exposure",
-                    "u_gamma", "u_lit", "u_texture", "u_textured",
-                    "u_nrro_texture", "u_has_nrro", "u_normal_texture",
-                    "u_has_normal", "u_rcto_texture", "u_has_rcto",
-                    "u_alpha_texture", "u_has_alpha", "u_wots_material", "u_roughness_scale",
-                    "u_occlusion_scale", "u_alpha_adjust",
-                    "u_alpha_threshold", "u_alpha_test",
-                )
+                for name in WOTS_MATERIAL_UNIFORM_NAMES
             )
             if generic
             else None
@@ -511,19 +615,30 @@ class GpuSkinningDeformer:
 
     @staticmethod
     def _dispose_source(source: _Source) -> None:
-        for handle in (source.positions, source.normals, source.influences):
+        for handle in (
+            source.positions,
+            source.normals,
+            source.tangents,
+            source.influences,
+        ):
             if handle is not None:
                 with suppress(Exception):
                     handle.delete()
 
 
 def _vertex_shader(groups: int, palette_size: int, *, riglogic: bool) -> str:
+    tangent_attribute = "" if riglogic else "attribute vec4 a_tangent;"
+    uv1_attribute = "" if riglogic else "attribute vec2 a_uv1;"
     attributes = "\n".join(
         f"attribute vec4 a_joints{i};\nattribute vec4 a_weights{i};"
         for i in range(groups)
     )
     influences = "\n".join(
-        f"    applyInfluence(position, normal, a_joints{i}.{c}, a_weights{i}.{c});"
+        (
+            f"    applyInfluence(position, normal, a_joints{i}.{c}, a_weights{i}.{c});"
+            if riglogic
+            else f"    applyInfluence(position, normal, tangent, a_joints{i}.{c}, a_weights{i}.{c});"
+        )
         for i in range(groups)
         for c in _COMPONENTS
     )
@@ -543,8 +658,10 @@ uniform float u_exposure;
 uniform float u_gamma;
 uniform bool u_lit;
 varying vec2 v_uv;
+varying vec2 v_uv1;
 varying vec3 v_eye_position;
 varying vec3 v_eye_normal;
+varying vec4 v_eye_tangent;
 varying vec4 v_color;
 """
     )
@@ -558,11 +675,32 @@ varying vec4 v_color;
         if riglogic
         else """
     v_uv = a_uv;
+    v_uv1 = a_uv1;
     v_eye_position = eye.xyz;
     v_eye_normal = eyeNormal;
+    vec3 eyeTangent = gl_NormalMatrix * tangent;
+    v_eye_tangent = vec4(
+        dot(eyeTangent, eyeTangent) > 0.000000000001
+            ? normalize(eyeTangent)
+            : vec3(0.0),
+        a_tangent.w
+    );
     v_color = a_color;
 """
     )
+    tangent_parameter = "" if riglogic else "    inout vec3 tangent,\n"
+    tangent_skin = "" if riglogic else """
+    tangent += vec3(
+        dot(u_palette[base].xyz, a_tangent.xyz),
+        dot(u_palette[base + 1].xyz, a_tangent.xyz),
+        dot(u_palette[base + 2].xyz, a_tangent.xyz)
+    ) * weight;
+"""
+    tangent_initial = "" if riglogic else "    vec3 tangent = vec3(0.0);"
+    tangent_normalize = "" if riglogic else """
+    tangent -= normal * dot(normal, tangent);
+    if (dot(tangent, tangent) > 0.000000000001) tangent = normalize(tangent);
+"""
     return f"""
 #version 120
 
@@ -570,6 +708,8 @@ attribute vec3 a_position;
 attribute vec3 a_normal;
 attribute vec2 a_uv;
 attribute vec4 a_color;
+{tangent_attribute}
+{uv1_attribute}
 {attributes}
 uniform vec4 u_palette[{palette_size * 3}];
 {outputs}
@@ -577,7 +717,7 @@ uniform vec4 u_palette[{palette_size * 3}];
 void applyInfluence(
     inout vec3 position,
     inout vec3 normal,
-    float jointIndex,
+{tangent_parameter}    float jointIndex,
     float weight
 ) {{
     if (weight <= 0.0) return;
@@ -593,13 +733,16 @@ void applyInfluence(
         dot(u_palette[base + 1].xyz, a_normal),
         dot(u_palette[base + 2].xyz, a_normal)
     ) * weight;
+{tangent_skin}
 }}
 
 void main() {{
     vec3 position = vec3(0.0);
     vec3 normal = vec3(0.0);
+{tangent_initial}
 {influences}
     if (dot(normal, normal) > 0.000000000001) normal = normalize(normal);
+{tangent_normalize}
     vec4 eye = gl_ModelViewMatrix * vec4(position, 1.0);
     vec3 eyeNormal = normalize(gl_NormalMatrix * normal);
     gl_Position = gl_ProjectionMatrix * eye;
@@ -608,124 +751,4 @@ void main() {{
 """
 
 
-_GENERIC_FRAGMENT_SHADER = """
-#version 120
-
-uniform sampler2D u_texture;
-uniform bool u_textured;
-uniform sampler2D u_nrro_texture;
-uniform bool u_has_nrro;
-uniform sampler2D u_normal_texture;
-uniform bool u_has_normal;
-uniform sampler2D u_rcto_texture;
-uniform bool u_has_rcto;
-uniform sampler2D u_alpha_texture;
-uniform bool u_has_alpha;
-uniform vec4 u_tint;
-uniform float u_ambient;
-uniform float u_diffuse;
-uniform float u_exposure;
-uniform float u_gamma;
-uniform bool u_lit;
-uniform bool u_wots_material;
-uniform float u_roughness_scale;
-uniform float u_occlusion_scale;
-uniform float u_alpha_adjust;
-uniform float u_alpha_threshold;
-uniform bool u_alpha_test;
-
-varying vec2 v_uv;
-varying vec3 v_eye_position;
-varying vec3 v_eye_normal;
-varying vec4 v_color;
-
-vec3 mappedNormal(vec3 tangentNormal) {
-    vec3 normal = normalize(v_eye_normal);
-    vec3 positionX = dFdx(v_eye_position);
-    vec3 positionY = dFdy(v_eye_position);
-    vec2 uvX = dFdx(v_uv);
-    vec2 uvY = dFdy(v_uv);
-    vec3 positionYPerp = cross(positionY, normal);
-    vec3 positionXPerp = cross(normal, positionX);
-    vec3 tangent = positionYPerp * uvX.x + positionXPerp * uvY.x;
-    vec3 bitangent = positionYPerp * uvX.y + positionXPerp * uvY.y;
-    float scale = max(dot(tangent, tangent), dot(bitangent, bitangent));
-    if (scale < 1e-12) return normal;
-    float inverseScale = inversesqrt(scale);
-    return normalize(
-        tangent * (tangentNormal.x * inverseScale)
-        + bitangent * (tangentNormal.y * inverseScale)
-        + normal * tangentNormal.z
-    );
-}
-
-void main() {
-    vec4 texel = u_textured ? texture2D(u_texture, v_uv) : vec4(1.0);
-    vec4 surface = texel * v_color * u_tint;
-    vec3 normal = normalize(v_eye_normal);
-    float roughness = 1.0;
-    float occlusion = 1.0;
-    if (u_wots_material && u_has_nrro) {
-        vec4 nrro = texture2D(u_nrro_texture, v_uv);
-        vec2 normalXY = nrro.ag * 2.0 - 1.0;
-        vec3 tangentNormal = vec3(
-            normalXY,
-            sqrt(max(1.0 - dot(normalXY, normalXY), 0.0))
-        );
-        normal = mappedNormal(normalize(tangentNormal));
-        roughness = clamp(nrro.r * max(u_roughness_scale, 0.0), 0.04, 1.0);
-        occlusion = clamp(
-            mix(1.0, nrro.b, max(u_occlusion_scale, 0.0)),
-            0.0,
-            1.0
-        );
-    } else if (u_wots_material && u_has_normal) {
-        normal = mappedNormal(
-            normalize(texture2D(u_normal_texture, v_uv).rgb * 2.0 - 1.0)
-        );
-    }
-    if (u_wots_material && u_has_rcto) {
-        vec4 rcto = texture2D(u_rcto_texture, v_uv);
-        roughness = clamp(rcto.r * max(u_roughness_scale, 0.0), 0.04, 1.0);
-        occlusion = clamp(
-            mix(1.0, rcto.a, max(u_occlusion_scale, 0.0)),
-            0.0,
-            1.0
-        );
-    }
-    float alpha = surface.a;
-    if (u_wots_material) {
-        float alphaMask = u_has_alpha
-            ? texture2D(u_alpha_texture, v_uv).r
-            : texel.a;
-        alpha = v_color.a * u_tint.a * pow(
-            clamp(alphaMask, 0.0, 1.0),
-            max(u_alpha_adjust, 0.0001)
-        );
-        if (u_alpha_test && alpha < u_alpha_threshold) discard;
-    }
-    float hemisphere = 0.35 + 0.65 * clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 keyDirection = normalize(vec3(0.45, 0.75, 0.55));
-    float key = max(dot(normal, keyDirection), 0.0);
-    float fill = max(dot(normal, normalize(vec3(-0.70, 0.30, 0.45))), 0.0);
-    float rim = pow(max(dot(normal, normalize(vec3(0.10, 0.35, -0.95))), 0.0), 2.0);
-    float light = u_ambient * hemisphere * occlusion
-        + u_diffuse * (0.72 * key + 0.28 * fill + 0.35 * rim);
-    vec3 litSurface = surface.rgb * light;
-    if (u_wots_material) {
-        vec3 viewDirection = normalize(-v_eye_position);
-        vec3 halfDirection = normalize(keyDirection + viewDirection);
-        float exponent = mix(96.0, 4.0, roughness);
-        float strength = mix(0.42, 0.04, roughness);
-        float specular = pow(max(dot(normal, halfDirection), 0.0), exponent);
-        litSurface += vec3(specular * strength * u_diffuse * occlusion);
-    }
-    vec3 rgb = u_lit
-        ? pow(
-            max(litSurface * max(u_exposure, 0.0), vec3(0.0)),
-            vec3(1.0 / max(u_gamma, 0.01))
-        )
-        : surface.rgb;
-    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), alpha);
-}
-"""
+_GENERIC_FRAGMENT_SHADER = WOTS_FRAGMENT_SHADER

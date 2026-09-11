@@ -17,13 +17,64 @@ from file_handlers.mesh.mesh_file import (
     _decode_skin_weights,
     get_mesh_version,
 )
-from file_handlers.mesh.material_resolver import MdfSurfaceProfile
+from file_handlers.mesh.material_resolver import MdfSurfaceProfile, MeshMaterialResolver
 from ui.scene.gpu_skinning import GpuSkinningDeformer
+from ui.scene.mesh_scene import _merge_tangent_frames
+from ui.scene.scene_buffers import build_scene_buffer_set
+from ui.scene.scene_model import SceneDrawMesh
 from ui.scene.scene_preview import ScenePreviewWidget
 from ui.scene.studio_material import StudioMaterialRenderer
 
 
 class TestWotsMesh(unittest.TestCase):
+    def test_item_material_candidate_supports_wots_a_suffix(self):
+        candidates = list(
+            MeshMaterialResolver.iter_mdf_candidates(
+                "natives/stm/art/model/item/it0/it000_0000/"
+                "it000_0000_00.mesh.260209350"
+            )
+        )
+        self.assertEqual(
+            candidates[:2],
+            [
+                "natives/stm/art/model/item/it0/it000_0000/"
+                "it000_0000_00.mdf2",
+                "natives/stm/art/model/item/it0/it000_0000/"
+                "it000_0000_00_a.mdf2",
+            ],
+        )
+
+    def test_preview_scene_preserves_secondary_uvs(self):
+        mesh = SceneDrawMesh(
+            key="face",
+            vertices=np.asarray(
+                [[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32
+            ),
+            indices=np.asarray([0, 1, 2], dtype=np.uint32),
+            color=(1.0, 1.0, 1.0, 1.0),
+            uvs=np.asarray([[0, 0], [1, 0], [0, 1]], dtype=np.float32),
+            uvs1=np.asarray(
+                [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75]],
+                dtype=np.float32,
+            ),
+        )
+        buffers = build_scene_buffer_set(
+            [mesh], set(), show_only_highlighted=False, force_solid=False
+        )
+        self.assertIsNotNone(buffers)
+        np.testing.assert_allclose(buffers.uvs1, mesh.uvs1)
+
+    def test_preview_tangent_frame_preserves_signed_handedness(self):
+        payload = SimpleNamespace(
+            tangents=[1.0, 0.0, 0.0],
+            tangent_ws=[128],
+        )
+        tangents = _merge_tangent_frames(
+            [(0, payload, 1)],
+            np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        )
+        np.testing.assert_allclose(tangents, [[1.0, 0.0, 0.0, -1.0]])
+
     def test_wots_material_shader_names_do_not_use_legacy_indices(self):
         shader_names = material_shader_names("onimusha_wots")
         self.assertEqual(shader_names[16], "ExpensiveTransparent")
@@ -36,13 +87,26 @@ class TestWotsMesh(unittest.TestCase):
                 "face": MdfSurfaceProfile(
                     material_name="face",
                     game_version="ONIWOTS",
-                    parameters={"UseDetail": (1.0,), "SSSScale": (0.5,)},
+                    mmtr_path=(
+                        "MaterialShader/Master/Character/Variation/PL/"
+                        "V_Chara_PL_Face.mmtr"
+                    ),
+                    parameters={
+                        "UseDetail": (1.0,),
+                        "SSSScale": (0.5,),
+                        "Dummy_UVScale": (0.5,),
+                    },
                 )
             },
             _texture_ids={},
         )
         arguments = ScenePreviewWidget._wots_material_inputs(preview, "face")
-        self.assertNotIn("use_detail", arguments)
+        self.assertTrue(arguments["use_detail"])
+        self.assertEqual(arguments["sss_scale"], 0.5)
+        self.assertIn("detail_nrrc_texture_id", arguments)
+        self.assertIn("stcm_texture_id", arguments)
+        self.assertFalse(arguments["use_secondary_uv"])
+        self.assertEqual(arguments["face_uv_scale"], 0.5)
         for renderer in (StudioMaterialRenderer.bind, GpuSkinningDeformer.bind):
             self.assertLessEqual(
                 set(arguments),

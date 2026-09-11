@@ -69,6 +69,7 @@ def build_skinned_mesh_deformer(
     bind_normals: np.ndarray | None,
     bind_indices: np.ndarray | None = None,
     *,
+    bind_tangents: np.ndarray | None = None,
     handler=None,
     explicit_mdf_path: str = "",
 ) -> "SkinnedMeshDeformer":
@@ -87,6 +88,7 @@ def build_skinned_mesh_deformer(
         bind_positions,
         bind_normals,
         bind_indices,
+        bind_tangents=bind_tangents,
         skinning_contract=contract,
     )
 
@@ -99,6 +101,7 @@ def build_shared_rig_deformer(
     bind_normals: np.ndarray | None,
     bind_indices: np.ndarray | None = None,
     *,
+    bind_tangents: np.ndarray | None = None,
     pose_to_constrained_matrix: np.ndarray,
     root_attachment_joint: str = "",
     handler=None,
@@ -111,6 +114,7 @@ def build_shared_rig_deformer(
             bind_positions,
             bind_normals,
             bind_indices,
+            bind_tangents=bind_tangents,
             handler=handler,
             explicit_mdf_path=explicit_mdf_path,
         ),
@@ -186,6 +190,7 @@ class SkinnedMeshDeformer:
         bind_normals: np.ndarray | None,
         bind_indices: np.ndarray | None = None,
         *,
+        bind_tangents: np.ndarray | None = None,
         skinning_contract: MeshSkinningContract | None = None,
     ):
         self.bind_positions = np.ascontiguousarray(
@@ -228,6 +233,7 @@ class SkinnedMeshDeformer:
             self.bind_normals,
             self._joint_indices,
             self._weights,
+            bind_tangents,
         )
 
     @property

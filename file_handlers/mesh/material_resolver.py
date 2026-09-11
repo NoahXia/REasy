@@ -489,6 +489,11 @@ class MeshMaterialResolver:
             return
         base = normalized[:idx]
         yield f"{base}.mdf2"
+        # WOTS item meshes commonly use a sibling ``*_a.mdf2.50`` material
+        # instead of the plain mesh basename.  Keep it behind the exact-name
+        # candidate so existing character and prop bindings retain priority;
+        # the resource resolver appends the concrete MDF version.
+        yield f"{base}_a.mdf2"
         # WOTS character parts commonly keep their material in an event
         # companion rather than beside the mesh under the plain base name.
         yield f"{base}_event_00.mdf2.51"
