@@ -50,13 +50,21 @@ from file_handlers.motion.preview.target import (
     load_re_engine_mesh_preset_target,
 )
 from file_handlers.motion.preview.attack_collision import (
+    ActiveAttackCollision,
     AttackCollisionOverlay,
     AttackCollisionSource,
     active_attack_collisions,
+    attack_collision_detail_sections,
     attack_collision_geometry_diagnostic,
     attack_rcol_resource_candidates,
     collision_type_label,
     load_attack_collision_resource,
+)
+from file_handlers.motion.preview.attack_parameters import (
+    AttackParameterRecord,
+    AttackParameterSource,
+    attack_parameter_detail_sections,
+    attack_parameter_resource_candidates,
 )
 from file_handlers.motion.preview.resolution import (
     MotionListDocument,
@@ -65,7 +73,7 @@ from file_handlers.motion.preview.resolution import (
 )
 from file_handlers.motion.wots_codec import WOTS_MOTION_FORMAT_CODEC, WotsMotParser
 from file_handlers.motbank.motbank_file import MotbankFile, MotlistItem
-from file_handlers.rcol.shape_types import Sphere
+from file_handlers.rcol.shape_types import Capsule, ShapeType, Sphere
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
 from utils.type_registry import TypeRegistry
@@ -670,6 +678,104 @@ class TestWotsMotion(unittest.TestCase):
         status = renderer.attack_collision_status(event_motion, 10.0)
         self.assertIn("Attack hitbox not drawn: RequestSet 120", status)
         self.assertIn("MAIN_WEAPON uses weapon-local collider space", status)
+
+    def test_attack_collision_details_report_actual_shape_type(self):
+        payload = Capsule()
+        payload.start = [0.0, 0.0, 0.0]
+        payload.end = [0.0, 1.0, 0.0]
+        payload.radius = 0.25
+        shape = SimpleNamespace(
+            shape=payload,
+            info=SimpleNamespace(
+                name="blade",
+                shape_type=ShapeType.ContinuousCapsule,
+                primary_joint_name_str="wp_start",
+                secondary_joint_name_str="wp_end",
+            ),
+        )
+        group = SimpleNamespace(
+            info=SimpleNamespace(name="katana"),
+            shapes=[shape],
+            extra_shapes=[],
+        )
+        request = SimpleNamespace(
+            info=SimpleNamespace(
+                field0=7,
+                id=0,
+                group_index=2,
+                name="slash",
+            ),
+            group=group,
+        )
+        source = AttackCollisionSource(
+            "fixture.rcol.37",
+            SimpleNamespace(request_sets=[request]),
+        )
+        event = ActiveAttackCollision(
+            "AttackCollision_Wp", 7, 60, 2, 10.0, 20.0
+        )
+        sections = dict(attack_collision_detail_sections(source, event))
+        request_rows = dict(sections["RCOL REQUEST SET"])
+        shape_rows = dict(sections["RCOL SHAPES"])
+        self.assertEqual(request_rows["Owner"], "MAIN_WEAPON")
+        self.assertEqual(request_rows["Shape Types"], "ContinuousCapsule")
+        self.assertIn("radius 0.25", shape_rows["Shape 0"])
+        self.assertIn("wp_start → wp_end", shape_rows["Shape 0"])
+
+    def test_attack_parameter_details_group_combat_rules(self):
+        value = lambda raw, orig_type="": SimpleNamespace(
+            value=raw,
+            orig_type=orig_type,
+        )
+        fields = {
+            "_Attack": value(100.0),
+            "_RikidoAttack": value(200.0),
+            "_GuardAttack": value(25.0),
+            "_ArmorAttack": value(75.0),
+            "_FlagBit": value(8 | 16 | 274877906944),
+            "_MultiHitTimer": value(3.0),
+            "_MultiHitMaxCount": value(2),
+            "_HitStopID": value(4),
+            "_HitStopDelayFrame": value(1),
+            "_HitStopDelayFrameGuard": value(2),
+        }
+        record = AttackParameterRecord(60, 12, fields)
+        source = AttackParameterSource(
+            "fixture.user.3",
+            SimpleNamespace(),
+            {60: (record,)},
+        )
+        sections = dict(attack_parameter_detail_sections(source, 60))
+        damage = dict(sections["DAMAGE / STAGGER"])
+        rules = dict(sections["HIT / DEFENSE RULES"])
+        hit_stop = dict(sections["HIT STOP"])
+        self.assertEqual(damage["Attack Damage"], "100")
+        self.assertEqual(damage["Rikido Damage"], "200")
+        self.assertIn("UNABLE_PARRY", rules["Flags"])
+        self.assertEqual(rules["Parry"], "Disabled")
+        self.assertEqual(rules["Block"], "Disabled")
+        self.assertEqual(hit_stop["HitStop ID"], "4")
+        self.assertEqual(hit_stop["Guard HitStop Delay"], "2 frames")
+
+    def test_attack_parameter_paths_follow_motion_owner(self):
+        self.assertEqual(
+            attack_parameter_resource_candidates(
+                "natives/stm/Motion/Player/Weapon/test.motlist.1036"
+            ),
+            (
+                "natives/stm/GameDesign/Action/Player/Data/ParamPack/"
+                "PlayerAttackParamList.user.3",
+            ),
+        )
+        self.assertEqual(
+            attack_parameter_resource_candidates(
+                "natives/stm/Motion/Enemy/Em100/00/test.motlist.1036"
+            ),
+            (
+                "natives/stm/GameDesign/Action/Enemy/Em100/00/Data/Param/"
+                "Em100_00_AttackParam.user.3",
+            ),
+        )
 
     def test_sound_event_profile_uses_enabled_trigger_keys(self):
         trigger = ClipProperty(

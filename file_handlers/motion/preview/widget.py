@@ -38,13 +38,24 @@ from .catalog import MotionPreviewCatalog
 from .blend_shapes import mesh_blend_shape_targets
 from .animation_browser import MotionEntryList
 from .attack_collision import (
+    attack_collision_detail_sections,
     load_attack_collision_resource,
     load_attack_collision_source,
+    selected_attack_collision,
+)
+from .attack_parameters import (
+    attack_parameter_detail_sections,
+    load_attack_parameter_source,
 )
 from .controller import MotionPreviewController
 from .controls import MotionPlaybackControls
 from .editor_layout import MotionEditorPane, MotionEditorWorkspace
-from .event_timeline import MotionEventDetailsWidget, MotionEventTimeline
+from .event_timeline import (
+    EventDetailSection,
+    MotionEventDetailsWidget,
+    MotionEventTimeline,
+    TimelineEventSelection,
+)
 from .model import (
     MotionPreviewError,
     snapshot_diagnostic_messages,
@@ -129,7 +140,13 @@ class MotListPreviewWidget(QWidget):
         self._cleaned = False
         self._attack_collision_diagnostics: tuple[str, ...] = ()
         self._weapon_attack_collision_diagnostics: tuple[str, ...] = ()
+        self._attack_collision_source = None
+        self._weapon_attack_collision_sources = {}
+        self._attack_parameter_source = None
+        self._attack_parameter_diagnostics: tuple[str, ...] = ()
+        self._attack_parameter_loaded = False
         root_path = str(getattr(handler, "filepath", "") or handler.model.name)
+        self._root_path = root_path
         self._catalog = MotionPreviewCatalog(
             MotionListDocument(root_path, handler.model),
             support.tree_references,
@@ -166,6 +183,7 @@ class MotListPreviewWidget(QWidget):
             self._catalog.resources.resource_data,
             type_registry=type_registry,
         )
+        self._attack_collision_source = attack_source
         self._scene_renderer.set_attack_collision_source(attack_source)
         self._scene_renderer.set_attack_hitboxes_enabled(
             self.attack_hitboxes_toggle.isChecked()
@@ -305,9 +323,7 @@ class MotListPreviewWidget(QWidget):
         self.event_timeline = MotionEventTimeline(self.viewport_pane)
         self.event_timeline.frame_requested.connect(self.playback.seek)
         self.event_timeline.scrub_started.connect(self.playback.stop)
-        self.event_timeline.details_requested.connect(
-            self.event_details.set_event
-        )
+        self.event_timeline.details_requested.connect(self._show_event_details)
         self.event_timeline_scroll = QScrollArea(self.viewport_pane)
         self.event_timeline_scroll.setWidgetResizable(True)
         self.event_timeline_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -418,6 +434,63 @@ class MotListPreviewWidget(QWidget):
             save_settings(settings)
         self._render()
 
+    def _show_event_details(
+        self,
+        selection: TimelineEventSelection | None,
+    ) -> None:
+        if selection is None:
+            self.event_details.set_event(None)
+            return
+        event = selected_attack_collision(
+            selection.track_type,
+            selection.properties,
+            selection.sample_frame,
+            selection.start_frame,
+            selection.end_frame,
+        )
+        if event is None:
+            self.event_details.set_event(selection)
+            return
+
+        if event.track_type == "AttackCollision_Wp":
+            collision_source = self._weapon_attack_collision_sources.get(
+                int(event.collision_type or 0)
+            )
+            collision_diagnostics = self._weapon_attack_collision_diagnostics or (
+                self.tr(
+                    "Weapon attack RCOL is not loaded; load a model preset with "
+                    "the matching weapon collision resource."
+                ),
+            )
+        else:
+            collision_source = self._attack_collision_source
+            collision_diagnostics = self._attack_collision_diagnostics
+        section_data = list(attack_collision_detail_sections(
+            collision_source,
+            event,
+            collision_diagnostics,
+        ))
+
+        if not self._attack_parameter_loaded:
+            self._attack_parameter_loaded = True
+            (
+                self._attack_parameter_source,
+                self._attack_parameter_diagnostics,
+            ) = load_attack_parameter_source(
+                self._root_path,
+                self._catalog.resources.resource_data,
+                type_registry=_wots_type_registry(self.handler),
+            )
+        section_data.extend(attack_parameter_detail_sections(
+            self._attack_parameter_source,
+            event.attack_param_id,
+            self._attack_parameter_diagnostics,
+        ))
+        self.event_details.set_event(
+            selection,
+            tuple(EventDetailSection(title, rows) for title, rows in section_data),
+        )
+
     def _load_current_motion(self, *, reset_camera: bool) -> None:
         deformation_targets = self._mesh_deformation_targets()
         self.blend_shapes_toggle.setVisible(bool(deformation_targets))
@@ -478,6 +551,7 @@ class MotListPreviewWidget(QWidget):
         self._scene_renderer.set_weapon_attack_collision_sources(
             weapon_attack_sources
         )
+        self._weapon_attack_collision_sources = dict(weapon_attack_sources or {})
         self._using_source_rig = False
         for index, part in enumerate(target.render_parts):
             key = part.material_scope or "target"

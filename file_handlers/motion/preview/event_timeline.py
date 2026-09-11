@@ -49,6 +49,7 @@ class TimelineLane:
     kind: str = "generic"
     segments: tuple[TimelineSegment, ...] = ()
     properties: tuple[ClipProperty, ...] = ()
+    track_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +59,18 @@ class TimelineEventSelection:
     end_frame: float
     properties: tuple[ClipProperty, ...]
     description: str = ""
+    track_type: str = ""
+    sample_frame: float = 0.0
 
     @property
     def frame_count(self) -> float:
         return max(0.0, self.end_frame - self.start_frame)
+
+
+@dataclass(frozen=True, slots=True)
+class EventDetailSection:
+    title: str
+    rows: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +518,7 @@ def motion_timeline_lanes(motion: Motion | None) -> tuple[TimelineLane, ...]:
                     details,
                     "generic",
                     properties=tuple(node.properties),
+                    track_type=track_name,
                 )
             )
     return tuple(lanes)
@@ -598,6 +608,7 @@ def _cancel_timeline_lanes(
                 "command_cancel",
                 segments,
                 tuple(group.children),
+                "PlayerCommandCancel",
             )
         )
     return lanes
@@ -692,6 +703,8 @@ def timeline_event_selection(
         end_frame=max(0.0, float(interval[1])),
         properties=lane.properties,
         description=lane.details,
+        track_type=lane.track_type,
+        sample_frame=max(0.0, float(frame)),
     )
 
 
@@ -1073,7 +1086,11 @@ class MotionEventDetailsWidget(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.properties, 1)
 
-    def set_event(self, selection: TimelineEventSelection | None) -> None:
+    def set_event(
+        self,
+        selection: TimelineEventSelection | None,
+        sections: tuple[EventDetailSection, ...] = (),
+    ) -> None:
         self.properties.clear()
         if selection is None:
             self.event_name.setText(self.tr("No event selected"))
@@ -1091,6 +1108,17 @@ class MotionEventDetailsWidget(QWidget):
         self.description.setVisible(bool(selection.description))
         for prop in selection.properties:
             self._add_property(None, prop)
+        for section in sections:
+            if not section.rows:
+                continue
+            section_item = QTreeWidgetItem((section.title, ""))
+            section_font = section_item.font(0)
+            section_font.setBold(True)
+            section_item.setFont(0, section_font)
+            section_item.setExpanded(True)
+            self.properties.addTopLevelItem(section_item)
+            for name, value in section.rows:
+                section_item.addChild(QTreeWidgetItem((name, value)))
         self.properties.expandAll()
 
     def _add_property(

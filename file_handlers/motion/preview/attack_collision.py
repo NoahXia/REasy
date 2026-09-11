@@ -8,7 +8,14 @@ import numpy as np
 
 from file_handlers.rcol.rcol_file import RcolFile
 from file_handlers.rcol.rcol_scene import _mesh_for_shape
-from file_handlers.rcol.shape_types import Capsule, Cylinder
+from file_handlers.rcol.shape_types import (
+    AABB,
+    Capsule,
+    Cylinder,
+    OBB,
+    ShapeType,
+    Sphere,
+)
 from ui.scene.scene_model import SceneDrawMesh
 from utils.hash_util import murmur3_hash_utf16le
 
@@ -123,6 +130,151 @@ class _ShapeBinding:
 
 def collision_type_label(value: int) -> str:
     return WOTS_WEAPON_COLLISION_TYPES.get(value, f"UNKNOWN_{value}")
+
+
+def selected_attack_collision(
+    track_type: str,
+    properties: Iterable[ClipProperty],
+    frame: float,
+    start_frame: float,
+    end_frame: float,
+) -> ActiveAttackCollision | None:
+    """Resolve the collision identifiers represented by a selected lane."""
+    if track_type not in _ATTACK_TRACKS:
+        return None
+    request_set_id = _integer_property(properties, "_RequestSetID", frame)
+    attack_param_id = _integer_property(properties, "_AttackParamID", frame)
+    if request_set_id is None or attack_param_id is None:
+        return None
+    return ActiveAttackCollision(
+        track_type,
+        request_set_id,
+        attack_param_id,
+        _integer_property(properties, "_CollisionType", frame),
+        start_frame,
+        end_frame,
+    )
+
+
+def attack_collision_detail_sections(
+    source: AttackCollisionSource | None,
+    event: ActiveAttackCollision,
+    diagnostics: Iterable[str] = (),
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """Describe the exact RCOL request set selected by a motion event."""
+    owner = event.collision_type_name
+    if source is None:
+        message = "; ".join(diagnostics) or "matching attack RCOL was not resolved"
+        return ((
+            "RCOL REQUEST SET",
+            (
+                ("Owner", owner),
+                ("RequestSetID", str(event.request_set_id)),
+                ("Status", message),
+            ),
+        ),)
+    request_set = source.request_set(event.request_set_id)
+    if request_set is None:
+        return ((
+            "RCOL REQUEST SET",
+            (
+                ("Resource", source.resource_path),
+                ("Owner", owner),
+                ("RequestSetID", str(event.request_set_id)),
+                ("Status", "request set was not found in this RCOL"),
+            ),
+        ),)
+
+    info = request_set.info
+    group = request_set.group
+    regular = tuple(getattr(group, "shapes", ()) or ()) if group is not None else ()
+    mirrored = (
+        tuple(getattr(group, "extra_shapes", ()) or ())
+        if group is not None
+        else ()
+    )
+    all_shapes = tuple((shape, False) for shape in regular) + tuple(
+        (shape, True) for shape in mirrored
+    )
+    type_counts: dict[str, int] = {}
+    for shape, _mirror in all_shapes:
+        name = _shape_type_name(shape)
+        type_counts[name] = type_counts.get(name, 0) + 1
+    type_summary = ", ".join(
+        f"{name} ×{count}" if count > 1 else name
+        for name, count in sorted(type_counts.items())
+    ) or "None"
+    group_index = int(getattr(info, "group_index", -1))
+    group_name = str(getattr(getattr(group, "info", None), "name", "") or "")
+    group_text = f"{group_index} · {group_name}" if group_name else str(group_index)
+    rows = (
+        ("Resource", source.resource_path),
+        ("Owner", owner),
+        ("RequestSetID", str(event.request_set_id)),
+        ("Request Set Name", str(getattr(info, "name", "") or "—")),
+        ("Group", group_text),
+        ("Shape Count", str(len(regular))),
+        ("Mirrored Shape Count", str(len(mirrored))),
+        ("Shape Types", type_summary),
+    )
+    shape_rows = tuple(
+        (f"Shape {index}", _shape_summary(shape, mirror))
+        for index, (shape, mirror) in enumerate(all_shapes)
+    )
+    sections = [("RCOL REQUEST SET", rows)]
+    if shape_rows:
+        sections.append(("RCOL SHAPES", shape_rows))
+    return tuple(sections)
+
+
+def _shape_type_name(shape) -> str:
+    value = getattr(getattr(shape, "info", None), "shape_type", None)
+    name = getattr(value, "name", None)
+    if name:
+        return name
+    try:
+        return ShapeType(int(value)).name
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _shape_summary(shape, mirror: bool) -> str:
+    info = shape.info
+    parts = [_shape_type_name(shape)]
+    if mirror:
+        parts.append("mirrored")
+    if info.name:
+        parts.append(info.name)
+    joints = [
+        value
+        for value in (info.primary_joint_name_str, info.secondary_joint_name_str)
+        if value
+    ]
+    if joints:
+        parts.append("joints " + " → ".join(joints))
+    payload = shape.shape
+    if isinstance(payload, (Capsule, Cylinder)):
+        parts.append(
+            f"start {_vector_text(payload.start)}, end {_vector_text(payload.end)}, "
+            f"radius {_number_text(payload.radius)}"
+        )
+    elif isinstance(payload, Sphere):
+        parts.append(
+            f"center {_vector_text(payload.center)}, radius {_number_text(payload.radius)}"
+        )
+    elif isinstance(payload, AABB):
+        parts.append(f"min {_vector_text(payload.min)}, max {_vector_text(payload.max)}")
+    elif isinstance(payload, OBB):
+        parts.append(f"extent {_vector_text(payload.extent)}")
+    return " · ".join(parts)
+
+
+def _number_text(value) -> str:
+    return f"{float(value):.4f}".rstrip("0").rstrip(".")
+
+
+def _vector_text(values) -> str:
+    return "(" + ", ".join(_number_text(value) for value in values) + ")"
 
 
 def attack_rcol_resource_candidates(anchor_path: str) -> tuple[str, ...]:
