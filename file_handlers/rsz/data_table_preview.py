@@ -226,6 +226,12 @@ def _collection_dataset(path: str, value, rsz) -> RszTableDataset | None:
     return None
 
 
+def _has_object_rows(value) -> bool:
+    return isinstance(value, (ArrayData, StructData)) and any(
+        isinstance(entry, (ObjectData, dict)) for entry in value.values
+    )
+
+
 def build_data_table_datasets(rsz) -> tuple[RszTableDataset, ...]:
     """Discover table-shaped collections reachable from a USR root object."""
     if not getattr(rsz, "is_usr", False) or not getattr(rsz, "object_table", None):
@@ -253,9 +259,25 @@ def build_data_table_datasets(rsz) -> tuple[RszTableDataset, ...]:
             dataset = _collection_dataset(path, value, rsz)
             if dataset is not None:
                 datasets.append(dataset)
-                # A tabular collection is already represented as one coherent
-                # sheet. Keep nested collections as compact cells instead of
-                # producing one duplicate sheet per row.
+                # Preserve the summary sheet, then expose object/struct arrays
+                # inside its rows as selectable detail sheets. Scalar arrays
+                # stay compact cells to avoid flooding the table selector.
+                for index, entry in enumerate(value.values):
+                    fields = None
+                    if isinstance(entry, ObjectData):
+                        fields = getattr(rsz, "parsed_elements", {}).get(
+                            int(entry.value or 0)
+                        )
+                    elif isinstance(entry, dict):
+                        fields = entry
+                    if not isinstance(fields, dict):
+                        continue
+                    for field_name, field_value in fields.items():
+                        if _has_object_rows(field_value):
+                            scan_value(
+                                field_value,
+                                f"{path}[{index}].{_field_label(field_name)}",
+                            )
                 return
             for index, entry in enumerate(value.values):
                 if isinstance(entry, ObjectData):

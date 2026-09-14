@@ -110,8 +110,8 @@ class TestRszDataTable(unittest.TestCase):
         root = next(dataset for dataset in datasets if dataset.path == "Root")
         self.assertEqual(len(root.rows), 1)
         self.assertIn("ReachPatternList", root.columns)
-        self.assertFalse(
-            any(dataset.path.startswith("ReachPatternList[") for dataset in datasets)
+        self.assertTrue(
+            any(dataset.path == "ReachPatternList[1].Nested" for dataset in datasets)
         )
 
     def test_scalar_and_struct_arrays_are_discovered(self):
@@ -241,6 +241,40 @@ class TestWotsRszDataTableAssets(unittest.TestCase):
         info, _ = handler.type_registry.find_type_by_name("app.cAttackParamDataPlayer")
         self.assertEqual(info["crc"], "b25b515f")
         self.assertIn("_AddSkill5Gauge", {field["name"] for field in info["fields"]})
+
+    def test_camera_parameter_nested_collections_are_detail_tables(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        )
+        expected = {
+            "CameraAddParam.user.3": (6, 69),
+            "CameraCommonParam.user.3": (4, 127),
+        }
+        for filename, (summary_rows, first_detail_rows) in expected.items():
+            with self.subTest(filename=filename):
+                path = root / "GameDesign/Action/Camera/Data/ParamData" / filename
+                rsz = RszFile()
+                rsz.filepath = str(path)
+                rsz.game_version = "OnimushaWOTS"
+                rsz.type_registry = WotsTypeRegistry(TypeRegistry(str(registry_path)))
+                rsz.read(path.read_bytes(), validate_type_registry=True)
+
+                tables = build_data_table_datasets(rsz)
+                summary = next(
+                    table for table in tables
+                    if table.path == "CameraParamDataCollections"
+                )
+                detail = next(
+                    table for table in tables
+                    if table.path == (
+                        "CameraParamDataCollections[0].CameraParamDataCollection"
+                    )
+                )
+                self.assertEqual(len(summary.rows), summary_rows)
+                self.assertEqual(len(detail.rows), first_detail_rows)
+                self.assertIn("CameraParamArgument", " ".join(detail.columns))
 
 
 if __name__ == "__main__":
