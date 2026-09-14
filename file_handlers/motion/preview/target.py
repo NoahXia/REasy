@@ -62,7 +62,7 @@ class MeshPreviewPreset:
 WOTS_MESH_PREVIEW_PRESETS = (
     MeshPreviewPreset(
         "wots_ch001_00",
-        "WOTS · ch001_00 (body + head + hair + sword + sheath)",
+        "WOTS · ch001_00 (body + head + hair + sword)",
         (
             "natives/stm/Art/Model/Character/ch0/ch001_00/00/"
             "ch001_00_00.mesh.260209350",
@@ -72,12 +72,10 @@ WOTS_MESH_PREVIEW_PRESETS = (
             "ch001_00_20.mesh.260209350",
             "natives/stm/Art/Model/Item/it0/it000_0000/"
             "it000_0000_00.mesh.260209350",
-            "natives/stm/Art/Model/Item/it0/it000_0000/"
-            "it000_0000_10.mesh.260209350",
         ),
-        ("Body", "Head", "Hair", "Sword", "Sheath"),
-        ("", "", "", "R_Wep", "Katana_root"),
-        (None, None, None, 2, None),
+        ("Body", "Head", "Hair", "Sword"),
+        ("", "", "", "R_Wep"),
+        (None, None, None, 2),
         ((
             2,
             "natives/stm/GameDesign/Gimmick/Gm800/Gm800_000/Collision/"

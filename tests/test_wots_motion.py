@@ -995,14 +995,14 @@ class TestWotsAssets(unittest.TestCase):
             path = root / Path(relative)
             resources.append((str(path), path.read_bytes()))
         target = load_re_engine_mesh_preset_target(preset, tuple(resources))
-        self.assertEqual(len(target.render_parts), 5)
+        self.assertEqual(len(target.render_parts), 4)
         self.assertEqual(
             tuple(part.attachment_joint for part in target.render_parts),
-            ("", "", "", "R_Wep", "Katana_root"),
+            ("", "", "", "R_Wep"),
         )
         self.assertEqual(
             tuple(part.weapon_collision_type for part in target.render_parts),
-            (None, None, None, 2, None),
+            (None, None, None, 2),
         )
 
         motlist = (
@@ -1045,7 +1045,6 @@ class TestWotsAssets(unittest.TestCase):
             "motion-preview:target:1",
             "motion-preview:target:2",
             "motion-preview:target:3",
-            "motion-preview:target:4",
         }
         self.assertEqual({mesh.key for mesh in viewport.scene}, expected)
         self.assertEqual(set(viewport.skinning), expected)
