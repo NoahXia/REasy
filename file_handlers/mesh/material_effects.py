@@ -26,6 +26,18 @@ WOTS_HAIR_TEMPLATES = frozenset({
     "v_chara_pl_hair.mmtr",
     "v_chara_pl_eyebrow.mmtr",
 })
+# These opaque weapon templates store non-opacity material masks in the alpha
+# channel of BaseDielectricMap.  Their MDFs still expose IsAlphaTest=1 as a
+# shared template switch, so treating that scalar as an opacity instruction
+# cuts holes into blades, hilts, and scabbards.
+WOTS_OPAQUE_WEAPON_TEMPLATES = frozenset({
+    "v_chara_wep_pl_basic.mmtr",
+    "v_chara_wep_pl_blade.mmtr",
+    "v_chara_event_wep_pl_blade.mmtr",
+    "v_chara_wep_em_basic.mmtr",
+    "v_chara_wep_em_basic_inf3.mmtr",
+    "v_chara_wep_em_blade_basic_inf1.mmtr",
+})
 WOTS_MATERIAL_FAMILY_GENERIC = 0
 WOTS_MATERIAL_FAMILY_SKIN = 1
 WOTS_MATERIAL_FAMILY_FACE = 2
@@ -392,7 +404,10 @@ def wots_material_parameters(
         "occlusion_scale": scalar("OcclusionScale", 1.0),
         "alpha_adjust": scalar("AlphaAdjust", 1.0),
         "alpha_threshold": scalar("AlphaTestThreshold", 0.5),
-        "alpha_test": scalar("IsAlphaTest", 0.0) >= 0.5,
+        "alpha_test": (
+            scalar("IsAlphaTest", 0.0) >= 0.5
+            and template not in WOTS_OPAQUE_WEAPON_TEMPLATES
+        ),
         "use_separate_alpha": scalar("UseSeparateAlpha", 0.0),
         "use_detail": (
             scalar("UseDetail", 0.0) >= 0.5 or micro_skin_rate > 0.0

@@ -18,6 +18,7 @@ from file_handlers.mesh.mesh_file import (
     get_mesh_version,
 )
 from file_handlers.mesh.material_resolver import MdfSurfaceProfile, MeshMaterialResolver
+from file_handlers.mesh.material_effects import wots_material_parameters
 from ui.scene.gpu_skinning import GpuSkinningDeformer
 from ui.scene.mesh_scene import _merge_tangent_frames
 from ui.scene.scene_buffers import build_scene_buffer_set
@@ -27,6 +28,20 @@ from ui.scene.studio_material import StudioMaterialRenderer
 
 
 class TestWotsMesh(unittest.TestCase):
+    def test_opaque_weapon_template_does_not_use_albedo_alpha_as_opacity(self):
+        surface = MdfSurfaceProfile(
+            material_name="blade",
+            game_version="OnimushaWOTS",
+            mmtr_path=(
+                "MaterialShader/Master/Character/Variation/WEP/"
+                "V_Chara_WEP_PL_Blade.mmtr"
+            ),
+            parameters={"IsAlphaTest": (1.0,)},
+        )
+        values = wots_material_parameters(surface)
+        self.assertTrue(values["wots_material"])
+        self.assertFalse(values["alpha_test"])
+
     def test_item_material_candidate_supports_wots_a_suffix(self):
         candidates = list(
             MeshMaterialResolver.iter_mdf_candidates(
