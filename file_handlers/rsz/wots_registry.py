@@ -12,6 +12,14 @@ WOTS_ATTACK_PARAM_CRCS = {
     "app.cAttackParamDataPlayer": "b25b515f",
 }
 
+WOTS_LAYOUT_COMPATIBLE_CRCS = {
+    # Verified against the WOTS 1.0.1.0 GrappleTablePack resources.  The
+    # serialized field layouts match the dump, but the shipped type CRCs do
+    # not.  Keep these as an overlay so other games/dumps remain untouched.
+    "app.GrappleTableParam.cGrapplePatternInfoData": "b8c51d0e",
+    "app.GrappleTableParam.cGrappleTableData": "2967860d",
+}
+
 
 def _float_field(name: str) -> dict:
     return {
@@ -63,6 +71,17 @@ class WotsTypeRegistry:
                     _float_field("_AddSkill5Gauge"),
                 )
             patched["fields"] = fields
+            patched["crc"] = crc
+            type_id = int(type_id)
+            self._patched_by_id[type_id] = patched
+            self._patched_by_name[name] = (patched, type_id)
+            registry_overrides[format(type_id, "x")] = patched
+
+        for name, crc in WOTS_LAYOUT_COMPATIBLE_CRCS.items():
+            info, type_id = base.find_type_by_name(name)
+            if info is None or type_id is None:
+                continue
+            patched = deepcopy(info)
             patched["crc"] = crc
             type_id = int(type_id)
             self._patched_by_id[type_id] = patched

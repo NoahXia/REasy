@@ -139,6 +139,25 @@ class TestRszDataTable(unittest.TestCase):
         rsz.is_usr = False
         self.assertEqual(build_data_table_datasets(rsz), ())
 
+    def test_wots_grapple_crc_overlay_preserves_field_layouts(self):
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        )
+        base = TypeRegistry(str(registry_path))
+        overlay = WotsTypeRegistry(base)
+        expected = {
+            "app.GrappleTableParam.cGrapplePatternInfoData": "b8c51d0e",
+            "app.GrappleTableParam.cGrappleTableData": "2967860d",
+        }
+        for name, crc in expected.items():
+            with self.subTest(type_name=name):
+                base_info, type_id = base.find_type_by_name(name)
+                patched_info = overlay.get_type_info(type_id)
+                self.assertEqual(patched_info["crc"], crc)
+                self.assertEqual(patched_info["fields"], base_info["fields"])
+                self.assertNotEqual(patched_info["crc"], base_info["crc"])
+
     def test_widget_switches_datasets_and_filters_rows(self):
         from PySide6.QtWidgets import QApplication
 
@@ -275,6 +294,42 @@ class TestWotsRszDataTableAssets(unittest.TestCase):
                 self.assertEqual(len(summary.rows), summary_rows)
                 self.assertEqual(len(detail.rows), first_detail_rows)
                 self.assertIn("CameraParamArgument", " ".join(detail.columns))
+
+    def test_grapple_table_pack_uses_verified_wots_crcs(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        path = root / (
+            "GameDesign/Action/Enemy/CommonData/Param/GrappleData/"
+            "Em100_Common_GrappleFatalBlowTablePack.user.3"
+        )
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        )
+        rsz = RszFile()
+        rsz.filepath = str(path)
+        rsz.game_version = "OnimushaWOTS"
+        rsz.type_registry = WotsTypeRegistry(TypeRegistry(str(registry_path)))
+        rsz.read(path.read_bytes(), validate_type_registry=True)
+
+        expected_crcs = {
+            0xA5F5F96A: 0xB8C51D0E,
+            0xC61E18A9: 0x2967860D,
+        }
+        matched = [
+            info for info in rsz.instance_infos if info.type_id in expected_crcs
+        ]
+        self.assertEqual(len(matched), 38)
+        for info in matched:
+            self.assertEqual(info.crc, expected_crcs[info.type_id])
+
+        grapple_table = next(
+            table
+            for table in build_data_table_datasets(rsz)
+            if table.path == "GrappleTableList"
+        )
+        self.assertEqual(len(grapple_table.rows), 19)
+        self.assertIn("TypePattern", grapple_table.columns)
+        self.assertEqual(rsz.build_validated(), path.read_bytes())
 
 
 if __name__ == "__main__":
