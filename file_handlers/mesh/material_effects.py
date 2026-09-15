@@ -382,6 +382,11 @@ def wots_material_parameters(
     material_family = WOTS_TEMPLATE_FAMILIES.get(
         template, WOTS_MATERIAL_FAMILY_GENERIC
     )
+    has_separate_alpha = any(
+        texture.texture_type in WOTS_ALPHA_ROLES
+        and bool(str(texture.texture_path or "").strip())
+        for texture in surface.textures
+    )
     micro_skin_rate = scalar("MicroSkin_BlendRate", 0.0)
     # WOTS face colour/normal textures are 2x2 expression atlases.  The MDF
     # stores their sub-UV scale as Dummy_UVScale (0.5 for the shipped face
@@ -408,7 +413,14 @@ def wots_material_parameters(
             scalar("IsAlphaTest", 0.0) >= 0.5
             and template not in WOTS_OPAQUE_WEAPON_TEMPLATES
         ),
-        "use_separate_alpha": scalar("UseSeparateAlpha", 0.0),
+        # A dedicated AlphaMap/BaseAlphaMap is semantic opacity even when the
+        # template omits UseSeparateAlpha.  Kote metal materials are the
+        # important WOTS example: their ALBD alpha is a packed material mask
+        # (0..4), while AlphaMap.R contains the actual cutout.
+        "use_separate_alpha": max(
+            scalar("UseSeparateAlpha", 0.0),
+            1.0 if has_separate_alpha else 0.0,
+        ),
         "use_detail": (
             scalar("UseDetail", 0.0) >= 0.5 or micro_skin_rate > 0.0
         ),

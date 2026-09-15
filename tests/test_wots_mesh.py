@@ -17,7 +17,11 @@ from file_handlers.mesh.mesh_file import (
     _decode_skin_weights,
     get_mesh_version,
 )
-from file_handlers.mesh.material_resolver import MdfSurfaceProfile, MeshMaterialResolver
+from file_handlers.mesh.material_resolver import (
+    MdfSurfaceProfile,
+    MdfTextureProfile,
+    MeshMaterialResolver,
+)
 from file_handlers.mesh.material_effects import wots_material_parameters
 from ui.scene.gpu_skinning import GpuSkinningDeformer
 from ui.scene.mesh_scene import _merge_tangent_frames
@@ -28,6 +32,24 @@ from ui.scene.studio_material import StudioMaterialRenderer
 
 
 class TestWotsMesh(unittest.TestCase):
+    def test_explicit_alpha_map_enables_separate_opacity_sampling(self):
+        surface = MdfSurfaceProfile(
+            material_name="kote",
+            game_version="OnimushaWOTS",
+            mmtr_path=(
+                "MaterialShader/Master/Character/Variation/PL/"
+                "V_Chara_PL_Kote_Metal_Alpha.mmtr"
+            ),
+            textures=(
+                MdfTextureProfile("BaseDielectricMap", "kote_albd.tex"),
+                MdfTextureProfile("AlphaMap", "kote_alp.tex"),
+            ),
+            parameters={"IsAlphaTest": (1.0,)},
+        )
+        values = wots_material_parameters(surface)
+        self.assertTrue(values["alpha_test"])
+        self.assertEqual(values["use_separate_alpha"], 1.0)
+
     def test_opaque_weapon_template_does_not_use_albedo_alpha_as_opacity(self):
         surface = MdfSurfaceProfile(
             material_name="blade",
