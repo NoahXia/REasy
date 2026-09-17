@@ -18,6 +18,7 @@ from file_handlers.motion.evaluation.model import (
     Transform,
 )
 from file_handlers.motion.evaluation.shared_rig import SharedRigPoseMapper
+from file_handlers.motion.evaluation.composition import compose_evaluated_pose
 from file_handlers.motion.errors import MotionParseError, MotionWriteError
 from file_handlers.motion.format_registry import find_motion_format
 from file_handlers.motion.mot.model import (
@@ -985,6 +986,68 @@ class TestWotsMotion(unittest.TestCase):
     os.environ.get("REASY_WOTS_ASSET_ROOT"), "set REASY_WOTS_ASSET_ROOT"
 )
 class TestWotsAssets(unittest.TestCase):
+    def test_em101_model_preset_contains_complete_costume_and_weapon(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        preset = next(
+            item for item in WOTS_MESH_PREVIEW_PRESETS
+            if item.key == "wots_em101_00"
+        )
+        resources = []
+        for resource_path in preset.resource_paths:
+            relative = resource_path.replace("\\", "/")
+            relative = relative.split("natives/stm/", 1)[-1]
+            path = root / Path(relative)
+            resources.append((str(path), path.read_bytes()))
+
+        target = load_re_engine_mesh_preset_target(preset, tuple(resources))
+
+        self.assertEqual(
+            tuple(part.label for part in target.render_parts),
+            ("Body", "Left Arm", "Right Arm", "Head", "Cloth", "Rusted Sword"),
+        )
+        self.assertEqual(
+            tuple(part.attachment_joint for part in target.render_parts),
+            ("", "", "", "", "", "R_Hand"),
+        )
+        self.assertEqual(
+            tuple(part.weapon_collision_type for part in target.render_parts),
+            (None, None, None, None, None, 2),
+        )
+
+        pose = compose_evaluated_pose(
+            target.rig,
+            0.0,
+            tuple(joint.rest for joint in target.rig.joints),
+            (1.0,) * len(target.rig.joints),
+        )
+        snapshot = MotionPreviewSnapshot(
+            frame=0.0,
+            end_frame=1.0,
+            pose=pose,
+            joint_names=tuple(joint.name for joint in target.rig.joints),
+            joint_positions=tuple(
+                (matrix[12], matrix[13], matrix[14])
+                for matrix in pose.world_matrices
+            ),
+            bone_pairs=tuple(
+                (joint.parent_index, index)
+                for index, joint in enumerate(target.rig.joints)
+                if joint.parent_index is not None
+            ),
+            node_weights=pose.node_weights,
+            root_deltas=(),
+            deformation_weights=(),
+            diagnostics=(),
+        )
+        viewport = _PreviewViewport()
+        renderer = MotionPreviewRenderer(viewport)
+        renderer.present(snapshot, target, reset_camera=True)
+        expected = {
+            f"motion-preview:target:{index}" for index in range(6)
+        }
+        self.assertEqual({mesh.key for mesh in viewport.scene}, expected)
+        self.assertEqual(set(viewport.skinning), expected)
+
     def test_ch001_model_preset_composes_character_and_weapon_parts(self):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
         preset = WOTS_MESH_PREVIEW_PRESETS[0]

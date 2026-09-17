@@ -285,6 +285,9 @@ class RszHandler(BaseFileHandler):
         viewer.populate_tree()
         from file_handlers.rsz.btable_preview import create_btable_preview
         from file_handlers.rsz.data_table_preview import create_data_table_preview
+        from file_handlers.rsz.wots_interaction_preview import (
+            create_wots_interaction_preview,
+        )
         from file_handlers.motion.preview.integration import create_pfb_motion_preview
 
         data_table_preview = create_data_table_preview(self)
@@ -293,6 +296,12 @@ class RszHandler(BaseFileHandler):
         btable_preview = create_btable_preview(self)
         if btable_preview is not None:
             viewer.add_preview_tab(btable_preview, viewer.tr("BTable Graph"))
+        interaction_preview = create_wots_interaction_preview(self)
+        if interaction_preview is not None:
+            viewer.add_preview_tab(
+                interaction_preview,
+                viewer.tr("Interaction Preview"),
+            )
         motion_preview = create_pfb_motion_preview(self)
         if motion_preview is not None:
             viewer.add_preview_tab(motion_preview, viewer.tr("3D"))

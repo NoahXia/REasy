@@ -82,6 +82,27 @@ WOTS_MESH_PREVIEW_PRESETS = (
             "Gm800_000_Attack.rcol.37",
         ),),
     ),
+    MeshPreviewPreset(
+        "wots_em101_00",
+        "WOTS · em101_00 (body + arms + head + cloth + sword)",
+        (
+            "natives/stm/Art/Model/Character/ch1/ch101/00/00/"
+            "ch101_00_00.mesh.260209350",
+            "natives/stm/Art/Model/Character/ch1/ch101/00/03/"
+            "ch101_00_03.mesh.260209350",
+            "natives/stm/Art/Model/Character/ch1/ch101/00/05/"
+            "ch101_00_05.mesh.260209350",
+            "natives/stm/Art/Model/Character/ch1/ch101/01/00/"
+            "ch101_01_00.mesh.260209350",
+            "natives/stm/Art/Model/Character/ch1/ch101/20/00/"
+            "ch101_20_00.mesh.260209350",
+            "natives/stm/Art/Model/Item/it0/it000_0001/"
+            "it000_0001_00.mesh.260209350",
+        ),
+        ("Body", "Left Arm", "Right Arm", "Head", "Cloth", "Rusted Sword"),
+        ("", "", "", "", "", "R_Hand"),
+        (None, None, None, None, None, 2),
+    ),
 )
 
 

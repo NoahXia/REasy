@@ -119,6 +119,8 @@ class MotListPreviewWidget(QWidget):
         handler,
         *,
         viewport_factory: ViewportFactory = ScenePreviewWidget,
+        material_parse_in_subprocess: bool = True,
+        snapshot_transform: Callable | None = None,
     ):
         super().__init__()
         self.handler = handler
@@ -136,6 +138,8 @@ class MotListPreviewWidget(QWidget):
         self._target: RigPreviewTarget | None = None
         self._target_material_session: MeshMaterialSession | None = None
         self._target_material_sessions: dict[str, MeshMaterialSession] = {}
+        self._material_parse_in_subprocess = bool(material_parse_in_subprocess)
+        self._snapshot_transform = snapshot_transform
         self._using_source_rig = True
         self._cleaned = False
         self._attack_collision_diagnostics: tuple[str, ...] = ()
@@ -405,6 +409,36 @@ class MotListPreviewWidget(QWidget):
             return None
         return self._motions[index]
 
+    def select_motion_id(
+        self,
+        motion_id: int,
+        *,
+        bank_id: int | None = None,
+    ) -> bool:
+        """Select a resolved motion without reaching into the browser internals."""
+        candidates = [
+            (index, entry)
+            for index, entry in enumerate(self._motions)
+            if entry.motion_id == int(motion_id)
+            and (bank_id is None or entry.bank_id in (None, int(bank_id)))
+        ]
+        if not candidates:
+            return False
+        index, _entry = candidates[0]
+        if self.motion_browser.current_index == index:
+            self._load_current_motion(reset_camera=True)
+        else:
+            self.motion_browser.animation_list.setCurrentRow(index)
+        return True
+
+    def seek_frame(self, frame: float) -> None:
+        """Seek a preview from a shared external playback clock."""
+        self.playback.seek(frame)
+
+    @property
+    def preview_end_frame(self) -> float:
+        return self.controller.end_frame
+
     def _on_motion_changed(self, _index: int) -> None:
         self.playback.stop()
         self._load_current_motion(reset_camera=True)
@@ -541,6 +575,7 @@ class MotListPreviewWidget(QWidget):
         weapon_attack_sources=None,
         weapon_attack_diagnostics: tuple[str, ...] = (),
     ) -> None:
+        self.playback.stop()
         self._materials.clear()
         self._target_material_session = None
         self._target_material_sessions.clear()
@@ -553,21 +588,26 @@ class MotListPreviewWidget(QWidget):
         )
         self._weapon_attack_collision_sources = dict(weapon_attack_sources or {})
         self._using_source_rig = False
+        self.target_rig_button.setEnabled(bool(self._motions))
+
+        # Establish the target rig and all mesh geometry before resolving MDF/TEX
+        # dependencies. Material resolution can dispatch work or fail independently;
+        # it must never leave a composite target paired with the old source-rig pose.
+        self._load_current_motion(reset_camera=True)
+
         for index, part in enumerate(target.render_parts):
             key = part.material_scope or "target"
             session = MeshMaterialSession(
                 part.handler,
                 material_scope=part.material_scope,
                 texture_quality=self._materials.texture_quality,
+                parse_in_subprocess=self._material_parse_in_subprocess,
                 parent=self._materials,
             )
             self._target_material_sessions[key] = session
             self._materials.add(key, session)
             if index == 0:
                 self._target_material_session = session
-        self.target_rig_button.setEnabled(bool(self._motions))
-        self.playback.stop()
-        self._load_current_motion(reset_camera=True)
 
     def use_source_rig(self) -> None:
         self._using_source_rig = True
@@ -726,6 +766,8 @@ class MotListPreviewWidget(QWidget):
             return
         try:
             snapshot = self.controller.sample()
+            if self._snapshot_transform is not None:
+                snapshot = self._snapshot_transform(snapshot)
         except MotionPreviewError as exc:
             self._clear_scene(str(exc), clear_timeline=False)
             return

@@ -18,6 +18,7 @@ WOTS_LAYOUT_COMPATIBLE_CRCS = {
     # not.  Keep these as an overlay so other games/dumps remain untouched.
     "app.GrappleTableParam.cGrapplePatternInfoData": "b8c51d0e",
     "app.GrappleTableParam.cGrappleTableData": "2967860d",
+    "app.user_data.JustGuardConditionMap": "e378c0e0",
 }
 
 

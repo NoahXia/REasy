@@ -149,6 +149,7 @@ class TestRszDataTable(unittest.TestCase):
         expected = {
             "app.GrappleTableParam.cGrapplePatternInfoData": "b8c51d0e",
             "app.GrappleTableParam.cGrappleTableData": "2967860d",
+            "app.user_data.JustGuardConditionMap": "e378c0e0",
         }
         for name, crc in expected.items():
             with self.subTest(type_name=name):
