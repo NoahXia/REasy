@@ -75,9 +75,26 @@ from file_handlers.motion.preview.resolution import (
 from file_handlers.motion.wots_codec import WOTS_MOTION_FORMAT_CODEC, WotsMotParser
 from file_handlers.motbank.motbank_file import MotbankFile, MotlistItem
 from file_handlers.rcol.shape_types import Capsule, ShapeType, Sphere
+from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
+from file_handlers.rsz.rsz_file import RszFile
+from file_handlers.rsz.wots_interaction_preview import (
+    _INVALID_MOTION_GROUP_ID,
+    _issen_pattern_title,
+    parse_wots_action_motion_map,
+    parse_wots_issen_document,
+    resolve_wots_grapple_action_phases,
+)
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
 from utils.type_registry import TypeRegistry
+
+
+class _ActionRegistry:
+    def __init__(self, names):
+        self.names = names
+
+    def get_type_info(self, type_id):
+        return {"name": self.names.get(type_id, "")}
 
 
 def _minimal_mot(name: str = "idle") -> bytes:
@@ -341,6 +358,61 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_grapple_action_guid_resolves_nested_motion_group(self):
+        action_ids = SimpleNamespace(
+            object_table=[1],
+            parsed_elements={
+                1: {"_ActionIDArray": ObjectData(2)},
+                2: {"_DataArray": ArrayData([ObjectData(3)])},
+                3: {
+                    "_InstanceGuid": GuidData(
+                        "12345678-1234-5678-90ab-cdef12345678"
+                    )
+                },
+            },
+        )
+        action_params = SimpleNamespace(
+            object_table=[1],
+            instance_infos=[
+                SimpleNamespace(type_id=0),
+                SimpleNamespace(type_id=1),
+                SimpleNamespace(type_id=2),
+                SimpleNamespace(type_id=3),
+                SimpleNamespace(type_id=4),
+            ],
+            type_registry=_ActionRegistry({
+                2: "app.TestAction.cFatalBlow",
+                4: "MotionInfo",
+            }),
+            parsed_elements={
+                1: {"_ActionClassList": ArrayData([ObjectData(2)])},
+                2: {"_MotModule": ObjectData(3)},
+                3: {"_MotionInfo": ObjectData(4)},
+                4: {"_MotionGroupID": U64Data(0x09C5_1234_5678_9ABC)},
+            },
+        )
+
+        links = parse_wots_action_motion_map(action_ids, action_params)
+
+        self.assertEqual(
+            links["123456781234567890abcdef12345678"],
+            ("cFatalBlow", (0x09C5_1234_5678_9ABC,)),
+        )
+
+    def test_grapple_preview_titles_blow_and_fatal_tables(self):
+        self.assertEqual(
+            _issen_pattern_title(
+                "Em100_GrappleBlowGrapMotionTable.user.3", 0, 2
+            ),
+            "Blow Grapple 01",
+        )
+        self.assertEqual(
+            _issen_pattern_title(
+                "Em100_GrappleFatalBlowMotionTable.user.3", 18, 2
+            ),
+            "Fatal Blow 19",
+        )
+
     def test_shared_rig_root_can_follow_an_owner_attachment_joint(self):
         owner = Rig([
             RigJoint("root"),
@@ -986,6 +1058,58 @@ class TestWotsMotion(unittest.TestCase):
     os.environ.get("REASY_WOTS_ASSET_ROOT"), "set REASY_WOTS_ASSET_ROOT"
 )
 class TestWotsAssets(unittest.TestCase):
+    def _load_grapple_document(self, filename: str):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        path = (
+            root
+            / "GameDesign/Action/Enemy/Em100/00/Data/Param/GrappleData"
+            / filename
+        )
+        registry = TypeRegistry(str(
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        ))
+        rsz = RszFile()
+        rsz.filepath = str(path)
+        rsz.game_version = "OnimushaWOTS"
+        rsz.type_registry = registry
+        rsz.read(path.read_bytes(), validate_type_registry=True)
+        handler = SimpleNamespace(
+            filepath=str(path),
+            resource_context=None,
+            rsz_file=rsz,
+        )
+        document = parse_wots_issen_document(rsz, str(path))
+        return resolve_wots_grapple_action_phases(handler, document)
+
+    def test_em100_blow_grapple_has_all_direct_motion_groups(self):
+        document = self._load_grapple_document(
+            "Em100_00_GrappleBlowGrapMotionTable.user.3"
+        )
+        self.assertEqual(len(document.patterns), 20)
+        phases = [
+            phase
+            for pattern in document.patterns
+            for phase in (*pattern.player_phases, *pattern.enemy_phases)
+        ]
+        self.assertTrue(phases)
+        self.assertTrue(all(
+            phase.motion_group_id != _INVALID_MOTION_GROUP_ID for phase in phases
+        ))
+
+    def test_em100_fatal_blow_resolves_every_enemy_action_guid(self):
+        document = self._load_grapple_document(
+            "Em100_00_GrappleFatalBlowMotionTable.user.3"
+        )
+        self.assertEqual(len(document.patterns), 19)
+        enemy_phases = [
+            phase for pattern in document.patterns for phase in pattern.enemy_phases
+        ]
+        self.assertTrue(enemy_phases)
+        self.assertTrue(all(
+            phase.reference.bank_id is not None for phase in enemy_phases
+        ))
+
     def test_em101_model_preset_contains_complete_body_and_weapon(self):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
         preset = next(

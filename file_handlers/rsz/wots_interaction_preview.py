@@ -423,6 +423,10 @@ def _issen_phase(rsz, instance_id: int, fallback_label: str) -> IssenMotionPhase
 
 def _issen_pattern_title(source_path: str, index: int, phase_count: int) -> str:
     lowered = str(source_path).replace("\\", "/").casefold()
+    if "blowgrap" in lowered:
+        return f"Blow Grapple {index + 1:02d}"
+    if "fatalblow" in lowered:
+        return f"Fatal Blow {index + 1:02d}"
     if "counterissen" in lowered:
         return f"Counter Issen {chr(ord('A') + index)}"
     if "blockissen" in lowered:
@@ -472,6 +476,80 @@ def parse_wots_mex_motion_map(rsz) -> dict[int, int]:
         if group is None or motion is None:
             continue
         result[int(_scalar(group)) & _INVALID_MOTION_GROUP_ID] = int(_scalar(motion))
+    return result
+
+
+def _instance_type_name(rsz, instance_id: int) -> str:
+    registry = getattr(rsz, "type_registry", None)
+    infos = getattr(rsz, "instance_infos", ())
+    if registry is None or not (0 < instance_id < len(infos)):
+        return ""
+    info = registry.get_type_info(infos[instance_id].type_id)
+    return str((info or {}).get("name", "") or "")
+
+
+def _referenced_object_ids(value) -> tuple[int, ...]:
+    if isinstance(value, ObjectData):
+        instance_id = int(value.value)
+        return (instance_id,) if instance_id > 0 else ()
+    if isinstance(value, ArrayData):
+        return tuple(
+            int(item.value)
+            for item in value.values
+            if isinstance(item, ObjectData) and int(item.value) > 0
+        )
+    return ()
+
+
+def _motion_groups_below(rsz, root_id: int) -> tuple[int, ...]:
+    """Collect MotionGroupIDs owned by one ActionParam entry."""
+    pending = [int(root_id)]
+    visited: set[int] = set()
+    groups: list[int] = []
+    while pending:
+        instance_id = pending.pop(0)
+        if instance_id <= 0 or instance_id in visited:
+            continue
+        visited.add(instance_id)
+        fields = rsz.parsed_elements.get(instance_id, {})
+        value = fields.get("_MotionGroupID")
+        if value is not None:
+            group_id = int(_scalar(value, _INVALID_MOTION_GROUP_ID)) & _INVALID_MOTION_GROUP_ID
+            if group_id != _INVALID_MOTION_GROUP_ID and group_id not in groups:
+                groups.append(group_id)
+        for field_value in fields.values():
+            pending.extend(_referenced_object_ids(field_value))
+    return tuple(groups)
+
+
+def parse_wots_action_motion_map(action_ids_rsz, action_params_rsz):
+    """Map ActionID instance GUIDs to names and MotionGroupIDs.
+
+    WOTS keeps the stable action GUIDs in an ActionID resource and the actual
+    action objects in a parallel ActionParam array.  Their array positions are
+    the join key; the motion module is nested below each action object.
+    """
+    id_root = int(action_ids_rsz.object_table[0])
+    param_root = int(action_params_rsz.object_table[0])
+    id_array_id = _object_id(_field(action_ids_rsz, id_root, "_ActionIDArray"))
+    id_entries = _object_ids(_field(action_ids_rsz, id_array_id, "_DataArray"))
+    action_entries = _object_ids(
+        _field(action_params_rsz, param_root, "_ActionClassList")
+    )
+    result = {}
+    for index, id_entry in enumerate(id_entries):
+        if index >= len(action_entries):
+            break
+        guid = _guid_key(_field(action_ids_rsz, id_entry, "_InstanceGuid"))
+        if not guid:
+            continue
+        action_entry = action_entries[index]
+        groups = _motion_groups_below(action_params_rsz, action_entry)
+        if not groups:
+            continue
+        full_name = _instance_type_name(action_params_rsz, action_entry)
+        action_name = full_name.rsplit(".", 1)[-1] or f"Action {index}"
+        result[guid] = (action_name, groups)
     return result
 
 
@@ -785,6 +863,121 @@ def _resolve_interaction_resource(handler, resource_path: str, parent):
     except OSError:
         matches = []
     return (str(matches[0]), matches[0].read_bytes()) if matches else None
+
+
+def _enemy_action_resource_pairs(source_path: str) -> tuple[tuple[str, str], ...]:
+    """Return ActionID/ActionParam pairs that own an enemy grapple action."""
+    parts = str(source_path).replace("\\", "/").split("/")
+    lowered = [part.casefold() for part in parts]
+    try:
+        enemy_index = next(
+            index
+            for index, part in enumerate(lowered[:-2])
+            if part == "enemy" and index > 0 and lowered[index - 1] == "action"
+        )
+    except StopIteration:
+        return ()
+    actor = parts[enemy_index + 1]
+    variant = parts[enemy_index + 2]
+    actor_stem = actor[:1].upper() + actor[1:]
+    prefix = f"natives/stm/GameDesign/Action/Enemy/{actor}/{variant}/Data/Action"
+    return (
+        (
+            "natives/stm/GameDesign/Action/Enemy/CommonData/EmCommon_FullBody.user",
+            f"{prefix}/{actor_stem}_{variant}_CommonFullBodyActionParam.user",
+        ),
+        (
+            f"{prefix}/{actor_stem}_{variant}_FullBody.user",
+            f"{prefix}/{actor_stem}_{variant}_FullBodyActionParam.user",
+        ),
+    )
+
+
+def _load_wots_rsz_resource(handler, resource_path: str, parent=None):
+    hit = _resolve_interaction_resource(handler, resource_path, parent)
+    if hit is None:
+        return None
+    filepath, data = hit
+    source_rsz = getattr(handler, "rsz_file", None)
+    registry = getattr(source_rsz, "type_registry", None)
+    if registry is None:
+        return None
+    try:
+        parsed = RszFile()
+        parsed.filepath = filepath
+        parsed.game_version = str(
+            getattr(source_rsz, "game_version", "OnimushaWOTS")
+        )
+        parsed.type_registry = registry
+        # Several shipped WOTS ActionParam resources have registry CRCs that
+        # differ from the public dump while retaining the same field layout.
+        # The owning GrappleMotionTable was already validated by the handler;
+        # keep this secondary, read-only lookup tolerant of those known CRCs.
+        parsed.read(data, validate_type_registry=False)
+        return parsed
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def resolve_wots_grapple_action_phases(
+    handler,
+    document: IssenDocument,
+    parent=None,
+) -> IssenDocument:
+    """Resolve partner ActionGuid phases through WOTS ActionID resources."""
+    unresolved = {
+        phase.action_guid
+        for pattern in document.patterns
+        for phase in pattern.enemy_phases
+        if phase.action_guid
+        and phase.motion_group_id == _INVALID_MOTION_GROUP_ID
+        and phase.reference.bank_id is None
+    }
+    if not unresolved:
+        return document
+
+    action_map = {}
+    for id_path, param_path in _enemy_action_resource_pairs(document.source_path):
+        action_ids = _load_wots_rsz_resource(handler, id_path, parent)
+        action_params = _load_wots_rsz_resource(handler, param_path, parent)
+        if action_ids is None or action_params is None:
+            continue
+        action_map.update(parse_wots_action_motion_map(action_ids, action_params))
+        if unresolved.issubset(action_map):
+            break
+    if not action_map:
+        return document
+
+    def resolved_phase(phase: IssenMotionPhase) -> IssenMotionPhase:
+        if (
+            phase.motion_group_id != _INVALID_MOTION_GROUP_ID
+            or phase.reference.bank_id is not None
+        ):
+            return phase
+        binding = action_map.get(phase.action_guid)
+        if binding is None:
+            return phase
+        action_name, groups = binding
+        group_id = groups[0]
+        return replace(
+            phase,
+            action_name=action_name,
+            motion_group_id=group_id,
+            reference=InteractionMotionRef(group_id, group_id >> 44, None),
+        )
+
+    return replace(
+        document,
+        patterns=tuple(
+            replace(
+                pattern,
+                enemy_phases=tuple(
+                    resolved_phase(phase) for phase in pattern.enemy_phases
+                ),
+            )
+            for pattern in document.patterns
+        ),
+    )
 
 
 def _mex_resource_path(motlist_path: str) -> str:
@@ -2059,7 +2252,7 @@ class WotsInteractionPreviewWidget(QWidget):
 
 
 class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
-    """Synchronized player/enemy preview for WOTS Issen motion tables."""
+    """Synchronized player/enemy preview for WOTS grapple motion tables."""
 
     def __init__(self, handler, document: IssenDocument, parent=None):
         QWidget.__init__(self, parent)
@@ -2092,13 +2285,17 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             bank_ids,
             getattr(handler, "resource_context", None),
         )
+        lowered_source = document.source_path.replace("\\", "/").casefold()
+        is_issen = "issen" in lowered_source
+        self.preview_tab_title = "Issen Preview" if is_issen else "Grapple Preview"
         self.preview_description = (
-            "Read-only WOTS Issen preview. Player and enemy phases are resolved "
+            "Read-only WOTS grapple preview. Player and enemy phases are resolved "
             "from GrappleMotionTable, adjacent MEX files, and verified WOTS "
             "action GUID links; runtime state transitions are simulated."
         )
         self._build_ui()
-        self.reaction_tree.setHeaderLabels((self.tr("Issen Pattern"), self.tr("Value")))
+        pattern_header = "Issen Pattern" if is_issen else "Grapple Pattern"
+        self.reaction_tree.setHeaderLabels((self.tr(pattern_header), self.tr("Value")))
         self._populate_reactions()
 
     def _populate_reactions(self) -> None:
@@ -2248,6 +2445,11 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
                 and len(enemy_segments) == 2
             ):
                 enemy_starts = (player_starts[0], player_starts[2])
+            elif len(player_starts) > 1 and len(enemy_segments) == 1:
+                # Blow/Fatal tables commonly encode an owner Adjust phase
+                # followed by the synchronized Const phase, while the partner
+                # only owns the Const motion.
+                enemy_starts = (player_starts[1],)
             else:
                 enemy_starts = player_starts[:len(enemy_segments)]
         if enemy_starts:
@@ -2300,13 +2502,17 @@ def create_wots_issen_preview(handler):
     if (
         rsz is None
         or _root_type_name(rsz) != "app.user_data.GrappleMotionTable"
-        or not any(
-            kind in lowered
-            for kind in ("blockissen", "counterissen", "chainissen")
-        )
+        or not any(kind in lowered for kind in (
+            "blockissen",
+            "counterissen",
+            "chainissen",
+            "blowgrap",
+            "fatalblow",
+        ))
     ):
         return None
     document = parse_wots_issen_document(rsz, source_path)
     if not document.patterns:
         return None
+    document = resolve_wots_grapple_action_phases(handler, document)
     return WotsIssenPreviewWidget(handler, document)

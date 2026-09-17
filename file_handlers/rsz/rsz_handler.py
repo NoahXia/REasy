@@ -305,7 +305,10 @@ class RszHandler(BaseFileHandler):
             )
         issen_preview = create_wots_issen_preview(self)
         if issen_preview is not None:
-            viewer.add_preview_tab(issen_preview, viewer.tr("Issen Preview"))
+            viewer.add_preview_tab(
+                issen_preview,
+                viewer.tr(getattr(issen_preview, "preview_tab_title", "Issen Preview")),
+            )
         motion_preview = create_pfb_motion_preview(self)
         if motion_preview is not None:
             viewer.add_preview_tab(motion_preview, viewer.tr("3D"))
