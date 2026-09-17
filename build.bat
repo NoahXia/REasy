@@ -5,6 +5,17 @@ cd /d "%~dp0"
 set "PY=.venv\Scripts\python.exe"
 set "GDEFLATE_DLL=.cache\gdeflate\libGDeflate.dll"
 set "PYTHONNOUSERSITE=1"
+set "PROJECTS_DIR=%CD%\dist\projects"
+set "PROJECTS_BACKUP=%CD%\.cache\dist-projects-backup"
+
+rem Preserve user projects because the normal build replaces the entire dist tree.
+rem Keep the backup after a successful restore so a failed future build remains recoverable.
+if exist "%PROJECTS_DIR%" (
+  if exist "%PROJECTS_BACKUP%" rmdir /S /Q "%PROJECTS_BACKUP%" || exit /b 1
+  xcopy /E /I /H /Y "%PROJECTS_DIR%" "%PROJECTS_BACKUP%\" >nul
+  if errorlevel 2 exit /b 1
+  echo Backed up dist\projects to .cache\dist-projects-backup
+)
 
 if exist build rmdir /S /Q build || exit /b 1
 if exist dist rmdir /S /Q dist || exit /b 1
@@ -43,6 +54,12 @@ copy "resources\images\reasy_guy.png" "dist\resources\images\reasy_guy.png" || e
 if not exist dist\resources\scripts mkdir dist\resources\scripts
 copy "scripts\auto_update.ps1" "dist\resources\scripts\auto_update.ps1" || exit /b 1
 copy "resources\data\dumps\*.json" dist\ || exit /b 1
+
+if exist "%PROJECTS_BACKUP%" (
+  xcopy /E /I /H /Y "%PROJECTS_BACKUP%" "%PROJECTS_DIR%\" >nul
+  if errorlevel 2 exit /b 1
+  echo Restored dist\projects from .cache\dist-projects-backup
+)
 
 if not exist dist\REasy.exe exit /b 1
 echo Built dist\REasy.exe

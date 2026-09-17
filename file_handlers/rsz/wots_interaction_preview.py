@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Read-only paired-motion preview for WOTS Just Guard interaction maps."""
+"""Read-only paired-motion previews for WOTS interaction resources."""
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from file_handlers.motion.motlist_handler import MotListHandler
 from file_handlers.motion.preview.widget import MotListPreviewWidget
 from file_handlers.motbank.motbank_file import MotbankFile
+from file_handlers.rsz.rsz_file import RszFile
 from ui.scene.scene_preview import ScenePreviewWidget
 from utils.resource_file_utils import resolve_handler_resource_data
 
@@ -57,10 +58,16 @@ class InteractionMotionRef:
 
     @property
     def available(self) -> bool:
-        return self.set_id != 0xFFFFFFFF and self.bank_id is not None
+        return (
+            self.set_id not in (0xFFFFFFFF, _INVALID_MOTION_GROUP_ID)
+            and self.bank_id is not None
+            and self.motion_id is not None
+        )
 
     @property
     def label(self) -> str:
+        if self.bank_id is not None and self.motion_id is None:
+            return f"0x{self.set_id:016X} · Bank {self.bank_id} · unresolved"
         if not self.available:
             return "Not configured"
         return (
@@ -73,6 +80,7 @@ class InteractionMotionRef:
 class _MotionSegment:
     label: str
     reference: InteractionMotionRef
+    start: float
     duration: float
     root_start: np.ndarray
     root_end: np.ndarray
@@ -143,6 +151,34 @@ class InteractionDocument:
     defender_role: str
     reactions: tuple[InteractionReaction, ...]
     group_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class IssenMotionPhase:
+    label: str
+    action_name: str
+    action_guid: str
+    motion_group_id: int
+    reference: InteractionMotionRef
+
+
+@dataclass(frozen=True, slots=True)
+class IssenPattern:
+    index: int
+    title: str
+    grapple_type: int
+    pattern_value: int
+    player_phases: tuple[IssenMotionPhase, ...]
+    enemy_phases: tuple[IssenMotionPhase, ...]
+    fixed_object_type: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IssenDocument:
+    source_path: str
+    patterns: tuple[IssenPattern, ...]
+    attacker_role: str = "Player"
+    defender_role: str = "Enemy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +316,163 @@ def parse_wots_interaction_document(rsz, source_path: str = "") -> InteractionDo
         tuple(reactions),
         len(group_ids),
     )
+
+
+_INVALID_MOTION_GROUP_ID = 0xFFFFFFFFFFFFFFFF
+
+# GrappleMotionTable stores the partner side as action GUIDs instead of motion
+# groups.  These are the verified Em100 WOTS 1.0.1.0 action-to-IssenEm links.
+# Valid group IDs are still resolved from the adjacent MEX at run time.
+_ISSEN_ACTIONS: dict[str, tuple[str, tuple[int, int] | None]] = {
+    "29cd4efa8c6d45c2a65725a57d12824e": ("Block Issen Adjust", None),
+    "085f8d9ba6c94c9781164c168b0b3bad": ("Block Issen Const", None),
+    "7e0fa006c2ee46aab33a990cc1e09928": (
+        "Block Issen Enemy Const",
+        (40031, 401),
+    ),
+    "67474a87483f4ffa956f785928118844": ("Counter Issen Adjust", None),
+    "0230d2261f294ec094097f869e19a972": ("Counter Issen Const", None),
+    "1dd502b449654130ab76fa3a27048974": ("Counter Issen Release", None),
+    "78eda3b63555400cb4bfa0632f3ce36f": (
+        "Counter Issen Enemy Const",
+        (40031, 189),
+    ),
+    "472a08a42fac4488ba73752b6291707b": (
+        "Counter Issen Enemy Release",
+        (40031, 204),
+    ),
+    "9433f04aaea941f483135e5581a3a8bd": ("Chain Issen Finish Start", None),
+    "9668bdce9cb5427db1f9f75581308d4f": ("Chain Issen Run Up", None),
+    "5079ee0c185f40a5931a56b1367e8502": ("Chain Issen Finish Attack", None),
+    "b42b09db7c154376ba90d1c674ebec6e": (
+        "Enemy Match Position",
+        (40031, 240),
+    ),
+    "d8745c26fd044248b60f42f8caf44ff3": ("Enemy Chain Issen", (40031, 250)),
+    "e7d06a8a08b642af909cce360872aa05": (
+        "Oni Change Finish Adjust",
+        None,
+    ),
+    "b16539ba3bc041a58b21e1b92c933c17": (
+        "Oni Change Finish Const",
+        None,
+    ),
+    "d82872b64b654eb8aabf012b2a60ffb5": (
+        "Oni Change Finish Release",
+        None,
+    ),
+    "e39f3b0e387041e98474b50ad22333be": (
+        "Enemy Fully Chain Issen Start",
+        (40031, 270),
+    ),
+    "82019f29935e41c2bc80944cf01ba3f1": (
+        "Enemy Fully Chain Issen Const",
+        (40031, 271),
+    ),
+    "adb33f23844747c7a037f01ce169edc3": (
+        "Enemy Fully Chain Issen End",
+        (40031, 272),
+    ),
+}
+
+
+def _guid_key(value) -> str:
+    raw = getattr(value, "guid_str", None)
+    if raw is None:
+        raw = _scalar(value, "")
+    return (
+        str(raw)
+        .replace("-", "")
+        .replace("{", "")
+        .replace("}", "")
+        .casefold()
+    )
+
+
+def _issen_phase(rsz, instance_id: int, fallback_label: str) -> IssenMotionPhase:
+    guid = _guid_key(_field(rsz, instance_id, "ActionGuid"))
+    action_name, fallback = _ISSEN_ACTIONS.get(
+        guid,
+        (fallback_label, None),
+    )
+    group_id = int(
+        _scalar(
+            _field(rsz, instance_id, "MotionGroupID"),
+            _INVALID_MOTION_GROUP_ID,
+        )
+    ) & _INVALID_MOTION_GROUP_ID
+    if group_id != _INVALID_MOTION_GROUP_ID:
+        reference = InteractionMotionRef(group_id, group_id >> 44, None)
+    elif fallback is not None:
+        bank_id, motion_id = fallback
+        reference = InteractionMotionRef(
+            (int(bank_id) << 12) | int(motion_id),
+            int(bank_id),
+            int(motion_id),
+        )
+    else:
+        reference = InteractionMotionRef(0xFFFFFFFF, None, None)
+    return IssenMotionPhase(
+        fallback_label,
+        action_name,
+        guid,
+        group_id,
+        reference,
+    )
+
+
+def _issen_pattern_title(source_path: str, index: int, phase_count: int) -> str:
+    lowered = str(source_path).replace("\\", "/").casefold()
+    if "counterissen" in lowered:
+        return f"Counter Issen {chr(ord('A') + index)}"
+    if "blockissen" in lowered:
+        return f"Block Issen {chr(ord('A') + index)}"
+    if "chainissen" in lowered:
+        if phase_count >= 3 and index >= 2:
+            return "Fully Chain Issen"
+        return f"Chain Issen {chr(ord('A') + index)}"
+    return f"Issen Pattern {index + 1}"
+
+
+def parse_wots_issen_document(rsz, source_path: str = "") -> IssenDocument:
+    """Convert a WOTS Issen GrappleMotionTable into paired phase sequences."""
+    root_type = _root_type_name(rsz)
+    if root_type != "app.user_data.GrappleMotionTable":
+        raise ValueError(f"unsupported Issen root type {root_type or '(unknown)'!r}")
+    root_id = int(rsz.object_table[0])
+    patterns = []
+    for index, list_id in enumerate(_object_ids(_field(rsz, root_id, "_List"))):
+        player_ids = _object_ids(_field(rsz, list_id, "_OwnerMotionList"))
+        enemy_ids = _object_ids(_field(rsz, list_id, "_PartnerMotionList"))
+        player = tuple(
+            _issen_phase(rsz, instance_id, f"Player Phase {phase_index + 1}")
+            for phase_index, instance_id in enumerate(player_ids)
+        )
+        enemy = tuple(
+            _issen_phase(rsz, instance_id, f"Enemy Phase {phase_index + 1}")
+            for phase_index, instance_id in enumerate(enemy_ids)
+        )
+        patterns.append(IssenPattern(
+            index=index,
+            title=_issen_pattern_title(source_path, index, len(player)),
+            grapple_type=int(_scalar(_field(rsz, list_id, "_GrappleType"))),
+            pattern_value=int(_scalar(_field(rsz, list_id, "_Pattern"))),
+            player_phases=player,
+            enemy_phases=enemy,
+        ))
+    return IssenDocument(str(source_path), tuple(patterns))
+
+
+def parse_wots_mex_motion_map(rsz) -> dict[int, int]:
+    """Return exact MotionGroupSetID -> MotionID links from one WOTS MEX."""
+    result = {}
+    for fields in getattr(rsz, "parsed_elements", {}).values():
+        group = fields.get("_MotionGroupSetID")
+        motion = fields.get("_MotionID")
+        if group is None or motion is None:
+            continue
+        result[int(_scalar(group)) & _INVALID_MOTION_GROUP_ID] = int(_scalar(motion))
+    return result
 
 
 def _loose_stm_root(source_path: str) -> Path | None:
@@ -594,6 +787,43 @@ def _resolve_interaction_resource(handler, resource_path: str, parent):
     return (str(matches[0]), matches[0].read_bytes()) if matches else None
 
 
+def _mex_resource_path(motlist_path: str) -> str:
+    normalized = str(motlist_path).replace("\\", "/")
+    marker = normalized.casefold().rfind(".motlist")
+    stemmed = normalized[:marker] if marker >= 0 else normalized
+    parent, _, stem = stemmed.rpartition("/")
+    return f"{parent}/{stem}_mex.user" if parent else f"{stem}_mex.user"
+
+
+def load_wots_mex_motion_map(
+    handler,
+    candidate: MotionBankCandidate,
+    parent=None,
+) -> tuple[dict[int, int], str]:
+    """Resolve and parse the MEX adjacent to a discovered MOTLIST candidate."""
+    mex_path = _mex_resource_path(candidate.resource_path)
+    hit = _resolve_interaction_resource(handler, mex_path, parent)
+    if hit is None:
+        return {}, f"MEX not found: {mex_path}"
+    filepath, data = hit
+    source_rsz = getattr(handler, "rsz_file", None)
+    registry = getattr(source_rsz, "type_registry", None)
+    if registry is None:
+        return {}, "MEX could not be parsed because no WOTS type registry is loaded."
+    try:
+        mex = RszFile()
+        mex.filepath = filepath
+        mex.game_version = str(getattr(source_rsz, "game_version", "OnimushaWOTS"))
+        mex.type_registry = registry
+        mex.read(data, validate_type_registry=True)
+        mapping = parse_wots_mex_motion_map(mex)
+    except (OSError, TypeError, ValueError) as exc:
+        return {}, f"Could not parse {mex_path}: {exc}"
+    if not mapping:
+        return {}, f"No MotionGroupSetID mappings were found in {mex_path}."
+    return mapping, ""
+
+
 _GRAPPLE_TYPES = {0: "PARRY", 1: "BLOCK"}
 _CHANCE_LEVELS = {0: "NONE", 1: "VERY_SMALL", 2: "SMALL", 3: "LARGE"}
 _CONST_TYPES = {0: "SYNCHRO", 4: "SYNCHRO_IGNORE_DIP"}
@@ -672,7 +902,16 @@ class InteractionTimeline(QWidget):
         self._defender_start = 0.0
         self._defender_end = 0.0
         self._source_trigger = 0
-        self.setMinimumHeight(92)
+        self._attacker_label = "Attacker"
+        self._defender_label = "Defender"
+        self._attacker_segments: tuple[tuple[str, float, float], ...] = ()
+        self._defender_segments: tuple[tuple[str, float, float], ...] = ()
+        self.setMinimumHeight(142)
+
+    def set_role_labels(self, attacker: str, defender: str) -> None:
+        self._attacker_label = str(attacker or "Attacker")
+        self._defender_label = str(defender or "Defender")
+        self.update()
 
     @property
     def end_frame(self) -> float:
@@ -686,14 +925,111 @@ class InteractionTimeline(QWidget):
         *,
         attacker_start: float = 0.0,
         defender_start: float = 0.0,
+        attacker_segments: tuple[tuple[str, float, float], ...] = (),
+        defender_segments: tuple[tuple[str, float, float], ...] = (),
     ) -> None:
         self._attacker_start = max(0.0, float(attacker_start))
         self._attacker_end = max(0.0, float(attacker_end))
         self._defender_start = max(0.0, float(defender_start))
         self._defender_end = max(0.0, float(defender_end))
         self._source_trigger = int(source_trigger)
+        self._attacker_segments = tuple(attacker_segments)
+        self._defender_segments = tuple(defender_segments)
+        self.setMinimumHeight(
+            142 if self._attacker_segments or self._defender_segments else 92
+        )
         self._frame = min(self._frame, self.end_frame)
         self.update()
+
+    @staticmethod
+    def _frame_label(value: float) -> str:
+        rounded = round(float(value))
+        return str(rounded) if abs(float(value) - rounded) < 0.001 else f"{value:.2f}"
+
+    @staticmethod
+    def _short_phase_label(label: str) -> str:
+        text = str(label)
+        if ". " in text and text.split(". ", 1)[0].isdigit():
+            text = text.split(". ", 1)[1]
+        for prefix in (
+            "Counter Issen Enemy ",
+            "Counter Issen ",
+            "Block Issen Enemy ",
+            "Block Issen ",
+            "Enemy Fully Chain Issen ",
+            "Oni Change Finish ",
+            "Chain Issen ",
+            "Enemy ",
+        ):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+        return text
+
+    def _draw_segments(
+        self,
+        painter: QPainter,
+        segments: tuple[tuple[str, float, float], ...],
+        fallback_start: float,
+        fallback_end: float,
+        y: int,
+        left: int,
+        width: int,
+        end: float,
+        color: QColor,
+    ) -> None:
+        draw_segments = segments or (("", fallback_start, fallback_end),)
+        last_index = len(draw_segments) - 1
+        for index, (label, start, finish) in enumerate(draw_segments):
+            start = max(0.0, float(start))
+            finish = max(start, float(finish))
+            x = left + round(width * start / end)
+            right = left + round(width * finish / end)
+            segment_width = max(1, right - x)
+            fill = color.lighter(100 + (index % 2) * 18)
+            painter.fillRect(x, y, segment_width, 20, fill)
+            active = start <= self._frame < finish or (
+                index == last_index and math.isclose(self._frame, finish)
+            )
+            painter.setPen(QPen(QColor(250, 210, 80) if active else color.lighter(145), 2 if active else 1))
+            painter.drawRect(x, y, segment_width, 20)
+            if label and segment_width >= 22:
+                caption = self._short_phase_label(label)
+                text = painter.fontMetrics().elidedText(
+                    caption,
+                    Qt.TextElideMode.ElideRight,
+                    max(0, segment_width - 6),
+                )
+                painter.setPen(QColor(245, 245, 245))
+                painter.drawText(x + 3, y + 15, text)
+
+    def _draw_segment_summary(
+        self,
+        painter: QPainter,
+        role: str,
+        segments: tuple[tuple[str, float, float], ...],
+        y: int,
+        left: int,
+        width: int,
+    ) -> None:
+        if not segments:
+            return
+        parts = [
+            f"{self._short_phase_label(label)} "
+            f"[{self._frame_label(start)}-{self._frame_label(finish)}]"
+            for label, start, finish in segments
+        ]
+        summary = f"{role}: " + "  |  ".join(parts)
+        painter.setPen(self.palette().text().color())
+        painter.drawText(
+            left,
+            y,
+            painter.fontMetrics().elidedText(
+                summary,
+                Qt.TextElideMode.ElideRight,
+                width,
+            ),
+        )
 
     def set_current_frame(self, frame: float) -> None:
         self._frame = min(max(0.0, float(frame)), self.end_frame)
@@ -716,40 +1052,62 @@ class InteractionTimeline(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         palette = self.palette()
         painter.fillRect(self.rect(), palette.base())
-        left, right = 92, max(93, self.width() - 12)
+        left, right = 100, max(101, self.width() - 12)
         width = right - left
         end = self.end_frame
 
         painter.setPen(palette.text().color())
-        painter.drawText(8, 31, "Attacker")
-        painter.drawText(8, 61, "Defender")
-        attacker_x = left + round(width * self._attacker_start / end)
-        defender_x = left + round(width * self._defender_start / end)
-        painter.fillRect(
-            attacker_x,
+        painter.drawText(8, 33, self._attacker_label)
+        painter.drawText(8, 65, self._defender_label)
+        self._draw_segments(
+            painter,
+            self._attacker_segments,
+            self._attacker_start,
+            self._attacker_end,
             17,
-            round(width * (self._attacker_end - self._attacker_start) / end),
-            18,
+            left,
+            width,
+            end,
             QColor(54, 126, 190),
         )
-        painter.fillRect(
-            defender_x,
-            47,
-            round(width * (self._defender_end - self._defender_start) / end),
-            18,
+        self._draw_segments(
+            painter,
+            self._defender_segments,
+            self._defender_start,
+            self._defender_end,
+            49,
+            left,
+            width,
+            end,
             QColor(83, 159, 104),
+        )
+        self._draw_segment_summary(
+            painter,
+            self._attacker_label,
+            self._attacker_segments,
+            88,
+            left,
+            width,
+        )
+        self._draw_segment_summary(
+            painter,
+            self._defender_label,
+            self._defender_segments,
+            108,
+            left,
+            width,
         )
 
         tick_step = max(1, int(math.ceil(end / 8.0)))
         painter.setPen(QColor(130, 130, 130))
         for frame in range(0, int(end) + 1, tick_step):
             x = left + round(width * frame / end)
-            painter.drawLine(x, 10, x, 70)
-            painter.drawText(x + 2, 84, str(frame))
+            painter.drawLine(x, 10, x, 72)
+            painter.drawText(x + 2, 136, str(frame))
 
         current_x = left + round(width * self._frame / end)
         painter.setPen(QPen(QColor(245, 245, 245), 2))
-        painter.drawLine(current_x, 8, current_x, 70)
+        painter.drawLine(current_x, 8, current_x, 72)
         painter.setPen(QColor(236, 166, 45))
         painter.drawText(
             left,
@@ -1087,7 +1445,14 @@ class _ActorMotionPane(QWidget):
 
     @property
     def sequence_duration(self) -> float:
-        return sum(segment.duration for segment in self._sequence)
+        return max(
+            (segment.start + segment.duration for segment in self._sequence),
+            default=0.0,
+        )
+
+    @property
+    def sequence_segments(self) -> tuple[_MotionSegment, ...]:
+        return self._sequence
 
     def set_content(
         self,
@@ -1156,9 +1521,15 @@ class _ActorMotionPane(QWidget):
         ).reshape(4, 4)
         return matrix[3, :3].copy()
 
-    def configure_sequence(self, labels: tuple[str, ...]) -> None:
+    def configure_sequence(
+        self,
+        labels: tuple[str, ...],
+        start_frames: tuple[float, ...] | None = None,
+    ) -> None:
+        starts = tuple(float(value) for value in start_frames or ())
         signature = (
             self._loaded_path,
+            starts,
             tuple(
                 (label, ref.set_id, ref.bank_id, ref.motion_id)
                 for label, ref in self._references
@@ -1175,7 +1546,8 @@ class _ActorMotionPane(QWidget):
         by_label = {label: ref for label, ref in self._references}
         segments = []
         corrected_end = None
-        for label in labels:
+        contiguous_start = 0.0
+        for index, label in enumerate(labels):
             reference = by_label.get(label)
             if reference is None or not self._select_reference(reference):
                 continue
@@ -1193,11 +1565,13 @@ class _ActorMotionPane(QWidget):
             segments.append(_MotionSegment(
                 label,
                 reference,
+                starts[index] if index < len(starts) else contiguous_start,
                 duration,
                 root_start,
                 root_end,
                 correction,
             ))
+            contiguous_start += duration
         self._sequence = tuple(segments)
         if self._sequence:
             self._select_reference(self._sequence[0].reference)
@@ -1206,16 +1580,21 @@ class _ActorMotionPane(QWidget):
         if self._preview is None or not self._sequence:
             return np.zeros(3, dtype=np.float32)
         local_clock = max(0.0, float(frame) - float(start_frame))
-        elapsed = 0.0
-        selected = self._sequence[-1]
-        local_frame = selected.duration
+        selected = self._sequence[0]
+        local_frame = 0.0
         for segment in self._sequence:
-            segment_end = elapsed + segment.duration
-            if local_clock <= segment_end or segment is self._sequence[-1]:
-                selected = segment
-                local_frame = min(max(local_clock - elapsed, 0.0), segment.duration)
+            segment_end = segment.start + segment.duration
+            if local_clock < segment.start:
                 break
-            elapsed = segment_end
+            selected = segment
+            local_frame = segment.duration
+            if local_clock <= segment_end:
+                selected = segment
+                local_frame = min(
+                    max(local_clock - segment.start, 0.0),
+                    segment.duration,
+                )
+                break
         self._select_reference(selected.reference)
         self._segment_correction = selected.root_correction.copy()
         self._preview.controller.set_frame(local_frame)
@@ -1384,10 +1763,12 @@ class WotsInteractionPreviewWidget(QWidget):
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(5)
         banner = QLabel(
-            self.tr(
+            self.tr(getattr(
+                self,
+                "preview_description",
                 "Read-only WOTS interaction preview. Resource links are verified; "
-                "the paired transition and constraint behavior are simulated."
-            ),
+                "the paired transition and constraint behavior are simulated.",
+            )),
             self,
         )
         banner.setWordWrap(True)
@@ -1438,6 +1819,10 @@ class WotsInteractionPreviewWidget(QWidget):
         preview_layout.addWidget(self.viewport, 1)
 
         self.timeline = InteractionTimeline(preview_area)
+        self.timeline.set_role_labels(
+            self.document.attacker_role,
+            self.document.defender_role,
+        )
         self.timeline.frame_requested.connect(self.set_frame)
         preview_layout.addWidget(self.timeline)
 
@@ -1673,6 +2058,228 @@ class WotsInteractionPreviewWidget(QWidget):
         super().closeEvent(event)
 
 
+class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
+    """Synchronized player/enemy preview for WOTS Issen motion tables."""
+
+    def __init__(self, handler, document: IssenDocument, parent=None):
+        QWidget.__init__(self, parent)
+        self.handler = handler
+        self.document = document
+        self._current_reaction: IssenPattern | None = None
+        self._initial_reaction_item: QTreeWidgetItem | None = None
+        self._activated = False
+        self._frame = 0.0
+        self._attacker_start = 0.0
+        self._defender_start = 0.0
+        self._playing = False
+        self._elapsed = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._mex_maps: dict[str, tuple[dict[int, int], str]] = {}
+        self._resolution_messages: list[str] = []
+        self._player_labels: tuple[str, ...] = ()
+        self._enemy_labels: tuple[str, ...] = ()
+        bank_ids = {
+            int(phase.reference.bank_id)
+            for pattern in document.patterns
+            for phase in (*pattern.player_phases, *pattern.enemy_phases)
+            if phase.reference.bank_id is not None
+        }
+        self._bank_candidates = discover_motion_bank_candidates(
+            document.source_path,
+            bank_ids,
+            getattr(handler, "resource_context", None),
+        )
+        self.preview_description = (
+            "Read-only WOTS Issen preview. Player and enemy phases are resolved "
+            "from GrappleMotionTable, adjacent MEX files, and verified WOTS "
+            "action GUID links; runtime state transitions are simulated."
+        )
+        self._build_ui()
+        self.reaction_tree.setHeaderLabels((self.tr("Issen Pattern"), self.tr("Value")))
+        self._populate_reactions()
+
+    def _populate_reactions(self) -> None:
+        for index, pattern in enumerate(self.document.patterns):
+            item = QTreeWidgetItem((
+                pattern.title,
+                f"{len(pattern.player_phases)} player / "
+                f"{len(pattern.enemy_phases)} enemy phases",
+            ))
+            item.setData(0, _ROLE, index)
+            self.reaction_tree.addTopLevelItem(item)
+        if self.reaction_tree.topLevelItemCount():
+            self._initial_reaction_item = self.reaction_tree.topLevelItem(0)
+
+    def _candidate_map(self, candidate: MotionBankCandidate) -> dict[int, int]:
+        key = candidate.resource_path.casefold()
+        cached = self._mex_maps.get(key)
+        if cached is None:
+            cached = load_wots_mex_motion_map(self.handler, candidate, self)
+            self._mex_maps[key] = cached
+        mapping, message = cached
+        if message and message not in self._resolution_messages:
+            self._resolution_messages.append(message)
+        return mapping
+
+    def _resolve_phase(self, phase: IssenMotionPhase, role: str) -> IssenMotionPhase:
+        reference = phase.reference
+        if reference.motion_id is not None or reference.bank_id is None:
+            return phase
+        candidates = self._bank_candidates.get(int(reference.bank_id), ())
+        preferred = preferred_motion_bank_candidate(candidates, role)
+        ordered = tuple(
+            item
+            for item in (preferred, *candidates)
+            if item is not None
+        )
+        seen = set()
+        for candidate in ordered:
+            key = candidate.resource_path.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            motion_id = self._candidate_map(candidate).get(phase.motion_group_id)
+            if motion_id is None:
+                continue
+            return replace(
+                phase,
+                reference=replace(reference, motion_id=int(motion_id)),
+            )
+        message = (
+            f"Unresolved {role} MotionGroupID "
+            f"0x{phase.motion_group_id:016X} ({phase.action_name})."
+        )
+        if message not in self._resolution_messages:
+            self._resolution_messages.append(message)
+        return phase
+
+    def _pattern_rows(
+        self,
+        pattern: IssenPattern,
+        player: tuple[IssenMotionPhase, ...],
+        enemy: tuple[IssenMotionPhase, ...],
+    ) -> tuple[tuple[str, str], ...]:
+        rows = [
+            ("Evidence", "GrappleMotionTable + adjacent MEX; runtime transitions are simulated"),
+            ("Pattern", pattern.title),
+            ("GrappleType", str(pattern.grapple_type)),
+            ("Pattern Value", f"{pattern.pattern_value} (0x{pattern.pattern_value & 0xFFFFFFFF:08X})"),
+        ]
+        for role, phases in (("Player", player), ("Enemy", enemy)):
+            for index, phase in enumerate(phases, 1):
+                rows.extend((
+                    (f"{role} Phase {index}", phase.action_name),
+                    (f"{role} Phase {index} ActionGuid", phase.action_guid or "None"),
+                    (
+                        f"{role} Phase {index} MotionGroupID",
+                        (
+                            "Action GUID link"
+                            if phase.motion_group_id == _INVALID_MOTION_GROUP_ID
+                            else f"0x{phase.motion_group_id:016X}"
+                        ),
+                    ),
+                    (f"{role} Phase {index} Motion", phase.reference.label),
+                ))
+        rows.extend(("Diagnostic", value) for value in self._resolution_messages)
+        return tuple(rows)
+
+    def _candidate_pool(
+        self,
+        phases: tuple[IssenMotionPhase, ...],
+    ) -> tuple[MotionBankCandidate, ...]:
+        result = []
+        for phase in phases:
+            bank_id = phase.reference.bank_id
+            if bank_id is None:
+                continue
+            for candidate in self._bank_candidates.get(int(bank_id), ()):
+                if candidate not in result:
+                    result.append(candidate)
+        return tuple(result)
+
+    def _on_reaction_changed(self, current, _previous) -> None:
+        index = current.data(0, _ROLE) if current is not None else None
+        if not isinstance(index, int) or not (0 <= index < len(self.document.patterns)):
+            return
+        self.stop_playback()
+        self._resolution_messages.clear()
+        pattern = self.document.patterns[index]
+        player = tuple(self._resolve_phase(phase, "Player") for phase in pattern.player_phases)
+        enemy = tuple(self._resolve_phase(phase, "Enemy") for phase in pattern.enemy_phases)
+        self._current_reaction = pattern
+        player_refs = tuple(
+            (f"{phase_index}. {phase.action_name}", phase.reference)
+            for phase_index, phase in enumerate(player, 1)
+        )
+        enemy_refs = tuple(
+            (f"{phase_index}. {phase.action_name}", phase.reference)
+            for phase_index, phase in enumerate(enemy, 1)
+        )
+        self._player_labels = tuple(label for label, _ref in player_refs)
+        self._enemy_labels = tuple(label for label, _ref in enemy_refs)
+        self._set_details(self._pattern_rows(pattern, player, enemy))
+        self.attacker.set_content(player_refs, self._candidate_pool(player))
+        self.defender.set_content(enemy_refs, self._candidate_pool(enemy))
+        self._frame = 0.0
+        self._motion_loaded()
+
+    def _motion_loaded(self) -> None:
+        self.attacker.configure_sequence(self._player_labels)
+        self.defender.configure_sequence(self._enemy_labels)
+        player_segments = self.attacker.sequence_segments
+        enemy_segments = self.defender.sequence_segments
+        player_starts = tuple(segment.start for segment in player_segments)
+        enemy_starts: tuple[float, ...] = ()
+        pattern = self._current_reaction
+        if pattern is not None and enemy_segments:
+            lowered_title = pattern.title.casefold()
+            if (
+                any(kind in lowered_title for kind in ("counter issen", "block issen"))
+                and len(player_starts) > 1
+            ):
+                enemy_starts = player_starts[1: 1 + len(enemy_segments)]
+            elif (
+                "chain issen" in lowered_title
+                and "fully" not in lowered_title
+                and len(player_starts) >= 3
+                and len(enemy_segments) == 2
+            ):
+                enemy_starts = (player_starts[0], player_starts[2])
+            else:
+                enemy_starts = player_starts[:len(enemy_segments)]
+        if enemy_starts:
+            self.defender.configure_sequence(self._enemy_labels, enemy_starts)
+        attacker_duration = self.attacker.sequence_duration
+        defender_duration = self.defender.sequence_duration
+        attacker_segments = tuple(
+            (segment.label, segment.start, segment.start + segment.duration)
+            for segment in self.attacker.sequence_segments
+        )
+        defender_segments = tuple(
+            (segment.label, segment.start, segment.start + segment.duration)
+            for segment in self.defender.sequence_segments
+        )
+        self._attacker_start = 0.0
+        self._defender_start = 0.0
+        defender_display_start = min(enemy_starts, default=0.0)
+        self.timeline.configure(
+            attacker_duration,
+            defender_duration,
+            0,
+            defender_start=defender_display_start,
+            attacker_segments=attacker_segments,
+            defender_segments=defender_segments,
+        )
+        end = self.timeline.end_frame
+        with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
+            self.frame_slider.setRange(0, round(end * _SLIDER_SCALE))
+            self.frame_spin.setRange(0.0, end)
+        self.set_frame(min(self._frame, end))
+
+
 def create_wots_interaction_preview(handler):
     rsz = getattr(handler, "rsz_file", None)
     if rsz is None or _root_type_name(rsz) != "app.user_data.JustGuardConditionMap":
@@ -1684,3 +2291,22 @@ def create_wots_interaction_preview(handler):
     if not document.reactions:
         return None
     return WotsInteractionPreviewWidget(handler, document)
+
+
+def create_wots_issen_preview(handler):
+    rsz = getattr(handler, "rsz_file", None)
+    source_path = str(getattr(handler, "filepath", "") or "")
+    lowered = source_path.replace("\\", "/").casefold()
+    if (
+        rsz is None
+        or _root_type_name(rsz) != "app.user_data.GrappleMotionTable"
+        or not any(
+            kind in lowered
+            for kind in ("blockissen", "counterissen", "chainissen")
+        )
+    ):
+        return None
+    document = parse_wots_issen_document(rsz, source_path)
+    if not document.patterns:
+        return None
+    return WotsIssenPreviewWidget(handler, document)
