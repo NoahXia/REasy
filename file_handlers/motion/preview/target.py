@@ -57,6 +57,7 @@ class MeshPreviewPreset:
     attachment_joints: tuple[str, ...] = ()
     weapon_collision_types: tuple[int | None, ...] = ()
     weapon_attack_resources: tuple[tuple[int, str], ...] = ()
+    optional_resource_paths: tuple[str, ...] = ()
 
 
 WOTS_MESH_PREVIEW_PRESETS = (
@@ -84,24 +85,20 @@ WOTS_MESH_PREVIEW_PRESETS = (
     ),
     MeshPreviewPreset(
         "wots_em101_00",
-        "WOTS · em101_00 (body + arms + head + cloth + sword)",
+        "WOTS · ch101_70 (complete body + weapon)",
         (
-            "natives/stm/Art/Model/Character/ch1/ch101/00/00/"
-            "ch101_00_00.mesh.260209350",
-            "natives/stm/Art/Model/Character/ch1/ch101/00/03/"
-            "ch101_00_03.mesh.260209350",
-            "natives/stm/Art/Model/Character/ch1/ch101/00/05/"
-            "ch101_00_05.mesh.260209350",
-            "natives/stm/Art/Model/Character/ch1/ch101/01/00/"
-            "ch101_01_00.mesh.260209350",
-            "natives/stm/Art/Model/Character/ch1/ch101/20/00/"
-            "ch101_20_00.mesh.260209350",
-            "natives/stm/Art/Model/Item/it0/it000_0001/"
-            "it000_0001_00.mesh.260209350",
+            "natives/stm/Art/Model/Character/ch1/ch101_70/00/"
+            "ch101_70_00.mesh.260209350",
+            "natives/stm/Art/Model/Item/it0/it000_0210/"
+            "it000_0210_00.mesh.260209350",
         ),
-        ("Body", "Left Arm", "Right Arm", "Head", "Cloth", "Rusted Sword"),
-        ("", "", "", "", "", "R_Hand"),
-        (None, None, None, None, None, 2),
+        ("Complete Body", "Weapon"),
+        ("", "R_Wep"),
+        (None, 2),
+        optional_resource_paths=(
+            "natives/stm/Art/Model/Item/it0/it000_0210/"
+            "it000_0210_00.mesh.260209350",
+        ),
     ),
 )
 
@@ -162,16 +159,32 @@ def load_re_engine_mesh_preset_target(
     preset: MeshPreviewPreset,
     resources: tuple[tuple[str, bytes], ...],
     *,
+    resource_indices: tuple[int, ...] | None = None,
     app=None,
     resource_context: ResourceResolutionContext | None = None,
 ) -> RigPreviewTarget:
-    if len(resources) != len(preset.resource_paths):
+    if resource_indices is None:
+        resource_indices = tuple(range(len(resources)))
+    if len(resources) != len(resource_indices):
+        raise ValueError("preset resource index count does not match mesh count")
+    if len(set(resource_indices)) != len(resource_indices) or any(
+        index < 0 or index >= len(preset.resource_paths)
+        for index in resource_indices
+    ):
+        raise ValueError("preset resource indices are invalid")
+    missing_required = tuple(
+        path
+        for index, path in enumerate(preset.resource_paths)
+        if index not in resource_indices
+        and path not in preset.optional_resource_paths
+    )
+    if missing_required:
         raise ValueError(
-            f"preset {preset.label!r} needs {len(preset.resource_paths)} meshes, "
-            f"got {len(resources)}"
+            f"preset {preset.label!r} is missing required mesh(es): "
+            + ", ".join(missing_required)
         )
     handlers = []
-    for index, (filepath, data) in enumerate(resources):
+    for index, (filepath, data) in zip(resource_indices, resources):
         target = load_re_engine_mesh_target(
             filepath,
             data,

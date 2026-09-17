@@ -1614,9 +1614,24 @@ class WotsInteractionPreviewWidget(QWidget):
             if reaction is not None and reaction.fixed_object_type == 1
             else np.zeros(3, dtype=np.float32)
         )
-        anchor_translation = -fixed_root
-        self.attacker.set_anchor_translation(anchor_translation)
-        self.defender.set_anchor_translation(anchor_translation)
+        # FixedObjType anchors the interaction on the ground plane.  Sharing
+        # its vertical root offset with the other actor makes one participant
+        # rise or sink whenever the fixed actor has authored Y root motion.
+        # X/Z remain a shared interaction-space anchor.  WOTS character
+        # controllers keep each interaction actor on its own vertical base;
+        # applying MOT root Y directly makes grapple participants float or
+        # sink.  Lock Y independently for both actors instead of transferring
+        # the fixed actor's vertical correction to its partner.
+        planar_anchor = np.array(
+            (-fixed_root[0], 0.0, -fixed_root[2]),
+            dtype=np.float32,
+        )
+        attacker_anchor = planar_anchor.copy()
+        defender_anchor = planar_anchor.copy()
+        attacker_anchor[1] = -attacker_root[1]
+        defender_anchor[1] = -defender_root[1]
+        self.attacker.set_anchor_translation(attacker_anchor)
+        self.defender.set_anchor_translation(defender_anchor)
         self.attacker.render_prepared_frame()
         self.defender.render_prepared_frame()
 

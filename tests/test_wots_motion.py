@@ -986,32 +986,49 @@ class TestWotsMotion(unittest.TestCase):
     os.environ.get("REASY_WOTS_ASSET_ROOT"), "set REASY_WOTS_ASSET_ROOT"
 )
 class TestWotsAssets(unittest.TestCase):
-    def test_em101_model_preset_contains_complete_costume_and_weapon(self):
+    def test_em101_model_preset_contains_complete_body_and_weapon(self):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
         preset = next(
             item for item in WOTS_MESH_PREVIEW_PRESETS
             if item.key == "wots_em101_00"
         )
         resources = []
-        for resource_path in preset.resource_paths:
+        resource_indices = []
+        for index, resource_path in enumerate(preset.resource_paths):
             relative = resource_path.replace("\\", "/")
             relative = relative.split("natives/stm/", 1)[-1]
             path = root / Path(relative)
+            if not path.exists() and resource_path in preset.optional_resource_paths:
+                continue
+            self.assertTrue(path.exists(), resource_path)
             resources.append((str(path), path.read_bytes()))
+            resource_indices.append(index)
 
-        target = load_re_engine_mesh_preset_target(preset, tuple(resources))
+        target = load_re_engine_mesh_preset_target(
+            preset,
+            tuple(resources),
+            resource_indices=tuple(resource_indices),
+        )
+
+        expected_labels = tuple(preset.part_labels[index] for index in resource_indices)
+        expected_joints = tuple(
+            ("", "R_Wep")[index] for index in resource_indices
+        )
+        expected_collision_types = tuple(
+            preset.weapon_collision_types[index] for index in resource_indices
+        )
 
         self.assertEqual(
             tuple(part.label for part in target.render_parts),
-            ("Body", "Left Arm", "Right Arm", "Head", "Cloth", "Rusted Sword"),
+            expected_labels,
         )
         self.assertEqual(
             tuple(part.attachment_joint for part in target.render_parts),
-            ("", "", "", "", "", "R_Hand"),
+            expected_joints,
         )
         self.assertEqual(
             tuple(part.weapon_collision_type for part in target.render_parts),
-            (None, None, None, None, None, 2),
+            expected_collision_types,
         )
 
         pose = compose_evaluated_pose(
@@ -1042,9 +1059,14 @@ class TestWotsAssets(unittest.TestCase):
         viewport = _PreviewViewport()
         renderer = MotionPreviewRenderer(viewport)
         renderer.present(snapshot, target, reset_camera=True)
-        expected = {
-            f"motion-preview:target:{index}" for index in range(6)
-        }
+        expected = (
+            {"motion-preview:target"}
+            if len(resources) == 1
+            else {
+                f"motion-preview:target:{index}"
+                for index in range(len(resources))
+            }
+        )
         self.assertEqual({mesh.key for mesh in viewport.scene}, expected)
         self.assertEqual(set(viewport.skinning), expected)
 

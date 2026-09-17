@@ -672,13 +672,19 @@ class MotListPreviewWidget(QWidget):
             self._show_error(self.tr("No model preset is selected."))
             return
         resources = []
+        resource_indices = []
         missing = []
-        for resource_path in preset.resource_paths:
+        optional_missing = []
+        for index, resource_path in enumerate(preset.resource_paths):
             hit = resolve_handler_resource_data(self.handler, resource_path, self)
             if hit is None:
-                missing.append(resource_path)
+                if resource_path in preset.optional_resource_paths:
+                    optional_missing.append(resource_path)
+                else:
+                    missing.append(resource_path)
             else:
                 resources.append(hit)
+                resource_indices.append(index)
         if missing:
             self._show_error(
                 self.tr("Model preset is missing resource(s): {paths}").format(
@@ -690,6 +696,7 @@ class MotListPreviewWidget(QWidget):
             target = load_re_engine_mesh_preset_target(
                 preset,
                 tuple(resources),
+                resource_indices=tuple(resource_indices),
                 app=getattr(self.handler, "app", None),
                 resource_context=getattr(self.handler, "resource_context", None),
             )
@@ -710,6 +717,14 @@ class MotListPreviewWidget(QWidget):
                 weapon_attack_sources=weapon_sources,
                 weapon_attack_diagnostics=tuple(weapon_diagnostics),
             )
+            if optional_missing:
+                self.rig_label.setText(
+                    self.rig_label.text()
+                    + "\n"
+                    + self.tr("Optional preset resource missing: {paths}").format(
+                        paths=", ".join(optional_missing)
+                    )
+                )
         except ValueError as exc:
             self._show_error(
                 self.tr("Could not load model preset: {error}").format(error=exc)
