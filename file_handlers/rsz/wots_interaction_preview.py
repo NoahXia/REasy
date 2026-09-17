@@ -1569,16 +1569,14 @@ class WotsInteractionPreviewWidget(QWidget):
         reaction = self._current_reaction
         trigger = reaction.trigger_frame if reaction else 0
         self.attacker.configure_sequence(("Main",))
-        self.defender.configure_sequence(("Start", "Main"))
+        # Defender Start is the approach/preparation clip that ran before the
+        # synchronized interaction.  The paired preview begins when both Main
+        # clips begin; prepending Start puts the two actors in different phases.
+        self.defender.configure_sequence(("Main",))
         attacker_duration = self.attacker.sequence_duration
         defender_duration = self.defender.sequence_duration
-        end = max(attacker_duration, defender_duration, 1.0)
-        if reaction is not None and reaction.const_type in _CONST_TYPES:
-            self._attacker_start = max(0.0, end - attacker_duration)
-            self._defender_start = max(0.0, end - defender_duration)
-        else:
-            self._attacker_start = 0.0
-            self._defender_start = 0.0
+        self._attacker_start = 0.0
+        self._defender_start = 0.0
         self.timeline.configure(
             self._attacker_start + attacker_duration,
             self._defender_start + defender_duration,
