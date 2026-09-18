@@ -47,6 +47,7 @@ from .rsz_data_types import ArrayData, ObjectData
 
 
 _ROLE = int(Qt.ItemDataRole.UserRole)
+_TARGET_COUNT_ROLE = _ROLE + 1
 _SLIDER_SCALE = 100
 
 
@@ -74,6 +75,18 @@ class InteractionMotionRef:
             f"0x{self.set_id:08X} · Bank {self.bank_id} · "
             f"Motion {self.motion_id}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InteractionNextAction:
+    action_type: int
+    action_guid: str
+    action_name: str
+    motion_group_id: int
+    reference: InteractionMotionRef
+    resource_path: str = ""
+    diagnostic: str = ""
+    preview_kind: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +155,7 @@ class InteractionReaction:
     attacker_motion: InteractionMotionRef
     defender_motion: InteractionMotionRef
     defender_start_motion: InteractionMotionRef
+    next_action: InteractionNextAction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,11 +333,154 @@ def parse_wots_interaction_document(rsz, source_path: str = "") -> InteractionDo
 
 
 _INVALID_MOTION_GROUP_ID = 0xFFFFFFFFFFFFFFFF
+_PLAYER_KATATE_ATTACK_MOTLIST_PATH = (
+    "natives/stm/Motion/Player/Weapon/plw_KatateAttack/plw_KatateAttack.motlist"
+)
+_PLAYER_RYOTE_ATTACK_MOTLIST_PATH = (
+    "natives/stm/Motion/Player/Weapon/plw_RyoteAttack/plw_RyoteAttack.motlist"
+)
+
+
+def _player_justguard_followups() -> tuple[InteractionNextAction, ...]:
+    """Return verified, input-dependent player actions after a parry.
+
+    These are not selected by enemy NEXT_ACT_TYPE.  The player action state
+    machine chooses one only when the corresponding attack branch is entered.
+    Group and motion IDs were verified against the WOTS 1.0.1.0 runtime
+    ActionParam and the adjacent MEX resources.
+    """
+    rows = (
+        (
+            "Attack After Parry · Front",
+            0x04E2A825EDCC3B7A,
+            40,
+            _PLAYER_KATATE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack After Parry · Far",
+            0x04E2AC669006C141,
+            44,
+            _PLAYER_KATATE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack After Parry · Front · Oni Change",
+            0x04E2ACC90DEDBA79,
+            46,
+            _PLAYER_KATATE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack After Parry · Far · Oni Change",
+            0x04E2A7F6076A2FAF,
+            47,
+            _PLAYER_KATATE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack Finish After Parry · Front",
+            0x04E2BEF8EA181904,
+            60,
+            _PLAYER_RYOTE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack Finish After Parry · Far",
+            0x04E2BC669006C141,
+            61,
+            _PLAYER_RYOTE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack Finish After Parry · Front · Oni Change",
+            0x04E2BCC90DEDBA79,
+            62,
+            _PLAYER_RYOTE_ATTACK_MOTLIST_PATH,
+        ),
+        (
+            "Attack Finish After Parry · Far · Oni Change",
+            0x04E2B7F6076A2FAF,
+            63,
+            _PLAYER_RYOTE_ATTACK_MOTLIST_PATH,
+        ),
+    )
+    followups = tuple(
+        InteractionNextAction(
+            0,
+            "",
+            label,
+            group_id,
+            InteractionMotionRef(group_id, group_id >> 44, motion_id),
+            resource_path=resource_path,
+            diagnostic="Input-dependent player action; not selected by enemy NEXT_ACT_TYPE.",
+        )
+        for label, group_id, motion_id, resource_path in rows
+    )
+    # cMultipleParry has no serialized MotionGroupID of its own. Runtime
+    # inspection shows that cMultipleJustGuardBase obtains ADJUST/JUST_GUARD
+    # motion details from the active GrappleMotionTable, so the widget binds
+    # this marker to the currently selected reaction rather than a fixed MOT.
+    return followups + (
+        InteractionNextAction(
+            0,
+            "",
+            "Multiple Parry · Repeat Current Reaction",
+            _INVALID_MOTION_GROUP_ID,
+            InteractionMotionRef(_INVALID_MOTION_GROUP_ID, None, None),
+            diagnostic=(
+                "Runtime cMultipleParry reuses the selected JustGuard "
+                "GrappleMotionTable. The nearby target placement and repeated "
+                "target selection are simulated."
+            ),
+            preview_kind="multiple_parry",
+        ),
+    )
+
+
+_BREAK_ISSEN_COMBO_ADJUST_GUID = "074b37a4ce154b18a40c017904d10f08"
+_BREAK_ISSEN_COMBO_CONST_GUID = "7082cf4496d540e0b1f456639c760356"
+_BREAK_ISSEN_COMBO_DEFAULT_SELECT_FRAMES = 180.0
+# app.GrappleTableDef.PATTERN_FATAL_BLOW_Fixed.  The runtime combo manager
+# advances through these three authored grapple variants in order.
+_BREAK_ISSEN_COMBO_PATTERN_VALUES = (
+    4728653,     # COMMON_PAT_10
+    1449708544,  # COMMON_PAT_11
+    958406400,   # COMMON_PAT_12
+)
+_BREAK_ISSEN_COMBO_PATTERN_NAMES = (
+    "COMMON_PAT_10",
+    "COMMON_PAT_11",
+    "COMMON_PAT_12",
+)
+_BREAK_ISSEN_MOTION_BANK_ID = 20031
+_BREAK_ISSEN_MOTLIST_PATH = (
+    "natives/stm/Motion/Player/Weapon/plw_Issen/plw_Issen.motlist"
+)
+# Verified from the WOTS 1.0.1.0 runtime TypeDB and plw_Issen_mex.user.3.
+# Each row is one subsequent target; columns follow F, B, L, R.
+_BREAK_ISSEN_NEXT_TURN_MOTIONS = (
+    (
+        (352402014515322549, 533),
+        (352405801135085221, 534),
+        (352393451123000886, 535),
+        (352405088304742692, 536),
+    ),
+    (
+        (352400910373180611, 538),
+        (352396275015885347, 539),
+        (352401101460717324, 540),
+        (352396012774523291, 541),
+    ),
+    (
+        (352405270068959620, 543),
+        (352392040753985171, 544),
+        (352393296696579374, 545),
+        (352396668684862077, 546),
+    ),
+)
+_BREAK_ISSEN_DIRECTIONS = ("F", "B", "L", "R")
 
 # GrappleMotionTable stores the partner side as action GUIDs instead of motion
 # groups.  These are the verified Em100 WOTS 1.0.1.0 action-to-IssenEm links.
 # Valid group IDs are still resolved from the adjacent MEX at run time.
 _ISSEN_ACTIONS: dict[str, tuple[str, tuple[int, int] | None]] = {
+    _BREAK_ISSEN_COMBO_ADJUST_GUID: ("Break Issen Combo Adjust", None),
+    _BREAK_ISSEN_COMBO_CONST_GUID: ("Break Issen Combo Const", None),
     "29cd4efa8c6d45c2a65725a57d12824e": ("Block Issen Adjust", None),
     "085f8d9ba6c94c9781164c168b0b3bad": ("Block Issen Const", None),
     "7e0fa006c2ee46aab33a990cc1e09928": (
@@ -421,6 +578,96 @@ def _issen_phase(rsz, instance_id: int, fallback_label: str) -> IssenMotionPhase
     )
 
 
+def _is_break_issen_combo_pattern(pattern: IssenPattern) -> bool:
+    """Return whether a grapple pattern is the paired Break Issen finisher."""
+    action_guids = {phase.action_guid for phase in pattern.player_phases}
+    return {
+        _BREAK_ISSEN_COMBO_ADJUST_GUID,
+        _BREAK_ISSEN_COMBO_CONST_GUID,
+    }.issubset(action_guids)
+
+
+def _break_issen_combo_patterns(
+    document: IssenDocument,
+) -> tuple[IssenPattern, ...]:
+    """Return COMMON_PAT_10/11/12 in the runtime combo order."""
+    by_value = {
+        int(pattern.pattern_value): pattern
+        for pattern in document.patterns
+        if _is_break_issen_combo_pattern(pattern)
+    }
+    return tuple(
+        by_value[value]
+        for value in _BREAK_ISSEN_COMBO_PATTERN_VALUES
+        if value in by_value
+    )
+
+
+def _break_issen_next_turn_phase(
+    target_number: int,
+    direction: str = "F",
+) -> IssenMotionPhase:
+    """Return one verified directional NextTurn motion for a chained target."""
+    if not 1 <= int(target_number) <= len(_BREAK_ISSEN_NEXT_TURN_MOTIONS):
+        raise ValueError(f"Break Issen target number is out of range: {target_number}")
+    normalized_direction = str(direction).strip().upper()
+    try:
+        direction_index = _BREAK_ISSEN_DIRECTIONS.index(normalized_direction)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported Break Issen direction: {direction!r}"
+        ) from exc
+    group_set_id, motion_id = _BREAK_ISSEN_NEXT_TURN_MOTIONS[
+        int(target_number) - 1
+    ][direction_index]
+    ordinal = ("1st", "2nd", "3rd")[int(target_number) - 1]
+    action_name = f"Chain Break Issen {ordinal} Move {normalized_direction} Start"
+    return IssenMotionPhase(
+        label="Next Turn",
+        action_name=action_name,
+        action_guid="",
+        motion_group_id=group_set_id,
+        reference=InteractionMotionRef(
+            group_set_id,
+            _BREAK_ISSEN_MOTION_BANK_ID,
+            motion_id,
+        ),
+    )
+
+
+def _bind_break_issen_enemy_motion(
+    player: tuple[IssenMotionPhase, ...],
+    enemy: tuple[IssenMotionPhase, ...],
+) -> tuple[IssenMotionPhase, ...]:
+    """Bind the generic enemy death action to the paired player Const group.
+
+    Break Issen Combo enemy actions select their concrete motion from the
+    current grapple pattern at runtime, so their serialized action entry has no
+    MotionGroupID of its own.  The matching enemy MEX contains the same group
+    ID as the player's Const phase; carrying that ID across reproduces the
+    engine's runtime selection without guessing a motion number.
+    """
+    const_phase = next(
+        (
+            phase
+            for phase in reversed(player)
+            if phase.action_guid == _BREAK_ISSEN_COMBO_CONST_GUID
+            and phase.motion_group_id != _INVALID_MOTION_GROUP_ID
+        ),
+        None,
+    )
+    if const_phase is None:
+        return enemy
+    group_id = const_phase.motion_group_id
+    inherited = InteractionMotionRef(group_id, group_id >> 44, None)
+    return tuple(
+        replace(phase, motion_group_id=group_id, reference=inherited)
+        if phase.motion_group_id == _INVALID_MOTION_GROUP_ID
+        else phase
+        for phase in enemy
+    )
+
+
 def _issen_pattern_title(source_path: str, index: int, phase_count: int) -> str:
     lowered = str(source_path).replace("\\", "/").casefold()
     if "blowgrap" in lowered:
@@ -456,14 +703,20 @@ def parse_wots_issen_document(rsz, source_path: str = "") -> IssenDocument:
             _issen_phase(rsz, instance_id, f"Enemy Phase {phase_index + 1}")
             for phase_index, instance_id in enumerate(enemy_ids)
         )
-        patterns.append(IssenPattern(
+        pattern = IssenPattern(
             index=index,
             title=_issen_pattern_title(source_path, index, len(player)),
             grapple_type=int(_scalar(_field(rsz, list_id, "_GrappleType"))),
             pattern_value=int(_scalar(_field(rsz, list_id, "_Pattern"))),
             player_phases=player,
             enemy_phases=enemy,
-        ))
+        )
+        if _is_break_issen_combo_pattern(pattern):
+            pattern = replace(
+                pattern,
+                enemy_phases=_bind_break_issen_enemy_motion(player, enemy),
+            )
+        patterns.append(pattern)
     return IssenDocument(str(source_path), tuple(patterns))
 
 
@@ -815,9 +1068,9 @@ def preferred_motion_bank_candidate(
         basename = path.rsplit("/", 1)[-1]
         looks_player = "/motion/player/" in path or basename.startswith("plw_")
         looks_enemy = "/motion/enemy/" in path and not basename.startswith("plw_")
-        if normalized_role == "player":
+        if normalized_role.startswith("player"):
             return 0 if looks_player else 1
-        if normalized_role == "enemy":
+        if normalized_role.startswith("enemy"):
             return 0 if looks_enemy else 1
         return 0
 
@@ -917,6 +1170,179 @@ def _load_wots_rsz_resource(handler, resource_path: str, parent=None):
         return parsed
     except (OSError, TypeError, ValueError):
         return None
+
+
+def _first_guid_below(rsz, root_id: int) -> str:
+    pending = [int(root_id)]
+    visited: set[int] = set()
+    while pending:
+        instance_id = pending.pop(0)
+        if instance_id <= 0 or instance_id in visited:
+            continue
+        visited.add(instance_id)
+        for value in rsz.parsed_elements.get(instance_id, {}).values():
+            if hasattr(value, "guid_str"):
+                guid = _guid_key(value)
+                if guid and guid != "0" * 32:
+                    return guid
+            pending.extend(_referenced_object_ids(value))
+    return ""
+
+
+def parse_wots_next_action_guid_map(rsz) -> dict[int, str]:
+    """Resolve JustGuard NEXT_ACT_TYPE values to requested FullBody GUIDs.
+
+    WOTS stores this dispatch in the actor ACTION BTable.  A branch normally
+    requests the action directly; ACT_25 in Em100 jumps to a small helper
+    table first, so local table jumps are followed as well.
+    """
+    if _root_type_name(rsz) != "ace.btable.user_data.BTable":
+        return {}
+    root_id = int(rsz.object_table[0])
+    table_container = _object_id(_field(rsz, root_id, "_Tables"))
+    table_ids = _object_ids(_field(rsz, table_container, "_DataArray"))
+    table_rows = {
+        _guid_key(_field(rsz, table_id, "_Guid")): _object_ids(
+            _field(rsz, table_id, "_Rows")
+        )
+        for table_id in table_ids
+    }
+
+    def requested_guid(rows: tuple[int, ...], row_index: int) -> str:
+        if not 0 <= row_index < len(rows):
+            return ""
+        row_fields = rsz.parsed_elements.get(rows[row_index], {})
+        command_id = _object_id(row_fields.get("_CommandArgument"))
+        command_type = _instance_type_name(rsz, command_id)
+        if command_type.endswith("cRequestFullBodyActionArg"):
+            return _first_guid_below(rsz, command_id)
+        operator_id = _object_id(row_fields.get("_OperatorArgument"))
+        operator_type = _instance_type_name(rsz, operator_id)
+        if "OperatorArgumentJump" in operator_type:
+            target_guid = _first_guid_below(rsz, operator_id)
+            target_rows = table_rows.get(target_guid, ())
+            for target_index in range(min(3, len(target_rows))):
+                guid = requested_guid(target_rows, target_index)
+                if guid:
+                    return guid
+        return ""
+
+    result: dict[int, str] = {}
+    for rows in table_rows.values():
+        for row_index, row_id in enumerate(rows):
+            fields = rsz.parsed_elements.get(row_id, {})
+            command_id = _object_id(fields.get("_CommandArgument"))
+            if not _instance_type_name(rsz, command_id).endswith(
+                "cCheckJustGuardAfterActionTypeArg"
+            ):
+                continue
+            check_method = _object_id(_field(rsz, command_id, "_CheckMethod"))
+            action_type = int(_scalar(_field(rsz, check_method, "_Value"), 0))
+            guid = requested_guid(rows, row_index + 1)
+            if action_type > 0 and guid:
+                result[action_type] = guid
+    return result
+
+
+def _enemy_action_btable_resource(source_path: str) -> str:
+    parts = str(source_path).replace("\\", "/").split("/")
+    lowered = [part.casefold() for part in parts]
+    try:
+        enemy_index = next(
+            index
+            for index, part in enumerate(lowered[:-2])
+            if part == "enemy" and index > 0 and lowered[index - 1] == "action"
+        )
+    except StopIteration:
+        return ""
+    actor = parts[enemy_index + 1]
+    variant = parts[enemy_index + 2]
+    actor_stem = actor[:1].upper() + actor[1:]
+    return (
+        f"natives/stm/GameDesign/Action/Enemy/{actor}/{variant}/Btable/"
+        f"{actor_stem}_{variant}_ACTION.user"
+    )
+
+
+def resolve_wots_justguard_next_actions(
+    handler,
+    document: InteractionDocument,
+    parent=None,
+) -> InteractionDocument:
+    """Attach statically verifiable post-grapple enemy actions to reactions."""
+    requested_types = {
+        reaction.next_action_type
+        for reaction in document.reactions
+        if reaction.next_action_type > 0
+    }
+    if not requested_types:
+        return document
+    btable_path = _enemy_action_btable_resource(document.source_path)
+    btable = _load_wots_rsz_resource(handler, btable_path, parent) if btable_path else None
+    guid_map = parse_wots_next_action_guid_map(btable) if btable is not None else {}
+
+    action_map = {}
+    for id_path, param_path in _enemy_action_resource_pairs(document.source_path):
+        action_ids = _load_wots_rsz_resource(handler, id_path, parent)
+        action_params = _load_wots_rsz_resource(handler, param_path, parent)
+        if action_ids is None or action_params is None:
+            continue
+        action_map.update(parse_wots_action_motion_map(action_ids, action_params))
+
+    def resolved(reaction: InteractionReaction) -> InteractionReaction:
+        action_type = int(reaction.next_action_type)
+        if action_type <= 0:
+            return reaction
+        guid = guid_map.get(action_type, "")
+        binding = action_map.get(guid)
+        if not guid:
+            diagnostic = (
+                f"ACT_{action_type:02d} has no static FullBody branch in the "
+                "owning ACTION BTable."
+            )
+            transition = InteractionNextAction(
+                action_type,
+                "",
+                "Runtime-selected action",
+                _INVALID_MOTION_GROUP_ID,
+                InteractionMotionRef(_INVALID_MOTION_GROUP_ID, None, None),
+                diagnostic=diagnostic,
+            )
+        elif binding is None:
+            transition = InteractionNextAction(
+                action_type,
+                guid,
+                "Unresolved FullBody action",
+                _INVALID_MOTION_GROUP_ID,
+                InteractionMotionRef(_INVALID_MOTION_GROUP_ID, None, None),
+                diagnostic=f"Action GUID {guid} was not found in the owning ActionParam.",
+            )
+        else:
+            action_name, groups = binding
+            group_id = int(groups[0]) if groups else _INVALID_MOTION_GROUP_ID
+            reference = (
+                InteractionMotionRef(group_id, group_id >> 44, None)
+                if group_id != _INVALID_MOTION_GROUP_ID
+                else InteractionMotionRef(group_id, None, None)
+            )
+            transition = InteractionNextAction(
+                action_type,
+                guid,
+                action_name,
+                group_id,
+                reference,
+                diagnostic=(
+                    "Action uses the previous motion at runtime."
+                    if group_id == _INVALID_MOTION_GROUP_ID
+                    else ""
+                ),
+            )
+        return replace(reaction, next_action=transition)
+
+    return replace(
+        document,
+        reactions=tuple(resolved(reaction) for reaction in document.reactions),
+    )
 
 
 def resolve_wots_grapple_action_phases(
@@ -1053,7 +1479,12 @@ def interaction_property_rows(
     group_banks = ", ".join(
         str(value >> 44) for value in reaction.trigger_groups
     )
-    return (
+    action_type = (
+        "NONE"
+        if reaction.next_action_type == 0
+        else f"ACT_{reaction.next_action_type:02d}"
+    )
+    rows = [
         ("Evidence", "Verified resource chain; runtime transition is simulated"),
         ("Attacker", document.attacker_role),
         ("Defender", document.defender_role),
@@ -1076,12 +1507,27 @@ def interaction_property_rows(
         ("Attacker Motion", reaction.attacker_motion.label),
         ("Defender Start Motion", reaction.defender_start_motion.label),
         ("Defender Motion", reaction.defender_motion.label),
-        (
-            "NextActionType",
-            "NONE" if reaction.next_action_type == 0 else f"ACT_{reaction.next_action_type:02d}",
-        ),
+        ("NextActionType", action_type),
         ("RikidoBreakDataId", str(reaction.rikido_break_data_id)),
-    )
+    ]
+    transition = reaction.next_action
+    if transition is not None:
+        rows.extend((
+            ("Next Action Class", transition.action_name),
+            ("Next Action GUID", transition.action_guid or "Runtime-selected"),
+            (
+                "Next Action MotionGroupID",
+                (
+                    f"0x{transition.motion_group_id:016X}"
+                    if transition.motion_group_id != _INVALID_MOTION_GROUP_ID
+                    else "Not serialized"
+                ),
+            ),
+            ("Next Action Motion", transition.reference.label),
+        ))
+        if transition.diagnostic:
+            rows.append(("Next Action Diagnostic", transition.diagnostic))
+    return tuple(rows)
 
 
 class InteractionTimeline(QWidget):
@@ -1718,11 +2164,14 @@ class _ActorMotionPane(QWidget):
         self,
         labels: tuple[str, ...],
         start_frames: tuple[float, ...] | None = None,
+        *,
+        preserve_root_continuity: bool = True,
     ) -> None:
         starts = tuple(float(value) for value in start_frames or ())
         signature = (
             self._loaded_path,
             starts,
+            bool(preserve_root_continuity),
             tuple(
                 (label, ref.set_id, ref.bank_id, ref.motion_id)
                 for label, ref in self._references
@@ -1751,10 +2200,14 @@ class _ActorMotionPane(QWidget):
             root_end = self._root_translation()
             correction = (
                 np.zeros(3, dtype=np.float32)
-                if corrected_end is None
+                if corrected_end is None or not preserve_root_continuity
                 else corrected_end - root_start
             )
-            corrected_end = root_end + correction
+            corrected_end = (
+                root_end + correction
+                if preserve_root_continuity
+                else None
+            )
             segments.append(_MotionSegment(
                 label,
                 reference,
@@ -1799,6 +2252,13 @@ class _ActorMotionPane(QWidget):
             self._segment_correction
             + np.asarray(translation, dtype=np.float32).reshape(3)
         )
+
+    def set_world_transform(self, transform) -> None:
+        """Apply a complete row-vector world transform to this actor."""
+        value = np.asarray(transform, dtype=np.float32).reshape(4, 4)
+        if not np.isfinite(value).all():
+            raise ValueError("actor world transform must contain finite values")
+        self._world_transform = value.copy()
 
     def render_prepared_frame(self) -> None:
         if self._preview is not None:
@@ -1879,11 +2339,12 @@ class _ActorMotionPane(QWidget):
             preview.play_pause_shortcut.setEnabled(False)
             preview.attack_hitboxes_toggle.setChecked(False)
             preview.bone_names_toggle.setChecked(False)
+            normalized_role = self.role.casefold()
             preset_key = (
                 "wots_ch001_00"
-                if self.role.casefold() == "player"
+                if normalized_role.startswith("player")
                 else "wots_em101_00"
-                if self.role.casefold() == "enemy"
+                if normalized_role.startswith("enemy")
                 else ""
             )
             preset_index = preview.model_preset_combo.findData(preset_key)
@@ -1927,6 +2388,25 @@ class WotsInteractionPreviewWidget(QWidget):
         self._frame = 0.0
         self._attacker_start = 0.0
         self._defender_start = 0.0
+        self._next_action_start = 0.0
+        self._next_action_role = ""
+        self._next_action_label = ""
+        self._next_action_transition: InteractionNextAction | None = None
+        self._player_followup_start = 0.0
+        self._player_followup_role = ""
+        self._player_followup_label = ""
+        self._player_followup_labels: tuple[str, ...] = ()
+        self._player_followup_transition: InteractionNextAction | None = None
+        self._multiple_parry_active = False
+        self._multiple_enemy_role = (
+            "attacker" if self.document.attacker_role == "Enemy" else "defender"
+        )
+        self._multiple_target_offset = np.array(
+            (0.0, 0.0, 2.5),
+            dtype=np.float32,
+        )
+        self._configuring_content = False
+        self._mex_maps: dict[str, tuple[dict[int, int], str]] = {}
         self._playing = False
         self._elapsed = QElapsedTimer()
         self._timer = QTimer(self)
@@ -1940,6 +2420,11 @@ class WotsInteractionPreviewWidget(QWidget):
                 reaction.attacker_motion,
                 reaction.defender_motion,
                 reaction.defender_start_motion,
+                *(
+                    (reaction.next_action.reference,)
+                    if reaction.next_action is not None
+                    else ()
+                ),
             )
             if ref.bank_id is not None
         }
@@ -1949,6 +2434,38 @@ class WotsInteractionPreviewWidget(QWidget):
             getattr(handler, "resource_context", None),
         )
         self._build_ui()
+        actors = self.attacker.parentWidget()
+        next_actor_key = (
+            "attacker" if self.document.attacker_role == "Enemy" else "defender"
+        )
+        self.next_action = _ActorMotionPane(
+            self.handler,
+            "Enemy Next Action",
+            self._scene_host.viewport_factory(next_actor_key),
+            parent=actors,
+        )
+        self.next_action.motion_loaded.connect(self._motion_loaded)
+        self.next_action.hide()
+        player_actor_key = (
+            "attacker" if self.document.attacker_role == "Player" else "defender"
+        )
+        self.player_followup = _ActorMotionPane(
+            self.handler,
+            "Player Follow-up",
+            self._scene_host.viewport_factory(player_actor_key),
+            parent=actors,
+        )
+        self.player_followup.motion_loaded.connect(self._motion_loaded)
+        self.player_followup.hide()
+        self.multiple_enemy = _ActorMotionPane(
+            self.handler,
+            "Enemy Nearby",
+            self._scene_host.viewport_factory("multiple_enemy"),
+            parent=actors,
+        )
+        self.multiple_enemy.motion_loaded.connect(self._motion_loaded)
+        actors.addWidget(self.multiple_enemy)
+        self.multiple_enemy.hide()
         self._populate_reactions()
 
     def _build_ui(self) -> None:
@@ -2020,6 +2537,26 @@ class WotsInteractionPreviewWidget(QWidget):
         preview_layout.addWidget(self.timeline)
 
         controls = QHBoxLayout()
+        if isinstance(self.document, InteractionDocument):
+            controls.addWidget(QLabel(self.tr("Player Follow-up"), preview_area))
+            self.player_followup_combo = QComboBox(preview_area)
+            self.player_followup_combo.addItem(
+                self.tr("No Input · Hold End Pose"),
+                None,
+            )
+            for transition in _player_justguard_followups():
+                self.player_followup_combo.addItem(
+                    transition.action_name,
+                    transition,
+                )
+            self.player_followup_combo.setToolTip(self.tr(
+                "Player follow-up is input-dependent and is not encoded by the "
+                "enemy NextActionType. Choose a branch to preview it."
+            ))
+            self.player_followup_combo.currentIndexChanged.connect(
+                self._on_player_followup_changed
+            )
+            controls.addWidget(self.player_followup_combo)
         self.play_button = QPushButton(self.tr("Play"), preview_area)
         self.play_button.clicked.connect(self.toggle_playback)
         controls.addWidget(self.play_button)
@@ -2100,6 +2637,136 @@ class WotsInteractionPreviewWidget(QWidget):
         if self._initial_reaction_item is not None and self.isVisible():
             self.reaction_tree.setCurrentItem(self._initial_reaction_item)
 
+    def _candidate_map(self, candidate: MotionBankCandidate) -> tuple[dict[int, int], str]:
+        key = candidate.resource_path.casefold()
+        cached = self._mex_maps.get(key)
+        if cached is None:
+            cached = load_wots_mex_motion_map(self.handler, candidate, self)
+            self._mex_maps[key] = cached
+        return cached
+
+    def _resolve_next_action(
+        self,
+        transition: InteractionNextAction | None,
+    ) -> InteractionNextAction | None:
+        if (
+            transition is None
+            or transition.reference.motion_id is not None
+            or transition.reference.bank_id is None
+        ):
+            return transition
+        candidates = self._bank_candidates.get(
+            int(transition.reference.bank_id),
+            (),
+        )
+        for candidate in candidates:
+            mapping, _message = self._candidate_map(candidate)
+            motion_id = mapping.get(transition.motion_group_id)
+            if motion_id is None:
+                continue
+            return replace(
+                transition,
+                reference=replace(transition.reference, motion_id=int(motion_id)),
+                resource_path=candidate.resource_path,
+            )
+        return replace(
+            transition,
+            diagnostic=(
+                transition.diagnostic
+                or f"MotionGroupID 0x{transition.motion_group_id:016X} was not found "
+                "in an adjacent MEX resource."
+            ),
+        )
+
+    def _configure_player_followup(self) -> None:
+        combo = getattr(self, "player_followup_combo", None)
+        pane = getattr(self, "player_followup", None)
+        multiple_enemy = getattr(self, "multiple_enemy", None)
+        if combo is None or pane is None:
+            return
+        transition = combo.currentData()
+        if not isinstance(transition, InteractionNextAction):
+            self._player_followup_transition = None
+            self._player_followup_label = ""
+            self._player_followup_labels = ()
+            self._multiple_parry_active = False
+            pane.configure_sequence(())
+            if multiple_enemy is not None:
+                multiple_enemy.set_content((), ())
+                multiple_enemy.hide()
+            return
+        self._player_followup_transition = transition
+        self._multiple_parry_active = transition.preview_kind == "multiple_parry"
+        self._player_followup_label = f"Player Follow-up · {transition.action_name}"
+        if self._multiple_parry_active and self._current_reaction is not None:
+            reaction = self._current_reaction
+            player_references = (
+                (
+                    ("Multiple Parry · ADJUST", reaction.defender_start_motion),
+                    ("Multiple Parry · JUST_GUARD", reaction.defender_motion),
+                )
+                if self.document.defender_role == "Player"
+                else (("Multiple Parry · JUST_GUARD", reaction.attacker_motion),)
+            )
+            player_references = tuple(
+                item for item in player_references if item[1].available
+            )
+            self._player_followup_labels = tuple(
+                label for label, _reference in player_references
+            )
+            player_bank_ids = {
+                int(reference.bank_id)
+                for _label, reference in player_references
+                if reference.bank_id is not None
+            }
+            player_candidates = tuple(dict.fromkeys(
+                candidate
+                for bank_id in player_bank_ids
+                for candidate in self._bank_candidates.get(bank_id, ())
+            ))
+            pane.set_content(player_references, player_candidates)
+        else:
+            self._player_followup_labels = (self._player_followup_label,)
+            pane.set_content(
+                ((self._player_followup_label, transition.reference),),
+                (
+                    MotionBankCandidate(
+                        int(transition.reference.bank_id),
+                        transition.resource_path,
+                    ),
+                ),
+            )
+        if multiple_enemy is None:
+            return
+        if not self._multiple_parry_active or self._current_reaction is None:
+            multiple_enemy.set_content((), ())
+            multiple_enemy.hide()
+            return
+        reaction = self._current_reaction
+        enemy_reference = (
+            reaction.attacker_motion
+            if self.document.attacker_role == "Enemy"
+            else reaction.defender_motion
+        )
+        candidates = self._bank_candidates.get(
+            int(enemy_reference.bank_id or -1),
+            (),
+        )
+        multiple_enemy.set_content(
+            (("Nearby Enemy · Reaction", enemy_reference),),
+            candidates,
+        )
+        multiple_enemy.show()
+
+    def _on_player_followup_changed(self, _index: int) -> None:
+        if not hasattr(self, "player_followup"):
+            return
+        self.stop_playback()
+        self._configuring_content = True
+        self._configure_player_followup()
+        self._configuring_content = False
+        self._motion_loaded()
+
     def _on_reaction_changed(self, current, _previous) -> None:
         index = current.data(0, _ROLE) if current is not None else None
         if not isinstance(index, int) or not (0 <= index < len(self.document.reactions)):
@@ -2107,7 +2774,21 @@ class WotsInteractionPreviewWidget(QWidget):
         self.stop_playback()
         reaction = self.document.reactions[index]
         self._current_reaction = reaction
-        self._set_details(interaction_property_rows(self.document, reaction))
+        transition = self._resolve_next_action(reaction.next_action)
+        resolved_reaction = replace(reaction, next_action=transition)
+        self._set_details(interaction_property_rows(self.document, resolved_reaction))
+        self._next_action_transition = transition
+        self._next_action_role = (
+            "attacker" if self.document.attacker_role == "Enemy" else "defender"
+        )
+        self._player_followup_role = (
+            "attacker" if self.document.attacker_role == "Player" else "defender"
+        )
+        self._next_action_label = (
+            f"Next Action · {transition.action_name}"
+            if transition is not None and transition.reference.available
+            else ""
+        )
         attacker_candidates = self._bank_candidates.get(
             int(reaction.attacker_motion.bank_id or -1),
             (),
@@ -2122,6 +2803,31 @@ class WotsInteractionPreviewWidget(QWidget):
             for bank_id in defender_bank_ids
             for candidate in self._bank_candidates.get(bank_id, ())
         ))
+        next_candidates = (
+            (
+                MotionBankCandidate(
+                    int(transition.reference.bank_id),
+                    transition.resource_path,
+                ),
+            )
+            if transition is not None
+            and transition.reference.available
+            and transition.reference.bank_id is not None
+            and transition.resource_path
+            else ()
+        )
+        self._configuring_content = True
+        if self._next_action_label and transition is not None:
+            self.next_action.set_content(
+                ((self._next_action_label, transition.reference),),
+                next_candidates,
+            )
+        else:
+            # This pane shares the enemy scene namespace with the normal
+            # interaction pane.  Keep its cached preview alive so clearing it
+            # cannot remove the visible enemy mesh while changing reactions.
+            self.next_action.configure_sequence(())
+        self._configure_player_followup()
         self.attacker.set_content(
             (("Main", reaction.attacker_motion),),
             attacker_candidates,
@@ -2133,6 +2839,7 @@ class WotsInteractionPreviewWidget(QWidget):
             ),
             defender_candidates,
         )
+        self._configuring_content = False
         self._frame = 0.0
         self._motion_loaded()
 
@@ -2144,6 +2851,8 @@ class WotsInteractionPreviewWidget(QWidget):
         self.details.resizeRowsToContents()
 
     def _motion_loaded(self) -> None:
+        if self._configuring_content:
+            return
         reaction = self._current_reaction
         trigger = reaction.trigger_frame if reaction else 0
         self.attacker.configure_sequence(("Main",))
@@ -2153,6 +2862,80 @@ class WotsInteractionPreviewWidget(QWidget):
         self.defender.configure_sequence(("Main",))
         attacker_duration = self.attacker.sequence_duration
         defender_duration = self.defender.sequence_duration
+        self.next_action.configure_sequence(
+            (self._next_action_label,) if self._next_action_label else ()
+        )
+        self._next_action_start = max(attacker_duration, defender_duration)
+        self.player_followup.configure_sequence(
+            self._player_followup_labels
+        )
+        self._player_followup_start = self._next_action_start
+        adjust_duration = (
+            self.player_followup.sequence_segments[0].duration
+            if self._multiple_parry_active
+            and len(self.player_followup.sequence_segments) > 1
+            else 0.0
+        )
+        self.multiple_enemy.configure_sequence(
+            ("Nearby Enemy · Reaction",) if self._multiple_parry_active else (),
+            (adjust_duration,) if self._multiple_parry_active else (),
+        )
+        next_duration = self.next_action.sequence_duration
+        player_followup_duration = self.player_followup.sequence_duration
+        multiple_enemy_duration = self.multiple_enemy.sequence_duration
+        attacker_segments = [("Main", 0.0, attacker_duration)]
+        defender_segments = [("Main", 0.0, defender_duration)]
+        if next_duration > 0.0:
+            segment = (
+                self._next_action_label,
+                self._next_action_start,
+                self._next_action_start + next_duration,
+            )
+            if self._next_action_role == "attacker":
+                attacker_segments.append(segment)
+                attacker_duration = segment[2]
+            else:
+                defender_segments.append(segment)
+                defender_duration = segment[2]
+        if self._multiple_parry_active:
+            for motion_segment in self.player_followup.sequence_segments:
+                segment = (
+                    motion_segment.label,
+                    self._player_followup_start + motion_segment.start,
+                    self._player_followup_start
+                    + motion_segment.start
+                    + motion_segment.duration,
+                )
+                if self._player_followup_role == "attacker":
+                    attacker_segments.append(segment)
+                    attacker_duration = max(attacker_duration, segment[2])
+                else:
+                    defender_segments.append(segment)
+                    defender_duration = max(defender_duration, segment[2])
+        elif player_followup_duration > 0.0:
+            segment = (
+                self._player_followup_label,
+                self._player_followup_start,
+                self._player_followup_start + player_followup_duration,
+            )
+            if self._player_followup_role == "attacker":
+                attacker_segments.append(segment)
+                attacker_duration = max(attacker_duration, segment[2])
+            else:
+                defender_segments.append(segment)
+                defender_duration = max(defender_duration, segment[2])
+        if multiple_enemy_duration > 0.0:
+            segment = (
+                "Multiple Parry · Nearby Enemy",
+                self._player_followup_start + adjust_duration,
+                self._player_followup_start + multiple_enemy_duration,
+            )
+            if self._multiple_enemy_role == "attacker":
+                attacker_segments.append(segment)
+                attacker_duration = max(attacker_duration, segment[2])
+            else:
+                defender_segments.append(segment)
+                defender_duration = max(defender_duration, segment[2])
         self._attacker_start = 0.0
         self._defender_start = 0.0
         self.timeline.configure(
@@ -2161,6 +2944,8 @@ class WotsInteractionPreviewWidget(QWidget):
             trigger,
             attacker_start=self._attacker_start,
             defender_start=self._defender_start,
+            attacker_segments=tuple(attacker_segments),
+            defender_segments=tuple(defender_segments),
         )
         end = self.timeline.end_frame
         with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
@@ -2210,8 +2995,59 @@ class WotsInteractionPreviewWidget(QWidget):
         defender_anchor[1] = -defender_root[1]
         self.attacker.set_anchor_translation(attacker_anchor)
         self.defender.set_anchor_translation(defender_anchor)
-        self.attacker.render_prepared_frame()
-        self.defender.render_prepared_frame()
+        actor_panes = {
+            "attacker": self.attacker,
+            "defender": self.defender,
+        }
+
+        def activate_followup(pane, start_frame: float, role: str) -> None:
+            if (
+                pane is None
+                or not pane.sequence_segments
+                or self._frame < start_frame
+            ):
+                return
+            followup_root = pane.prepare_sequence_frame(self._frame, start_frame)
+            main_root = attacker_root if role == "attacker" else defender_root
+            main_anchor = attacker_anchor if role == "attacker" else defender_anchor
+            action_start = pane.sequence_segments[0].root_start
+            world_start = main_root + main_anchor
+            pane.set_anchor_translation(np.array((
+                world_start[0] - action_start[0],
+                -followup_root[1],
+                world_start[2] - action_start[2],
+            ), dtype=np.float32))
+            actor_panes[role] = pane
+
+        activate_followup(
+            getattr(self, "next_action", None),
+            self._next_action_start,
+            self._next_action_role,
+        )
+        activate_followup(
+            getattr(self, "player_followup", None),
+            self._player_followup_start,
+            self._player_followup_role,
+        )
+        if self._multiple_parry_active and self.multiple_enemy.sequence_segments:
+            nearby_root = self.multiple_enemy.prepare_sequence_frame(
+                self._frame,
+                self._player_followup_start,
+            )
+            player_role = self._player_followup_role
+            player_root = attacker_root if player_role == "attacker" else defender_root
+            player_anchor = (
+                attacker_anchor if player_role == "attacker" else defender_anchor
+            )
+            target = player_root + player_anchor + self._multiple_target_offset
+            self.multiple_enemy.set_anchor_translation(np.array((
+                target[0] - nearby_root[0],
+                -nearby_root[1],
+                target[2] - nearby_root[2],
+            ), dtype=np.float32))
+            self.multiple_enemy.render_prepared_frame()
+        actor_panes["attacker"].render_prepared_frame()
+        actor_panes["defender"].render_prepared_frame()
 
     def toggle_playback(self) -> None:
         if self._playing:
@@ -2242,6 +3078,15 @@ class WotsInteractionPreviewWidget(QWidget):
 
     def cleanup(self) -> None:
         self.stop_playback()
+        next_pane = getattr(self, "next_action", None)
+        if next_pane is not None:
+            next_pane.cleanup()
+        player_followup = getattr(self, "player_followup", None)
+        if player_followup is not None:
+            player_followup.cleanup()
+        multiple_enemy = getattr(self, "multiple_enemy", None)
+        if multiple_enemy is not None:
+            multiple_enemy.cleanup()
         self.attacker.cleanup()
         self.defender.cleanup()
         self.viewport.cleanup()
@@ -2273,7 +3118,17 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         self._mex_maps: dict[str, tuple[dict[int, int], str]] = {}
         self._resolution_messages: list[str] = []
         self._player_labels: tuple[str, ...] = ()
+        self._player_transition_labels: tuple[str, ...] = ()
         self._enemy_labels: tuple[str, ...] = ()
+        self._enemy2_labels: tuple[str, ...] = ()
+        self._combo_target_count = 1
+        self._combo_player_phase_counts = (0, 0)
+        self._combo_first_end = 0.0
+        self._combo_second_start = 0.0
+        self._combo_first_target = np.zeros(3, dtype=np.float32)
+        self._combo_second_target = np.zeros(3, dtype=np.float32)
+        self._combo_transition_transform = np.identity(4, dtype=np.float32)
+        self._configuring_content = False
         bank_ids = {
             int(phase.reference.bank_id)
             for pattern in document.patterns
@@ -2294,11 +3149,37 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             "action GUID links; runtime state transitions are simulated."
         )
         self._build_ui()
+        actors = self.attacker.parentWidget()
+        self.enemy2 = _ActorMotionPane(
+            self.handler,
+            "Enemy 2",
+            self._scene_host.viewport_factory("enemy2"),
+            parent=actors,
+        )
+        self.enemy2.motion_loaded.connect(self._motion_loaded)
+        # The transition lives in the global plw_Issen MOTLIST rather than the
+        # enemy-specific paired-motion bank.  It renders through the same
+        # actor namespace as the normal player pane, so only one player model
+        # is present in the shared scene.
+        self.player_transition = _ActorMotionPane(
+            self.handler,
+            "Player Transition",
+            self._scene_host.viewport_factory("attacker"),
+            parent=actors,
+        )
+        self.player_transition.motion_loaded.connect(self._motion_loaded)
+        self.player_transition.hide()
+        if isinstance(actors, QSplitter):
+            actors.addWidget(self.enemy2)
+            actors.setSizes([700, 700, 700])
+        self.enemy2.hide()
         pattern_header = "Issen Pattern" if is_issen else "Grapple Pattern"
         self.reaction_tree.setHeaderLabels((self.tr(pattern_header), self.tr("Value")))
         self._populate_reactions()
 
     def _populate_reactions(self) -> None:
+        combo_patterns = _break_issen_combo_patterns(self.document)
+        combo_start_index = combo_patterns[0].index if len(combo_patterns) >= 2 else -1
         for index, pattern in enumerate(self.document.patterns):
             item = QTreeWidgetItem((
                 pattern.title,
@@ -2306,7 +3187,17 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
                 f"{len(pattern.enemy_phases)} enemy phases",
             ))
             item.setData(0, _ROLE, index)
+            item.setData(0, _TARGET_COUNT_ROLE, 1)
             self.reaction_tree.addTopLevelItem(item)
+            if index == combo_start_index:
+                combo = QTreeWidgetItem((
+                    "Break Issen Combo · 2 Targets",
+                    "COMMON_PAT_10 → COMMON_PAT_11",
+                ))
+                combo.setData(0, _ROLE, index)
+                combo.setData(0, _TARGET_COUNT_ROLE, 2)
+                item.addChild(combo)
+                item.setExpanded(True)
         if self.reaction_tree.topLevelItemCount():
             self._initial_reaction_item = self.reaction_tree.topLevelItem(0)
 
@@ -2402,28 +3293,152 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         if not isinstance(index, int) or not (0 <= index < len(self.document.patterns)):
             return
         self.stop_playback()
+        self._combo_target_count = int(
+            current.data(0, _TARGET_COUNT_ROLE) or 1
+        )
         self._resolution_messages.clear()
         pattern = self.document.patterns[index]
         player = tuple(self._resolve_phase(phase, "Player") for phase in pattern.player_phases)
         enemy = tuple(self._resolve_phase(phase, "Enemy") for phase in pattern.enemy_phases)
+        followup_pattern = None
+        followup_player: tuple[IssenMotionPhase, ...] = ()
+        followup_enemy: tuple[IssenMotionPhase, ...] = ()
         self._current_reaction = pattern
-        player_refs = tuple(
-            (f"{phase_index}. {phase.action_name}", phase.reference)
-            for phase_index, phase in enumerate(player, 1)
-        )
-        enemy_refs = tuple(
-            (f"{phase_index}. {phase.action_name}", phase.reference)
-            for phase_index, phase in enumerate(enemy, 1)
-        )
+        if self._combo_target_count > 1:
+            combo_patterns = _break_issen_combo_patterns(self.document)
+            combo_index = next(
+                (
+                    item_index
+                    for item_index, item in enumerate(combo_patterns)
+                    if item.index == pattern.index
+                ),
+                -1,
+            )
+            if not 0 <= combo_index < len(combo_patterns) - 1:
+                self._combo_target_count = 1
+                self._on_reaction_changed(
+                    self.reaction_tree.topLevelItem(index),
+                    current,
+                )
+                return
+            followup_pattern = combo_patterns[combo_index + 1]
+            followup_player = tuple(
+                self._resolve_phase(phase, "Player Target 2")
+                for phase in followup_pattern.player_phases
+            )
+            followup_enemy = tuple(
+                self._resolve_phase(phase, "Enemy Target 2")
+                for phase in followup_pattern.enemy_phases
+            )
+            transition = _break_issen_next_turn_phase(1, "F")
+            player_refs = tuple(
+                (
+                    f"Target 1 · {phase_index}. {phase.action_name}",
+                    phase.reference,
+                )
+                for phase_index, phase in enumerate(player, 1)
+            ) + tuple(
+                (
+                    f"Target 2 · {phase_index}. {phase.action_name}",
+                    phase.reference,
+                )
+                for phase_index, phase in enumerate(followup_player, 1)
+            )
+            enemy_refs = tuple(
+                (f"Target 1 · {phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(enemy, 1)
+            )
+            enemy2_refs = tuple(
+                (f"Target 2 · {phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(followup_enemy, 1)
+            )
+            transition_refs = ((transition.action_name, transition.reference),)
+            self._combo_player_phase_counts = (len(player), len(followup_player))
+        else:
+            player_refs = tuple(
+                (f"{phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(player, 1)
+            )
+            enemy_refs = tuple(
+                (f"{phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(enemy, 1)
+            )
+            enemy2_refs = ()
+            transition_refs = ()
+            self._combo_player_phase_counts = (0, 0)
         self._player_labels = tuple(label for label, _ref in player_refs)
+        self._player_transition_labels = tuple(
+            label for label, _ref in transition_refs
+        )
         self._enemy_labels = tuple(label for label, _ref in enemy_refs)
-        self._set_details(self._pattern_rows(pattern, player, enemy))
-        self.attacker.set_content(player_refs, self._candidate_pool(player))
+        self._enemy2_labels = tuple(label for label, _ref in enemy2_refs)
+        rows = list(self._pattern_rows(pattern, player, enemy))
+        if self._combo_target_count > 1 and followup_pattern is not None:
+            rows.extend((
+                ("Preview Mode", "Break Issen Combo · 2 Targets"),
+                ("Entry", "Parry / synchronized Grapple"),
+                (
+                    "Target 1 Pattern",
+                    f"COMMON_PAT_10 · table index {pattern.index} · motions "
+                    + "/".join(
+                        str(phase.reference.motion_id)
+                        for phase in player
+                        if phase.reference.motion_id is not None
+                    ),
+                ),
+                (
+                    "Target 2 Pattern",
+                    f"COMMON_PAT_11 · table index {followup_pattern.index} · motions "
+                    + "/".join(
+                        str(phase.reference.motion_id)
+                        for phase in followup_player
+                        if phase.reference.motion_id is not None
+                    ),
+                ),
+                (
+                    "Target Select Window",
+                    f"up to {_BREAK_ISSEN_COMBO_DEFAULT_SELECT_FRAMES:.0f} frames (input limit; not playback duration)",
+                ),
+                (
+                    "Target 2 Transition",
+                    "NextTurn · ChainBreakIssen_1st_Move_F_Start · Bank 20031 / Motion 533",
+                ),
+            ))
+        self._set_details(tuple(rows))
+        self._configuring_content = True
+        self.player_transition.set_content(
+            transition_refs,
+            (
+                MotionBankCandidate(
+                    _BREAK_ISSEN_MOTION_BANK_ID,
+                    _BREAK_ISSEN_MOTLIST_PATH,
+                ),
+            ) if transition_refs else (),
+        )
+        self.attacker.set_content(
+            player_refs,
+            self._candidate_pool((*player, *followup_player)),
+        )
         self.defender.set_content(enemy_refs, self._candidate_pool(enemy))
+        self.enemy2.set_content(
+            enemy2_refs,
+            self._candidate_pool(followup_enemy),
+        )
+        self.enemy2.setVisible(self._combo_target_count > 1)
+        self._configuring_content = False
         self._frame = 0.0
         self._motion_loaded()
 
     def _motion_loaded(self) -> None:
+        if self._configuring_content:
+            return
+        if self._combo_target_count > 1:
+            self._configure_break_issen_combo()
+            return
+        self.timeline.set_role_labels(
+            self.document.attacker_role,
+            self.document.defender_role,
+        )
         self.attacker.configure_sequence(self._player_labels)
         self.defender.configure_sequence(self._enemy_labels)
         player_segments = self.attacker.sequence_segments
@@ -2481,6 +3496,219 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             self.frame_spin.setRange(0.0, end)
         self.set_frame(min(self._frame, end))
 
+    def _configure_break_issen_combo(self) -> None:
+        """Build a two-target sequence with the authored first NextTurn clip."""
+        self.timeline.set_role_labels("Player", "Enemy 1 / Enemy 2")
+        self.attacker.configure_sequence(
+            self._player_labels,
+            preserve_root_continuity=False,
+        )
+        self.player_transition.configure_sequence(
+            self._player_transition_labels,
+            preserve_root_continuity=False,
+        )
+        initial_segments = self.attacker.sequence_segments
+        first_phase_count, second_phase_count = self._combo_player_phase_counts
+        if (
+            first_phase_count <= 0
+            or second_phase_count <= 0
+            or len(initial_segments) < first_phase_count + second_phase_count
+        ):
+            return
+
+        first_durations = tuple(
+            segment.duration for segment in initial_segments[:first_phase_count]
+        )
+        first_starts = []
+        cursor = 0.0
+        for duration in first_durations:
+            first_starts.append(cursor)
+            cursor += duration
+        self._combo_first_end = cursor
+        transition_segments = self.player_transition.sequence_segments
+        transition_duration = sum(
+            segment.duration for segment in transition_segments
+        )
+        self._combo_second_start = self._combo_first_end + transition_duration
+        second_starts = []
+        cursor = self._combo_second_start
+        for segment in initial_segments[
+            first_phase_count:first_phase_count + second_phase_count
+        ]:
+            second_starts.append(cursor)
+            cursor += segment.duration
+        player_starts = tuple(first_starts) + tuple(second_starts)
+        self.attacker.configure_sequence(
+            self._player_labels,
+            player_starts,
+            preserve_root_continuity=False,
+        )
+
+        player_segments = self.attacker.sequence_segments
+        first_const_start = player_segments[first_phase_count - 1].start
+        second_const_start = player_segments[-1].start
+        self.defender.configure_sequence(
+            self._enemy_labels,
+            tuple(first_const_start for _label in self._enemy_labels),
+        )
+        self.enemy2.configure_sequence(
+            self._enemy2_labels,
+            tuple(second_const_start for _label in self._enemy2_labels),
+        )
+        enemy1_segments = self.defender.sequence_segments
+        enemy2_segments = self.enemy2.sequence_segments
+        self._combo_first_target = np.array((-1.3, 0.0, 0.0), dtype=np.float32)
+        self._combo_second_target = np.array((1.3, 0.0, 0.0), dtype=np.float32)
+        self._combo_transition_transform = np.identity(4, dtype=np.float32)
+        if enemy1_segments and enemy2_segments and transition_segments:
+            first_player_end = player_segments[first_phase_count - 1].root_end
+            second_player_start = player_segments[first_phase_count].root_start
+            first_enemy_end = enemy1_segments[-1].root_end
+            second_enemy_start = enemy2_segments[0].root_start
+            route_start = (
+                self._combo_first_target + first_player_end - first_enemy_end
+            )
+            route_start[1] = 0.0
+
+            transition = transition_segments[0]
+            delta = transition.root_end - transition.root_start
+            horizontal_length = math.hypot(float(delta[0]), float(delta[2]))
+            if horizontal_length > 1e-5:
+                # The preview lays targets out left-to-right. Rotate the
+                # authored local root path onto that world-space route without
+                # scaling it, preserving the clip's actual travel distance.
+                source_angle = math.atan2(float(delta[0]), float(delta[2]))
+                yaw = (math.pi * 0.5) - source_angle
+                cosine = math.cos(yaw)
+                sine = math.sin(yaw)
+                transform = np.identity(4, dtype=np.float32)
+                transform[0, 0] = cosine
+                transform[0, 2] = -sine
+                transform[2, 0] = sine
+                transform[2, 2] = cosine
+                transformed_start = transition.root_start @ transform[:3, :3]
+                transform[3, :3] = route_start - transformed_start
+                self._combo_transition_transform = transform
+                route_end = (
+                    transition.root_end @ transform[:3, :3]
+                    + transform[3, :3]
+                )
+                self._combo_second_target = (
+                    route_end - second_player_start + second_enemy_start
+                )
+                self._combo_second_target[1] = 0.0
+
+        player_timeline = [
+            (segment.label, segment.start, segment.start + segment.duration)
+            for segment in player_segments[:first_phase_count]
+        ]
+        player_timeline.extend(
+            (
+                f"Next Turn · {segment.label}",
+                self._combo_first_end + segment.start,
+                self._combo_first_end + segment.start + segment.duration,
+            )
+            for segment in transition_segments
+        )
+        player_timeline.extend(
+            (segment.label, segment.start, segment.start + segment.duration)
+            for segment in player_segments[first_phase_count:]
+        )
+        enemy_timeline = tuple(
+            (segment.label, segment.start, segment.start + segment.duration)
+            for segment in (
+                *self.defender.sequence_segments,
+                *self.enemy2.sequence_segments,
+            )
+        )
+        end = max(
+            self.attacker.sequence_duration,
+            self.defender.sequence_duration,
+            self.enemy2.sequence_duration,
+            1.0,
+        )
+        self.timeline.configure(
+            end,
+            end,
+            0,
+            attacker_segments=tuple(player_timeline),
+            defender_segments=enemy_timeline,
+        )
+        with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
+            self.frame_slider.setRange(0, round(end * _SLIDER_SCALE))
+            self.frame_spin.setRange(0.0, end)
+        self.set_frame(min(self._frame, end))
+
+    def set_frame(self, frame: float) -> None:
+        if self._combo_target_count <= 1:
+            super().set_frame(frame)
+            return
+        if not math.isfinite(frame):
+            return
+        self._frame = min(max(0.0, float(frame)), self.timeline.end_frame)
+        with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
+            self.frame_slider.setValue(round(self._frame * _SLIDER_SCALE))
+            self.frame_spin.setValue(self._frame)
+        self.timeline.set_current_frame(self._frame)
+
+        player_root = self.attacker.prepare_sequence_frame(self._frame, 0.0)
+        enemy1_root = self.defender.prepare_sequence_frame(self._frame, 0.0)
+        enemy2_root = self.enemy2.prepare_sequence_frame(self._frame, 0.0)
+        first_target = self._combo_first_target
+        second_target = self._combo_second_target
+        if self._frame <= self._combo_first_end:
+            player_anchor_root = enemy1_root
+            player_target = first_target
+        elif self._frame >= self._combo_second_start:
+            player_anchor_root = enemy2_root
+            player_target = second_target
+        else:
+            self.player_transition.prepare_sequence_frame(
+                self._frame,
+                self._combo_first_end,
+            )
+            self.player_transition.set_world_transform(
+                self._combo_transition_transform
+            )
+            player_target = None
+            player_anchor_root = None
+
+        def grounded_anchor(
+            target: np.ndarray,
+            fixed_root: np.ndarray,
+            actor_root: np.ndarray,
+        ) -> np.ndarray:
+            # Match the normal paired preview: the enemy is the planar anchor,
+            # preserving the player/enemy authored X/Z root offset.  Vertical
+            # roots remain grounded independently so neither actor floats.
+            result = target.copy()
+            result[0] -= fixed_root[0]
+            result[2] -= fixed_root[2]
+            result[1] = -actor_root[1]
+            return result
+
+        if player_target is not None and player_anchor_root is not None:
+            self.attacker.set_anchor_translation(
+                grounded_anchor(player_target, player_anchor_root, player_root)
+            )
+        self.defender.set_anchor_translation(
+            grounded_anchor(first_target, enemy1_root, enemy1_root)
+        )
+        self.enemy2.set_anchor_translation(
+            grounded_anchor(second_target, enemy2_root, enemy2_root)
+        )
+        if player_target is None:
+            self.player_transition.render_prepared_frame()
+        else:
+            self.attacker.render_prepared_frame()
+        self.defender.render_prepared_frame()
+        self.enemy2.render_prepared_frame()
+
+    def cleanup(self) -> None:
+        self.player_transition.cleanup()
+        self.enemy2.cleanup()
+        super().cleanup()
+
 
 def create_wots_interaction_preview(handler):
     rsz = getattr(handler, "rsz_file", None)
@@ -2492,6 +3720,7 @@ def create_wots_interaction_preview(handler):
     )
     if not document.reactions:
         return None
+    document = resolve_wots_justguard_next_actions(handler, document)
     return WotsInteractionPreviewWidget(handler, document)
 
 

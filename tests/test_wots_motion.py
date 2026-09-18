@@ -28,6 +28,7 @@ from file_handlers.motion.mot.model import (
     Skeleton,
     TrackFamily,
 )
+from file_handlers.motion.motlist_file import MotListFile
 from file_handlers.motion.mot_clip.model import (
     ClipInterpolation,
     ClipKey,
@@ -78,11 +79,28 @@ from file_handlers.rcol.shape_types import Capsule, ShapeType, Sphere
 from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
 from file_handlers.rsz.rsz_file import RszFile
 from file_handlers.rsz.wots_interaction_preview import (
+    InteractionMotionRef,
+    IssenDocument,
+    IssenMotionPhase,
+    IssenPattern,
+    _BREAK_ISSEN_COMBO_ADJUST_GUID,
+    _BREAK_ISSEN_COMBO_CONST_GUID,
+    _BREAK_ISSEN_COMBO_PATTERN_VALUES,
+    _BREAK_ISSEN_MOTION_BANK_ID,
+    _BREAK_ISSEN_MOTLIST_PATH,
     _INVALID_MOTION_GROUP_ID,
+    _bind_break_issen_enemy_motion,
+    _break_issen_combo_patterns,
+    _break_issen_next_turn_phase,
+    _is_break_issen_combo_pattern,
     _issen_pattern_title,
+    _player_justguard_followups,
     parse_wots_action_motion_map,
+    parse_wots_interaction_document,
     parse_wots_issen_document,
+    parse_wots_next_action_guid_map,
     resolve_wots_grapple_action_phases,
+    resolve_wots_justguard_next_actions,
 )
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
@@ -358,6 +376,175 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_player_justguard_followups_match_runtime_action_params(self):
+        followups = {
+            item.action_name: item for item in _player_justguard_followups()
+        }
+        front = followups["Attack After Parry · Front"]
+        self.assertEqual(front.motion_group_id, 0x04E2A825EDCC3B7A)
+        self.assertEqual(front.reference.bank_id, 20010)
+        self.assertEqual(front.reference.motion_id, 40)
+        self.assertTrue(front.resource_path.endswith("plw_KatateAttack.motlist"))
+
+        finish = followups["Attack Finish After Parry · Front"]
+        self.assertEqual(finish.motion_group_id, 0x04E2BEF8EA181904)
+        self.assertEqual(finish.reference.bank_id, 20011)
+        self.assertEqual(finish.reference.motion_id, 60)
+        self.assertTrue(finish.resource_path.endswith("plw_RyoteAttack.motlist"))
+        multiple = followups["Multiple Parry · Repeat Current Reaction"]
+        self.assertFalse(multiple.reference.available)
+        self.assertEqual(multiple.preview_kind, "multiple_parry")
+        self.assertIn("GrappleMotionTable", multiple.diagnostic)
+        self.assertEqual(len(followups), 9)
+
+    def test_justguard_next_action_btable_dispatch(self):
+        names = {
+            1: "ace.btable.user_data.BTable",
+            2: "ace.btable.user_data.BTable.cTableElement",
+            3: "ace.btable.user_data.BTable.cRowElement",
+            4: "app.btable.EnemyCommonCommand.cCheckJustGuardAfterActionTypeArg",
+            5: "app.btable.AIActionBTableCommand.cRequestFullBodyActionArg",
+            6: "ace.btable.cOperatorArgumentJump",
+        }
+        instance_types = [0] * 20
+        for instance_id, type_id in {
+            1: 1,
+            3: 2,
+            4: 2,
+            5: 3,
+            6: 3,
+            7: 3,
+            8: 3,
+            9: 4,
+            10: 5,
+            11: 4,
+            12: 6,
+            13: 3,
+            14: 5,
+        }.items():
+            instance_types[instance_id] = type_id
+        parsed = {
+            1: {"_Tables": ObjectData(2)},
+            2: {"_DataArray": ArrayData([ObjectData(3), ObjectData(4)])},
+            3: {
+                "_Guid": GuidData("11111111-1111-1111-1111-111111111111"),
+                "_Rows": ArrayData([
+                    ObjectData(5), ObjectData(6), ObjectData(7), ObjectData(8)
+                ]),
+            },
+            4: {
+                "_Guid": GuidData("22222222-2222-2222-2222-222222222222"),
+                "_Rows": ArrayData([ObjectData(13)]),
+            },
+            5: {"_CommandArgument": ObjectData(9)},
+            6: {"_CommandArgument": ObjectData(10)},
+            7: {"_CommandArgument": ObjectData(11)},
+            8: {"_OperatorArgument": ObjectData(12)},
+            9: {"_CheckMethod": ObjectData(15)},
+            10: {"_ActionIndexBody": ObjectData(16)},
+            11: {"_CheckMethod": ObjectData(17)},
+            12: {"_Table": ObjectData(18)},
+            13: {"_CommandArgument": ObjectData(14)},
+            14: {"_ActionIndexBody": ObjectData(19)},
+            15: {"_Value": 1},
+            16: {"_Value": GuidData("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")},
+            17: {"_Value": 25},
+            18: {"_Value": GuidData("22222222-2222-2222-2222-222222222222")},
+            19: {"_Value": GuidData("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")},
+        }
+        rsz = SimpleNamespace(
+            object_table=[1],
+            parsed_elements=parsed,
+            instance_infos=[SimpleNamespace(type_id=value) for value in instance_types],
+            type_registry=_ActionRegistry(names),
+        )
+
+        self.assertEqual(
+            parse_wots_next_action_guid_map(rsz),
+            {
+                1: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                25: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+        )
+
+    def test_break_issen_next_turn_motion_mapping(self):
+        expected = (
+            (1, "F", 533, 352402014515322549),
+            (1, "R", 536, 352405088304742692),
+            (2, "F", 538, 352400910373180611),
+            (3, "L", 545, 352393296696579374),
+        )
+        for target, direction, motion_id, group_set_id in expected:
+            phase = _break_issen_next_turn_phase(target, direction)
+            self.assertEqual(phase.reference.bank_id, _BREAK_ISSEN_MOTION_BANK_ID)
+            self.assertEqual(phase.reference.motion_id, motion_id)
+            self.assertEqual(phase.reference.set_id, group_set_id)
+            self.assertEqual(phase.motion_group_id, group_set_id)
+            self.assertIn(direction, phase.action_name)
+        self.assertEqual(
+            _BREAK_ISSEN_MOTLIST_PATH,
+            "natives/stm/Motion/Player/Weapon/plw_Issen/plw_Issen.motlist",
+        )
+        with self.assertRaises(ValueError):
+            _break_issen_next_turn_phase(4, "F")
+        with self.assertRaises(ValueError):
+            _break_issen_next_turn_phase(1, "UP")
+
+    def test_break_issen_combo_pattern_and_enemy_motion_binding(self):
+        group_id = (40130 << 44) | 0x201F
+        player = (
+            IssenMotionPhase(
+                "Player Phase 1",
+                "Break Issen Combo Adjust",
+                _BREAK_ISSEN_COMBO_ADJUST_GUID,
+                (40130 << 44) | 0x201E,
+                InteractionMotionRef((40130 << 44) | 0x201E, 40130, None),
+            ),
+            IssenMotionPhase(
+                "Player Phase 2",
+                "Break Issen Combo Const",
+                _BREAK_ISSEN_COMBO_CONST_GUID,
+                group_id,
+                InteractionMotionRef(group_id, 40130, None),
+            ),
+        )
+        enemy = (
+            IssenMotionPhase(
+                "Enemy Phase 1",
+                "Enemy Phase 1",
+                "11111111111111111111111111111111",
+                _INVALID_MOTION_GROUP_ID,
+                InteractionMotionRef(0xFFFFFFFF, None, None),
+            ),
+        )
+        pattern = IssenPattern(14, "Fatal Blow 15", 0, 0, player, enemy)
+
+        self.assertTrue(_is_break_issen_combo_pattern(pattern))
+        bound = _bind_break_issen_enemy_motion(player, enemy)
+        self.assertEqual(bound[0].motion_group_id, group_id)
+        self.assertEqual(bound[0].reference.bank_id, 40130)
+        self.assertIsNone(bound[0].reference.motion_id)
+
+        ordered = _break_issen_combo_patterns(IssenDocument(
+            "table.user.3",
+            tuple(
+                IssenPattern(
+                    index,
+                    f"Pattern {index}",
+                    0,
+                    value,
+                    player,
+                    enemy,
+                )
+                for index, value in (
+                    (15, _BREAK_ISSEN_COMBO_PATTERN_VALUES[2]),
+                    (13, _BREAK_ISSEN_COMBO_PATTERN_VALUES[0]),
+                    (14, _BREAK_ISSEN_COMBO_PATTERN_VALUES[1]),
+                )
+            ),
+        ))
+        self.assertEqual(tuple(item.index for item in ordered), (13, 14, 15))
+
     def test_grapple_action_guid_resolves_nested_motion_group(self):
         action_ids = SimpleNamespace(
             object_table=[1],
@@ -1082,6 +1269,45 @@ class TestWotsAssets(unittest.TestCase):
         document = parse_wots_issen_document(rsz, str(path))
         return resolve_wots_grapple_action_phases(handler, document)
 
+    def test_em100_justguard_next_actions_resolve_to_motion_groups(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        path = (
+            root
+            / "GameDesign/Action/Enemy/Em100/00/Data/Param"
+            / "Em100_00_Attack_Player_JustGuardData.user.3"
+        )
+        registry = TypeRegistry(str(
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        ))
+        rsz = RszFile()
+        rsz.filepath = str(path)
+        rsz.game_version = "OnimushaWOTS"
+        rsz.type_registry = registry
+        rsz.read(path.read_bytes(), validate_type_registry=False)
+        handler = SimpleNamespace(
+            filepath=str(path),
+            resource_context=None,
+            rsz_file=rsz,
+        )
+        document = resolve_wots_justguard_next_actions(
+            handler,
+            parse_wots_interaction_document(rsz, str(path)),
+        )
+        actions = {
+            reaction.next_action_type: reaction.next_action
+            for reaction in document.reactions
+            if reaction.next_action is not None
+        }
+        self.assertEqual(
+            actions[1].action_name,
+            "cParryAttackAfterAction",
+        )
+        self.assertEqual(actions[1].motion_group_id, 0x09CC282B62DBFDFB)
+        self.assertEqual(actions[10].motion_group_id, 0x09CC2714C5DCBE24)
+        self.assertEqual(actions[25].action_name, "cChargedAttackOneHand")
+        self.assertEqual(actions[25].motion_group_id, 0x04E8E1C44C923395)
+
     def test_em100_blow_grapple_has_all_direct_motion_groups(self):
         document = self._load_grapple_document(
             "Em100_00_GrappleBlowGrapMotionTable.user.3"
@@ -1109,6 +1335,59 @@ class TestWotsAssets(unittest.TestCase):
         self.assertTrue(all(
             phase.reference.bank_id is not None for phase in enemy_phases
         ))
+
+    def test_em100_fatal_blow_break_issen_variants_share_const_group(self):
+        document = self._load_grapple_document(
+            "Em100_00_GrappleFatalBlowMotionTable.user.3"
+        )
+        combo_patterns = _break_issen_combo_patterns(document)
+        self.assertEqual(tuple(pattern.index for pattern in combo_patterns), (13, 14, 15))
+        self.assertEqual(
+            tuple(pattern.pattern_value for pattern in combo_patterns),
+            _BREAK_ISSEN_COMBO_PATTERN_VALUES,
+        )
+        const_groups = []
+        for pattern in combo_patterns:
+            const_phase = next(
+                phase for phase in pattern.player_phases
+                if phase.action_guid == _BREAK_ISSEN_COMBO_CONST_GUID
+            )
+            const_groups.append(const_phase.motion_group_id)
+            self.assertNotEqual(
+                const_phase.motion_group_id,
+                _INVALID_MOTION_GROUP_ID,
+            )
+            self.assertTrue(pattern.enemy_phases)
+            self.assertTrue(all(
+                phase.motion_group_id == const_phase.motion_group_id
+                for phase in pattern.enemy_phases
+            ))
+        self.assertEqual(len(set(const_groups)), 3)
+
+    def test_break_issen_next_turn_motions_exist_in_player_bank(self):
+        root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
+        path = (
+            root
+            / "Motion/Player/Weapon/plw_Issen/plw_Issen.motlist.1036"
+        )
+        motlist = MotListFile()
+        motlist.read(path.read_bytes())
+        slots = {
+            slot.motion_id: slot
+            for slot in motlist.model.slots
+            if slot.payload is not None
+        }
+        for target_number, expected_ids in enumerate(
+            ((533, 534, 535, 536), (538, 539, 540, 541), (543, 544, 545, 546)),
+            1,
+        ):
+            for direction, expected_id in zip(
+                ("F", "B", "L", "R"), expected_ids
+            ):
+                phase = _break_issen_next_turn_phase(target_number, direction)
+                self.assertEqual(phase.reference.motion_id, expected_id)
+                self.assertIn(expected_id, slots)
+                self.assertGreater(slots[expected_id].payload.value.end_frame, 0.0)
 
     def test_em101_model_preset_contains_complete_body_and_weapon(self):
         root = Path(os.environ["REASY_WOTS_ASSET_ROOT"])
