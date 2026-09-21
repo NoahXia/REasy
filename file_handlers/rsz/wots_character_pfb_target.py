@@ -31,8 +31,19 @@ class WotsCharacterPfbTargetResult:
     resource_path: str
     part_paths: tuple[str, ...]
     weapon_path: str = ""
+    weapon_attachment_joint: str = ""
     weapon_candidates: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+
+
+def _preferred_weapon_attachment_joint(rig) -> str:
+    """Choose the best right-hand weapon socket present in a mesh rig."""
+    names = {joint.name.casefold(): joint.name for joint in rig.joints}
+    for candidate in ("R_Wep", "R_Weapon", "R_Hand", "R_Palm"):
+        match = names.get(candidate.casefold())
+        if match:
+            return match
+    return ""
 
 
 def inferred_wots_enemy_pfb_path(source_path: str) -> str:
@@ -313,6 +324,7 @@ def load_wots_character_pfb_target(
         if weapon_path is None and weapon_candidates
         else normalize_resource_path(weapon_path or "")
     )
+    weapon_attachment_joint = ""
     if selected_weapon:
         if selected_weapon in character_mesh_paths:
             selected_weapon = ""
@@ -340,11 +352,23 @@ def load_wots_character_pfb_target(
                     if weapon_mesh is None:
                         raise ValueError("mesh parser returned no model")
                     weapon_rig = rig_from_re_engine_mesh(weapon_mesh)
+                    owner_rig = max(
+                        (item[7] for item in loaded),
+                        key=lambda rig: len(rig.joints),
+                    )
+                    weapon_attachment_joint = _preferred_weapon_attachment_joint(
+                        owner_rig
+                    )
+                    if not weapon_attachment_joint:
+                        diagnostics.append(
+                            "Weapon attachment joint was not found; the weapon "
+                            "will use its shared root transform."
+                        )
                     loaded.append((
                         "Weapon",
                         selected_weapon,
                         "",
-                        "R_Wep",
+                        weapon_attachment_joint,
                         2,
                         weapon_handler,
                         weapon_mesh,
@@ -391,6 +415,7 @@ def load_wots_character_pfb_target(
         requested_path,
         tuple(item[1] for item in loaded),
         selected_weapon,
+        weapon_attachment_joint,
         weapon_candidates,
         tuple(diagnostics),
     )

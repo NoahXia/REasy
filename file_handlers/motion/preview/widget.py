@@ -139,6 +139,7 @@ class MotListPreviewWidget(QWidget):
         self._target: RigPreviewTarget | None = None
         self._target_material_session: MeshMaterialSession | None = None
         self._target_material_sessions: dict[str, MeshMaterialSession] = {}
+        self._target_material_diagnostics: tuple[str, ...] = ()
         self._material_parse_in_subprocess = bool(material_parse_in_subprocess)
         self._snapshot_transform = snapshot_transform
         self._using_source_rig = True
@@ -614,11 +615,12 @@ class MotListPreviewWidget(QWidget):
         *,
         weapon_attack_sources=None,
         weapon_attack_diagnostics: tuple[str, ...] = (),
-    ) -> None:
+    ) -> tuple[str, ...]:
         self.playback.stop()
         self._materials.clear()
         self._target_material_session = None
         self._target_material_sessions.clear()
+        self._target_material_diagnostics = ()
         self._target = target
         self._weapon_attack_collision_diagnostics = tuple(
             weapon_attack_diagnostics
@@ -635,6 +637,7 @@ class MotListPreviewWidget(QWidget):
         # it must never leave a composite target paired with the old source-rig pose.
         self._load_current_motion(reset_camera=True)
 
+        material_diagnostics = []
         for index, part in enumerate(target.render_parts):
             key = part.material_scope or "target"
             session = MeshMaterialSession(
@@ -645,10 +648,21 @@ class MotListPreviewWidget(QWidget):
                 parse_in_subprocess=self._material_parse_in_subprocess,
                 parent=self._materials,
             )
+            try:
+                self._materials.add(key, session)
+            except Exception as exc:
+                material_diagnostics.append(
+                    self.tr("Material unavailable for {part}: {error}").format(
+                        part=part.label or key,
+                        error=exc,
+                    )
+                )
+                continue
             self._target_material_sessions[key] = session
-            self._materials.add(key, session)
-            if index == 0:
+            if index == 0 or self._target_material_session is None:
                 self._target_material_session = session
+        self._target_material_diagnostics = tuple(material_diagnostics)
+        return self._target_material_diagnostics
 
     def use_source_rig(self) -> None:
         self._using_source_rig = True
@@ -753,18 +767,23 @@ class MotListPreviewWidget(QWidget):
                 weapon_diagnostics.extend(diagnostics)
                 if source is not None:
                     weapon_sources[int(collision_type)] = source
-            self.set_target(
+            material_diagnostics = self.set_target(
                 target,
                 weapon_attack_sources=weapon_sources,
                 weapon_attack_diagnostics=tuple(weapon_diagnostics),
             )
+            extra_diagnostics = list(material_diagnostics)
             if optional_missing:
+                extra_diagnostics.append(
+                    self.tr("Optional preset resource missing: {paths}").format(
+                        paths=", ".join(optional_missing)
+                    )
+                )
+            if extra_diagnostics:
                 self.rig_label.setText(
                     self.rig_label.text()
                     + "\n"
-                    + self.tr("Optional preset resource missing: {paths}").format(
-                        paths=", ".join(optional_missing)
-                    )
+                    + "\n".join(extra_diagnostics)
                 )
         except ValueError as exc:
             self._show_error(
@@ -788,7 +807,7 @@ class MotListPreviewWidget(QWidget):
                 self,
                 type_registry=_wots_type_registry(self.handler),
             )
-            self.set_target(result.target)
+            material_diagnostics = self.set_target(result.target)
             details = [
                 self.tr("Loaded {count} model part(s) from {path}.").format(
                     count=len(result.part_paths),
@@ -797,11 +816,13 @@ class MotListPreviewWidget(QWidget):
             ]
             if result.weapon_path:
                 details.append(
-                    self.tr("Weapon: {path} → R_Wep").format(
+                    self.tr("Weapon: {path} -> {joint}").format(
                         path=result.weapon_path,
+                        joint=result.weapon_attachment_joint or "shared root",
                     )
                 )
             details.extend(result.diagnostics)
+            details.extend(material_diagnostics)
             self.rig_label.setText("\n".join(details))
         except Exception as exc:
             self._show_error(
@@ -905,6 +926,7 @@ class MotListPreviewWidget(QWidget):
                 )
             )
         messages.extend(snapshot_diagnostic_messages(snapshot))
+        messages.extend(self._scene_renderer._part_diagnostics)
         messages.extend(self._catalog.messages)
         collision_status = self._scene_renderer.attack_collision_status(
             motion,

@@ -120,6 +120,7 @@ from file_handlers.rsz.wots_interaction_preview import (
     transition_world_transform,
 )
 from file_handlers.rsz.wots_character_pfb_target import (
+    _preferred_weapon_attachment_joint,
     inferred_wots_enemy_pfb_path,
 )
 from utils.hash_util import murmur3_hash
@@ -425,6 +426,13 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_character_pfb_weapon_attachment_uses_available_socket(self):
+        hand_only = Rig((RigJoint("root"), RigJoint("R_Hand", 0)))
+        weapon_socket = Rig((RigJoint("root"), RigJoint("R_Wep", 0)))
+
+        self.assertEqual(_preferred_weapon_attachment_joint(hand_only), "R_Hand")
+        self.assertEqual(_preferred_weapon_attachment_joint(weapon_socket), "R_Wep")
+
     def test_player_motion_in_enemy_folder_does_not_infer_enemy_pfb(self):
         self.assertEqual(
             inferred_wots_enemy_pfb_path(

@@ -3206,8 +3206,9 @@ class WotsInteractionPreviewWidget(QWidget):
             path=result.resource_path,
         )
         if result.weapon_path:
-            summary += "\n" + self.tr("Weapon: {path} → R_Wep").format(
+            summary += "\n" + self.tr("Weapon: {path} -> {joint}").format(
                 path=result.weapon_path,
+                joint=result.weapon_attachment_joint or "shared root",
             )
         elif result.weapon_candidates:
             summary += "\n" + self.tr(

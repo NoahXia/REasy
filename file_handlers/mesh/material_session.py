@@ -507,7 +507,16 @@ class MeshMaterialCollection(QObject):
         session.images_updated.connect(image_callback)
         session.status_changed.connect(status_callback)
         if start:
-            session.start()
+            try:
+                session.start()
+            except Exception:
+                # Starting a session resolves its MDF immediately and may
+                # fail for an optional or unsupported material.  Do not keep
+                # a half-registered session in the collection: callers can
+                # then degrade that mesh part to untextured rendering and
+                # continue loading the remaining parts.
+                self.remove(key)
+                raise
         else:
             self.refresh()
 

@@ -1020,7 +1020,11 @@ class MotionEventTimeline(QWidget):
 
     def event(self, event) -> bool:
         if event.type() == QEvent.Type.ToolTip:
-            row = (event.position().y() - self.HEADER_HEIGHT) // self.ROW_HEIGHT
+            # QHelpEvent exposes pos()/globalPos() in PySide6.  Unlike mouse
+            # events it does not consistently expose the Qt 6 position()
+            # accessor, so using that accessor crashes timeline tooltips on
+            # the PySide6 version shipped in the Windows build.
+            row = (event.pos().y() - self.HEADER_HEIGHT) // self.ROW_HEIGHT
             if 0 <= row < len(self._lanes):
                 lane = self._lanes[row]
                 QToolTip.showText(

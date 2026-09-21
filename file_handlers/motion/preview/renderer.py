@@ -123,6 +123,7 @@ class MotionPreviewRenderer:
         self._target_meshes: dict[str, SceneDrawMesh] = {}
         self._deformers: dict[str, object] = {}
         self._gpu_skinned_keys: set[str] = set()
+        self._part_diagnostics: tuple[str, ...] = ()
         self._skeleton: SkeletonScene | None = None
         self._attack_collision_source: AttackCollisionSource | None = None
         self._weapon_attack_sources: dict[int, AttackCollisionSource] = {}
@@ -282,6 +283,7 @@ class MotionPreviewRenderer:
         self._target_meshes.clear()
         self._deformers.clear()
         self._gpu_skinned_keys.clear()
+        self._part_diagnostics = ()
         self._skeleton = None
         self._hitbox_signature = None
         self._weapon_collision_poses.clear()
@@ -302,6 +304,7 @@ class MotionPreviewRenderer:
         self._target_meshes.clear()
         self._deformers.clear()
         self._gpu_skinned_keys.clear()
+        part_diagnostics = []
         self._render_state.clear()
         self._skeleton = SkeletonScene(snapshot)
         meshes: list[SceneDrawMesh] = []
@@ -324,42 +327,48 @@ class MotionPreviewRenderer:
                     if part.material_scope
                     else None
                 )
-                target_scene = build_mesh_scene(
-                    part.mesh,
-                    key=key,
-                    material_key=material_key,
-                )
-                if len(target_scene) != 1:
-                    raise SkinningError(
-                        f"preset mesh {part.label!r} has no renderable LOD 0 geometry"
-                    )
-                target_mesh = target_scene[0]
-                if index == 0 and part.rig is target.rig:
-                    deformer = build_skinned_mesh_deformer(
+                try:
+                    target_scene = build_mesh_scene(
                         part.mesh,
-                        target.rig,
-                        target_mesh.vertices,
-                        target_mesh.normals,
-                        target_mesh.indices,
-                        bind_tangents=target_mesh.tangents,
-                        handler=part.handler,
+                        key=key,
+                        material_key=material_key,
                     )
-                else:
-                    deformer = build_shared_rig_deformer(
-                        part.mesh,
-                        part.rig,
-                        target.rig,
-                        target_mesh.vertices,
-                        target_mesh.normals,
-                        target_mesh.indices,
-                        bind_tangents=target_mesh.tangents,
-                        pose_to_constrained_matrix=np.identity(
-                            4,
-                            dtype=np.float32,
-                        ),
-                        root_attachment_joint=part.attachment_joint,
-                        handler=part.handler,
+                    if len(target_scene) != 1:
+                        raise SkinningError(
+                            f"preset mesh {part.label!r} has no renderable LOD 0 geometry"
+                        )
+                    target_mesh = target_scene[0]
+                    if index == 0 and part.rig is target.rig:
+                        deformer = build_skinned_mesh_deformer(
+                            part.mesh,
+                            target.rig,
+                            target_mesh.vertices,
+                            target_mesh.normals,
+                            target_mesh.indices,
+                            bind_tangents=target_mesh.tangents,
+                            handler=part.handler,
+                        )
+                    else:
+                        deformer = build_shared_rig_deformer(
+                            part.mesh,
+                            part.rig,
+                            target.rig,
+                            target_mesh.vertices,
+                            target_mesh.normals,
+                            target_mesh.indices,
+                            bind_tangents=target_mesh.tangents,
+                            pose_to_constrained_matrix=np.identity(
+                                4,
+                                dtype=np.float32,
+                            ),
+                            root_attachment_joint=part.attachment_joint,
+                            handler=part.handler,
+                        )
+                except (ValueError, RuntimeError) as exc:
+                    part_diagnostics.append(
+                        f"Skipped model part {part.label!r}: {exc}"
                     )
+                    continue
                 gpu_capability = getattr(
                     self.viewport,
                     "can_use_gpu_skinning",
@@ -383,6 +392,8 @@ class MotionPreviewRenderer:
                 self._target_meshes[key] = target_mesh
                 self._deformers[key] = deformer
                 meshes.append(target_mesh)
+
+        self._part_diagnostics = tuple(part_diagnostics)
 
         self._weapon_collision_poses = self._build_weapon_collision_poses(
             snapshot
