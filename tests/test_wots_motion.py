@@ -85,6 +85,7 @@ from file_handlers.rsz.wots_interaction_preview import (
     InteractionMotionRef,
     InteractionNextAction,
     InteractionReaction,
+    WotsIssenPreviewWidget,
     WotsInteractionPreviewWidget,
     IssenDocument,
     IssenMotionPhase,
@@ -98,9 +99,13 @@ from file_handlers.rsz.wots_interaction_preview import (
     _bind_break_issen_enemy_motion,
     _break_issen_combo_patterns,
     _break_issen_next_turn_phase,
+    _counter_grab_actor_patterns,
     _is_break_issen_combo_pattern,
     _issen_pattern_title,
     _multiple_parry_target_label,
+    counter_grab_pattern_direction,
+    counter_grab_target_position,
+    counter_grab_target_transform,
     _player_justguard_followups,
     multiple_parry_candidates,
     multiple_parry_player_references,
@@ -542,6 +547,13 @@ class TestWotsMotion(unittest.TestCase):
             source.index("set_world_transform"),
         )
 
+    def test_issen_single_target_frame_does_not_enter_justguard_path(self):
+        source = inspect.getsource(WotsIssenPreviewWidget.set_frame)
+        self.assertNotIn("super().set_frame", source)
+        self.assertIn("self.attacker.prepare_sequence_frame", source)
+        self.assertIn("self.defender.prepare_sequence_frame", source)
+        self.assertIn("pane.activate_scene", source)
+
     def test_justguard_next_action_btable_dispatch(self):
         names = {
             1: "ace.btable.user_data.BTable",
@@ -744,6 +756,73 @@ class TestWotsMotion(unittest.TestCase):
             ),
             "Fatal Blow 19",
         )
+
+    def test_counter_grab_preview_has_five_distinct_target_placements(self):
+        positions = {
+            direction: counter_grab_target_position(direction)
+            for direction in ("FRONT", "BACK", "LEFT", "RIGHT", "MIDDLE")
+        }
+        self.assertEqual(len({tuple(value) for value in positions.values()}), 5)
+        np.testing.assert_allclose(positions["FRONT"], (0.0, 0.0, 2.5))
+        np.testing.assert_allclose(positions["BACK"], (0.0, 0.0, -2.5))
+        np.testing.assert_allclose(positions["LEFT"], (-2.5, 0.0, 0.0))
+        np.testing.assert_allclose(positions["RIGHT"], (2.5, 0.0, 0.0))
+        self.assertGreater(positions["MIDDLE"][2], 0.0)
+        self.assertLess(positions["MIDDLE"][2], positions["FRONT"][2])
+
+    def test_counter_grab_pattern_unique_ids_select_authored_direction(self):
+        self.assertEqual(counter_grab_pattern_direction(-581520192), "FRONT")
+        self.assertEqual(counter_grab_pattern_direction(-1156701824), "BACK")
+        self.assertEqual(counter_grab_pattern_direction(1658271360), "LEFT")
+        self.assertEqual(counter_grab_pattern_direction(1003352640), "RIGHT")
+        self.assertEqual(counter_grab_pattern_direction(1763771136), "MIDDLE")
+        self.assertIsNone(counter_grab_pattern_direction(123))
+
+    def test_counter_grab_enemy2_uses_timeline_frame(self):
+        source = inspect.getsource(WotsIssenPreviewWidget.set_frame)
+        self.assertIn(
+            "self.enemy2.prepare_sequence_frame(self._frame, 0.0)",
+            source,
+        )
+        self.assertNotIn("self.enemy2.prepare_sequence_frame(0.0, 0.0)", source)
+
+    def test_counter_grab_partner_lists_are_simultaneous_actor_slots(self):
+        ref = InteractionMotionRef(1, 1, 1)
+        owner = IssenMotionPhase("owner", "owner", "", 1, ref)
+        enemy1 = IssenMotionPhase("enemy1", "enemy1", "", 2, ref)
+        enemy2 = IssenMotionPhase("enemy2", "enemy2", "", 3, ref)
+        base = IssenPattern(
+            0,
+            "Pattern A Left",
+            0,
+            -66848048,
+            (owner,),
+            (enemy1,),
+            unique_id=1658271360,
+        )
+        multi = IssenPattern(
+            1,
+            "Pattern B Left",
+            0,
+            1800944256,
+            (owner,),
+            (enemy1, enemy2),
+            unique_id=1658271360,
+        )
+        document = IssenDocument("countergrab", (base, multi))
+        self.assertEqual(_counter_grab_actor_patterns(document, base), (base, ()))
+        self.assertEqual(
+            _counter_grab_actor_patterns(document, multi),
+            (base, (enemy2,)),
+        )
+
+    def test_counter_grab_target_transform_places_root_on_ground(self):
+        root = np.identity(4, dtype=np.float32)
+        root[3, :3] = (0.25, 1.5, -0.75)
+        transform = counter_grab_target_transform(root, "RIGHT")
+        world = root @ transform
+        np.testing.assert_allclose(world[3, :3], (2.5, 0.0, 0.0), atol=1e-6)
+        np.testing.assert_allclose(world[2, (0, 2)], (-1.0, 0.0), atol=1e-6)
 
     def test_shared_rig_root_can_follow_an_owner_attachment_joint(self):
         owner = Rig([
@@ -1498,6 +1577,31 @@ class TestWotsAssets(unittest.TestCase):
         self.assertTrue(phases)
         self.assertTrue(all(
             phase.motion_group_id != _INVALID_MOTION_GROUP_ID for phase in phases
+        ))
+
+    def test_em100_counter_grab_resolves_four_pairs_and_enemy_variants(self):
+        document = self._load_grapple_document(
+            "Em100_00_GrappleCounterGrabMotionTable.user.3"
+        )
+        self.assertEqual(len(document.patterns), 4)
+        self.assertEqual(
+            tuple(pattern.title for pattern in document.patterns),
+            (
+                "Counter Grab 01",
+                "Counter Grab 02",
+                "Counter Grab 03",
+                "Counter Grab 04",
+            ),
+        )
+        self.assertTrue(all(
+            phase.motion_group_candidates
+            for pattern in document.patterns
+            for phase in pattern.enemy_phases
+        ))
+        self.assertTrue(all(
+            all(group_id >> 44 == 40130 for group_id in phase.motion_group_candidates)
+            for pattern in document.patterns
+            for phase in pattern.enemy_phases
         ))
 
     def test_em100_fatal_blow_resolves_every_enemy_action_guid(self):

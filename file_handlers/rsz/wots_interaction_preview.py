@@ -250,6 +250,7 @@ class IssenMotionPhase:
     action_guid: str
     motion_group_id: int
     reference: InteractionMotionRef
+    motion_group_candidates: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +262,7 @@ class IssenPattern:
     player_phases: tuple[IssenMotionPhase, ...]
     enemy_phases: tuple[IssenMotionPhase, ...]
     fixed_object_type: int = 0
+    unique_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +673,115 @@ _BREAK_ISSEN_NEXT_TURN_MOTIONS = (
 )
 _BREAK_ISSEN_DIRECTIONS = ("F", "B", "L", "R")
 
+_COUNTER_GRAB_DIRECTIONS = ("FRONT", "BACK", "LEFT", "RIGHT", "MIDDLE")
+_COUNTER_GRAB_TARGET_DISTANCE = 2.5
+_COUNTER_GRAB_PATTERN_A = -66848048
+_COUNTER_GRAB_UNIQUE_DIRECTIONS = {
+    # Em100 does not serialize a directional selector for its four variants.
+    0: "FRONT",
+    # Em107 Pattern A direction variants, verified from the WOTS 1.0.1.0 table.
+    -581520192: "FRONT",
+    -1156701824: "BACK",
+    1658271360: "LEFT",
+    1003352640: "RIGHT",
+    1763771136: "MIDDLE",
+}
+_COUNTER_GRAB_PATTERN_NAMES = {
+    -66848048: "PATTERN_A",
+    1800944256: "PATTERN_B",
+    -2081304832: "PATTERN_A_BACK",
+    1815826944: "PATTERN_B_BACK",
+    928738688: "PATTERN_C",
+}
+
+
+def counter_grab_pattern_direction(unique_id: int) -> str | None:
+    """Return the encounter direction encoded by a Counter Grab pattern."""
+    return _COUNTER_GRAB_UNIQUE_DIRECTIONS.get(int(unique_id))
+
+
+def _counter_grab_actor_patterns(
+    document: IssenDocument,
+    pattern: IssenPattern,
+) -> tuple[IssenPattern, tuple[IssenMotionPhase, ...]]:
+    """Split a Counter Grab entry into its simultaneous participant slots.
+
+    Pattern A serializes the player/first-enemy pair.  Pattern B/C entries keep
+    that pair active through GUID-only slots and append a second partner slot.
+    The lists are actor slots, not sequential animation phases.
+    """
+    if len(pattern.enemy_phases) <= 1:
+        return pattern, ()
+    base = next(
+        (
+            candidate
+            for candidate in document.patterns
+            if candidate.pattern_value == _COUNTER_GRAB_PATTERN_A
+            and candidate.unique_id == pattern.unique_id
+        ),
+        pattern,
+    )
+    return base, tuple(pattern.enemy_phases[1:])
+
+
+def counter_grab_target_position(
+    direction: str,
+    distance: float = _COUNTER_GRAB_TARGET_DISTANCE,
+) -> np.ndarray:
+    """Return a readable preview placement for the runtime-selected target.
+
+    Counter Grab serializes the paired motion, but the extra target's actual
+    world position is selected by the encounter at run time.  Keep the five
+    engine selector values distinct while using a stable representative
+    distance in the offline preview.
+    """
+    normalized = str(direction).strip().upper()
+    if normalized not in _COUNTER_GRAB_DIRECTIONS:
+        raise ValueError(f"Unsupported Counter Grab direction: {direction!r}")
+    radius = max(0.1, float(distance))
+    positions = {
+        "FRONT": (0.0, 0.0, radius),
+        "BACK": (0.0, 0.0, -radius),
+        "LEFT": (-radius, 0.0, 0.0),
+        "RIGHT": (radius, 0.0, 0.0),
+        # MIDDLE is the neutral, centered target slot.  Pull it closer than
+        # FRONT so both choices remain visible in the offline scene.
+        "MIDDLE": (0.0, 0.0, radius * 0.55),
+    }
+    return np.asarray(positions[normalized], dtype=np.float32)
+
+
+def counter_grab_target_transform(
+    root_matrix,
+    direction: str,
+    distance: float = _COUNTER_GRAB_TARGET_DISTANCE,
+) -> np.ndarray:
+    """Place an extra Counter Grab target and turn it toward the interaction."""
+    root = np.asarray(root_matrix, dtype=np.float32).reshape(4, 4)
+    position = counter_grab_target_position(direction, distance)
+    toward_center = -position.copy()
+    toward_center[1] = 0.0
+    length = float(np.linalg.norm(toward_center))
+    desired_yaw = np.identity(3, dtype=np.float32)
+    if length > 1e-6:
+        toward_center /= length
+        yaw = math.atan2(float(toward_center[0]), float(toward_center[2]))
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        desired_yaw = np.array(
+            (
+                (cosine, 0.0, -sine),
+                (0.0, 1.0, 0.0),
+                (sine, 0.0, cosine),
+            ),
+            dtype=np.float32,
+        )
+    rotation = _planar_rotation(root).T @ desired_yaw
+    transform = np.identity(4, dtype=np.float32)
+    transform[:3, :3] = rotation
+    transform[3, :3] = position - root[3, :3] @ rotation
+    return transform
+
 # GrappleMotionTable stores the partner side as action GUIDs instead of motion
 # groups.  These are the verified Em100 WOTS 1.0.1.0 action-to-IssenEm links.
 # Valid group IDs are still resolved from the adjacent MEX at run time.
@@ -866,6 +977,8 @@ def _bind_break_issen_enemy_motion(
 
 def _issen_pattern_title(source_path: str, index: int, phase_count: int) -> str:
     lowered = str(source_path).replace("\\", "/").casefold()
+    if "countergrab" in lowered:
+        return f"Counter Grab {index + 1:02d}"
     if "blowgrap" in lowered:
         return f"Blow Grapple {index + 1:02d}"
     if "fatalblow" in lowered:
@@ -906,6 +1019,7 @@ def parse_wots_issen_document(rsz, source_path: str = "") -> IssenDocument:
             pattern_value=int(_scalar(_field(rsz, list_id, "_Pattern"))),
             player_phases=player,
             enemy_phases=enemy,
+            unique_id=int(_scalar(_field(rsz, list_id, "_UniqueID"))),
         )
         if _is_break_issen_combo_pattern(pattern):
             pattern = replace(
@@ -1547,13 +1661,19 @@ def resolve_wots_grapple_action_phases(
     parent=None,
 ) -> IssenDocument:
     """Resolve partner ActionGuid phases through WOTS ActionID resources."""
+    is_counter_grab = "countergrab" in document.source_path.replace("\\", "/").casefold()
     unresolved = {
         phase.action_guid
         for pattern in document.patterns
         for phase in pattern.enemy_phases
         if phase.action_guid
-        and phase.motion_group_id == _INVALID_MOTION_GROUP_ID
-        and phase.reference.bank_id is None
+        and (
+            is_counter_grab
+            or (
+                phase.motion_group_id == _INVALID_MOTION_GROUP_ID
+                and phase.reference.bank_id is None
+            )
+        )
     }
     if not unresolved:
         return document
@@ -1572,20 +1692,43 @@ def resolve_wots_grapple_action_phases(
 
     def resolved_phase(phase: IssenMotionPhase) -> IssenMotionPhase:
         if (
-            phase.motion_group_id != _INVALID_MOTION_GROUP_ID
-            or phase.reference.bank_id is not None
+            not is_counter_grab
+            and (
+                phase.motion_group_id != _INVALID_MOTION_GROUP_ID
+                or phase.reference.bank_id is not None
+            )
         ):
             return phase
         binding = action_map.get(phase.action_guid)
+        if binding is None and is_counter_grab and len(phase.action_guid) == 32:
+            # The shipped Counter Grab table uses stable action GUID suffixes,
+            # while the corresponding ActionID resources differ in their first
+            # DWORD.  Accept the suffix only when it identifies one action
+            # unambiguously; this mirrors the runtime holder relationship
+            # without weakening normal GUID resolution.
+            suffix = phase.action_guid[8:]
+            matches = [
+                value
+                for key, value in action_map.items()
+                if len(key) == 32 and key[8:] == suffix
+            ]
+            if len(matches) == 1:
+                binding = matches[0]
         if binding is None:
             return phase
         action_name, groups = binding
-        group_id = groups[0]
+        candidate_groups = tuple(
+            int(group_id)
+            for group_id in groups
+            if int(group_id) >> 44 == int(phase.reference.bank_id or -1)
+        ) or tuple(int(group_id) for group_id in groups)
+        group_id = candidate_groups[0]
         return replace(
             phase,
             action_name=action_name,
             motion_group_id=group_id,
             reference=InteractionMotionRef(group_id, group_id >> 44, None),
+            motion_group_candidates=candidate_groups,
         )
 
     return replace(
@@ -2948,6 +3091,22 @@ class WotsInteractionPreviewWidget(QWidget):
             )
             self.multiple_parry_target_combo.setVisible(False)
             controls.addWidget(self.multiple_parry_target_combo)
+        if getattr(self, "_counter_grab_mode", False):
+            controls.addWidget(QLabel(self.tr("Second Enemy Position"), preview_area))
+            self.counter_grab_direction_combo = QComboBox(preview_area)
+            for direction in _COUNTER_GRAB_DIRECTIONS:
+                self.counter_grab_direction_combo.addItem(
+                    self.tr(direction.title()),
+                    direction,
+                )
+            self.counter_grab_direction_combo.setToolTip(self.tr(
+                "Counter Grab selects this extra target from the encounter at "
+                "runtime. The preview uses a representative 2.5 m placement."
+            ))
+            self.counter_grab_direction_combo.currentIndexChanged.connect(
+                self._on_counter_grab_direction_changed
+            )
+            controls.addWidget(self.counter_grab_direction_combo)
         self.play_button = QPushButton(self.tr("Play"), preview_area)
         self.play_button.clicked.connect(self.toggle_playback)
         controls.addWidget(self.play_button)
@@ -3808,12 +3967,25 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         self._combo_transition_transform = np.identity(4, dtype=np.float32)
         self._enemy_model_target = None
         self._configuring_content = False
+        self._counter_grab_mode = (
+            "countergrab" in document.source_path.replace("\\", "/").casefold()
+        )
+        self._resolved_player_phases: tuple[IssenMotionPhase, ...] = ()
+        self._resolved_enemy_phases: tuple[IssenMotionPhase, ...] = ()
+        self._resolved_enemy2_phases: tuple[IssenMotionPhase, ...] = ()
+        self._counter_grab_target_world = np.identity(4, dtype=np.float32)
         bank_ids = {
             int(phase.reference.bank_id)
             for pattern in document.patterns
             for phase in (*pattern.player_phases, *pattern.enemy_phases)
             if phase.reference.bank_id is not None
         }
+        bank_ids.update(
+            int(group_id) >> 44
+            for pattern in document.patterns
+            for phase in (*pattern.player_phases, *pattern.enemy_phases)
+            for group_id in phase.motion_group_candidates
+        )
         self._bank_candidates = discover_motion_bank_candidates(
             document.source_path,
             bank_ids,
@@ -3821,8 +3993,19 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         )
         lowered_source = document.source_path.replace("\\", "/").casefold()
         is_issen = "issen" in lowered_source
-        self.preview_tab_title = "Issen Preview" if is_issen else "Grapple Preview"
+        self.preview_tab_title = (
+            "Counter Grab Preview"
+            if self._counter_grab_mode
+            else "Issen Preview"
+            if is_issen
+            else "Grapple Preview"
+        )
         self.preview_description = (
+            "Read-only WOTS Counter Grab preview. The paired motions come from "
+            "GrappleMotionTable and adjacent MEX files; the additional target "
+            "position is a representative runtime placement."
+            if self._counter_grab_mode
+            else
             "Read-only WOTS grapple preview. Player and enemy phases are resolved "
             "from GrappleMotionTable, adjacent MEX files, and verified WOTS "
             "action GUID links; runtime state transitions are simulated."
@@ -3831,7 +4014,7 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         actors = self.attacker.parentWidget()
         self.enemy2 = _ActorMotionPane(
             self.handler,
-            "Enemy 2",
+            "Enemy 2 · Counter Grab Target" if self._counter_grab_mode else "Enemy 2",
             self._scene_host.viewport_factory("enemy2"),
             parent=actors,
         )
@@ -3860,10 +4043,26 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         combo_patterns = _break_issen_combo_patterns(self.document)
         combo_start_index = combo_patterns[0].index if len(combo_patterns) >= 2 else -1
         for index, pattern in enumerate(self.document.patterns):
-            item = QTreeWidgetItem((
-                pattern.title,
+            title = pattern.title
+            value = (
                 f"{len(pattern.player_phases)} player / "
-                f"{len(pattern.enemy_phases)} enemy phases",
+                f"{len(pattern.enemy_phases)} enemy phases"
+            )
+            if self._counter_grab_mode:
+                pattern_name = _COUNTER_GRAB_PATTERN_NAMES.get(
+                    pattern.pattern_value,
+                    "UNKNOWN",
+                )
+                direction = counter_grab_pattern_direction(pattern.unique_id) or "UNKNOWN"
+                title = f"{pattern_name} · {direction}"
+                value = (
+                    "Player + 2 Enemies"
+                    if len(pattern.enemy_phases) > 1
+                    else "Player + 1 Enemy"
+                )
+            item = QTreeWidgetItem((
+                title,
+                value,
             ))
             item.setData(0, _ROLE, index)
             item.setData(0, _TARGET_COUNT_ROLE, 1)
@@ -3891,29 +4090,55 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             self._resolution_messages.append(message)
         return mapping
 
-    def _resolve_phase(self, phase: IssenMotionPhase, role: str) -> IssenMotionPhase:
+    def _resolve_phase(
+        self,
+        phase: IssenMotionPhase,
+        role: str,
+        preferred_motion_id: int | None = None,
+    ) -> IssenMotionPhase:
         reference = phase.reference
         if reference.motion_id is not None or reference.bank_id is None:
             return phase
-        candidates = self._bank_candidates.get(int(reference.bank_id), ())
+        group_ids = phase.motion_group_candidates or (phase.motion_group_id,)
+        candidates = tuple(dict.fromkeys(
+            candidate
+            for group_id in group_ids
+            for candidate in self._bank_candidates.get(int(group_id) >> 44, ())
+        ))
         preferred = preferred_motion_bank_candidate(candidates, role)
-        ordered = tuple(
-            item
-            for item in (preferred, *candidates)
-            if item is not None
-        )
+        ordered = tuple(dict.fromkeys(
+            item for item in (preferred, *candidates) if item is not None
+        ))
         seen = set()
+        resolved = []
         for candidate in ordered:
             key = candidate.resource_path.casefold()
             if key in seen:
                 continue
             seen.add(key)
-            motion_id = self._candidate_map(candidate).get(phase.motion_group_id)
-            if motion_id is None:
-                continue
+            mapping = self._candidate_map(candidate)
+            for group_id in group_ids:
+                motion_id = mapping.get(group_id)
+                if motion_id is not None:
+                    resolved.append((group_id, motion_id))
+        if resolved:
+            group_id, motion_id = next(
+                (
+                    item
+                    for item in resolved
+                    if preferred_motion_id is not None
+                    and int(item[1]) == int(preferred_motion_id)
+                ),
+                resolved[0],
+            )
             return replace(
                 phase,
-                reference=replace(reference, motion_id=int(motion_id)),
+                motion_group_id=int(group_id),
+                reference=InteractionMotionRef(
+                    int(group_id),
+                    int(group_id) >> 44,
+                    int(motion_id),
+                ),
             )
         message = (
             f"Unresolved {role} MotionGroupID "
@@ -3928,14 +4153,50 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         pattern: IssenPattern,
         player: tuple[IssenMotionPhase, ...],
         enemy: tuple[IssenMotionPhase, ...],
+        enemy2: tuple[IssenMotionPhase, ...] = (),
     ) -> tuple[tuple[str, str], ...]:
         rows = [
             ("Evidence", "GrappleMotionTable + adjacent MEX; runtime transitions are simulated"),
             ("Pattern", pattern.title),
             ("GrappleType", str(pattern.grapple_type)),
-            ("Pattern Value", f"{pattern.pattern_value} (0x{pattern.pattern_value & 0xFFFFFFFF:08X})"),
+            (
+                "Pattern Value",
+                (
+                    f"{_COUNTER_GRAB_PATTERN_NAMES.get(pattern.pattern_value, 'UNKNOWN')} · "
+                    f"{pattern.pattern_value} (0x{pattern.pattern_value & 0xFFFFFFFF:08X})"
+                    if self._counter_grab_mode
+                    else f"{pattern.pattern_value} (0x{pattern.pattern_value & 0xFFFFFFFF:08X})"
+                ),
+            ),
         ]
-        for role, phases in (("Player", player), ("Enemy", enemy)):
+        if self._counter_grab_mode:
+            direction = self._counter_grab_direction()
+            position = counter_grab_target_position(direction)
+            rows.extend((
+                (
+                    "Participant Layout",
+                    "Player + 2 Enemies" if enemy2 else "Player + 1 Enemy",
+                ),
+                ("Target Direction", direction),
+                (
+                    "Preview Placement",
+                    f"X {position[0]:.2f} m · Y {position[1]:.2f} m · Z {position[2]:.2f} m",
+                ),
+                (
+                    "Placement Evidence",
+                    "Direction comes from the selected pattern's _UniqueID; exact world distance is not stored in this MotionTable.",
+                ),
+                (
+                    "Enemy 2 Playback",
+                    (
+                        "Uses the second PartnerMotionList actor slot."
+                        if enemy2
+                        else "Not present in this single-partner Pattern A entry."
+                    ),
+                ),
+            ))
+        enemy_role = "Enemy 1" if self._counter_grab_mode and enemy2 else "Enemy"
+        for role, phases in (("Player", player), (enemy_role, enemy), ("Enemy 2", enemy2)):
             for index, phase in enumerate(phases, 1):
                 rows.extend((
                     (f"{role} Phase {index}", phase.action_name),
@@ -3952,6 +4213,24 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
                 ))
         rows.extend(("Diagnostic", value) for value in self._resolution_messages)
         return tuple(rows)
+
+    def _counter_grab_direction(self) -> str:
+        combo = getattr(self, "counter_grab_direction_combo", None)
+        value = combo.currentData() if combo is not None else "FRONT"
+        return value if value in _COUNTER_GRAB_DIRECTIONS else "FRONT"
+
+    def _on_counter_grab_direction_changed(self, _index: int) -> None:
+        if not self._counter_grab_mode:
+            return
+        self.stop_playback()
+        if self._current_reaction is not None:
+            self._set_details(self._pattern_rows(
+                self._current_reaction,
+                self._resolved_player_phases,
+                self._resolved_enemy_phases,
+                self._resolved_enemy2_phases,
+            ))
+        self._motion_loaded()
 
     def _candidate_pool(
         self,
@@ -3977,12 +4256,48 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         )
         self._resolution_messages.clear()
         pattern = self.document.patterns[index]
-        player = tuple(self._resolve_phase(phase, "Player") for phase in pattern.player_phases)
-        enemy = tuple(self._resolve_phase(phase, "Enemy") for phase in pattern.enemy_phases)
+        motion_pattern = pattern
+        enemy2_source: tuple[IssenMotionPhase, ...] = ()
+        if self._counter_grab_mode:
+            motion_pattern, enemy2_source = _counter_grab_actor_patterns(
+                self.document,
+                pattern,
+            )
+        player = tuple(
+            self._resolve_phase(phase, "Player")
+            for phase in motion_pattern.player_phases
+        )
+        enemy = tuple(
+            self._resolve_phase(
+                phase,
+                "Enemy",
+                (
+                    player[min(phase_index, len(player) - 1)].reference.motion_id
+                    if player
+                    else None
+                ),
+            )
+            for phase_index, phase in enumerate(motion_pattern.enemy_phases)
+        )
+        enemy2 = tuple(
+            self._resolve_phase(phase, "Enemy 2")
+            for phase in enemy2_source
+        )
+        self._resolved_player_phases = player
+        self._resolved_enemy_phases = enemy
+        self._resolved_enemy2_phases = enemy2
         followup_pattern = None
         followup_player: tuple[IssenMotionPhase, ...] = ()
         followup_enemy: tuple[IssenMotionPhase, ...] = ()
         self._current_reaction = pattern
+        if self._counter_grab_mode:
+            direction = counter_grab_pattern_direction(pattern.unique_id)
+            combo = getattr(self, "counter_grab_direction_combo", None)
+            if direction is not None and combo is not None:
+                direction_index = combo.findData(direction)
+                if direction_index >= 0:
+                    with QSignalBlocker(combo):
+                        combo.setCurrentIndex(direction_index)
         if self._combo_target_count > 1:
             combo_patterns = _break_issen_combo_patterns(self.document)
             combo_index = next(
@@ -4033,6 +4348,21 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             )
             transition_refs = ((transition.action_name, transition.reference),)
             self._combo_player_phase_counts = (len(player), len(followup_player))
+        elif self._counter_grab_mode:
+            player_refs = tuple(
+                (f"{phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(player, 1)
+            )
+            enemy_refs = tuple(
+                (f"{phase_index}. {phase.action_name}", phase.reference)
+                for phase_index, phase in enumerate(enemy, 1)
+            )
+            enemy2_refs = tuple(
+                (f"Enemy 2 · {phase.action_name}", phase.reference)
+                for phase in enemy2
+            )
+            transition_refs = ()
+            self._combo_player_phase_counts = (0, 0)
         else:
             player_refs = tuple(
                 (f"{phase_index}. {phase.action_name}", phase.reference)
@@ -4051,7 +4381,7 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         )
         self._enemy_labels = tuple(label for label, _ref in enemy_refs)
         self._enemy2_labels = tuple(label for label, _ref in enemy2_refs)
-        rows = list(self._pattern_rows(pattern, player, enemy))
+        rows = list(self._pattern_rows(pattern, player, enemy, enemy2))
         if self._combo_target_count > 1 and followup_pattern is not None:
             rows.extend((
                 ("Preview Mode", "Break Issen Combo · 2 Targets"),
@@ -4101,9 +4431,13 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         self.defender.set_content(enemy_refs, self._candidate_pool(enemy))
         self.enemy2.set_content(
             enemy2_refs,
-            self._candidate_pool(followup_enemy),
+            self._candidate_pool(
+                enemy2 if self._counter_grab_mode else followup_enemy
+            ),
         )
-        self.enemy2.setVisible(self._combo_target_count > 1)
+        self.enemy2.setVisible(
+            self._combo_target_count > 1 or bool(enemy2_refs)
+        )
         self._configuring_content = False
         self._frame = 0.0
         self._motion_loaded()
@@ -4148,6 +4482,13 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
                 enemy_starts = player_starts[:len(enemy_segments)]
         if enemy_starts:
             self.defender.configure_sequence(self._enemy_labels, enemy_starts)
+        if self._counter_grab_mode:
+            self.enemy2.configure_sequence(self._enemy2_labels)
+            if self.enemy2.sequence_segments:
+                self._counter_grab_target_world = counter_grab_target_transform(
+                    self.enemy2.segment_root_matrix(),
+                    self._counter_grab_direction(),
+                )
         attacker_duration = self.attacker.sequence_duration
         defender_duration = self.defender.sequence_duration
         attacker_segments = tuple(
@@ -4168,12 +4509,29 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             defender_start=defender_display_start,
             attacker_segments=attacker_segments,
             defender_segments=defender_segments,
+            extra_label=(
+                f"Enemy 2 · {self._counter_grab_direction()}"
+                if self._counter_grab_mode
+                else ""
+            ),
+            extra_segments=(
+                tuple(
+                    (segment.label, segment.start, segment.start + segment.duration)
+                    for segment in self.enemy2.sequence_segments
+                )
+                if self._counter_grab_mode
+                else ()
+            ),
         )
         end = self.timeline.end_frame
         with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
             self.frame_slider.setRange(0, round(end * _SLIDER_SCALE))
             self.frame_spin.setRange(0.0, end)
-        self._active_actor_panes = {"attacker": None, "defender": None}
+        self._active_actor_panes = {
+            "attacker": None,
+            "defender": None,
+            "enemy2": None,
+        }
         self.set_frame(min(self._frame, end))
 
     def _configure_break_issen_combo(self) -> None:
@@ -4320,9 +4678,6 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         self.set_frame(min(self._frame, end))
 
     def set_frame(self, frame: float) -> None:
-        if self._combo_target_count <= 1:
-            super().set_frame(frame)
-            return
         if not math.isfinite(frame):
             return
         self._frame = min(max(0.0, float(frame)), self.timeline.end_frame)
@@ -4330,6 +4685,44 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
             self.frame_slider.setValue(round(self._frame * _SLIDER_SCALE))
             self.frame_spin.setValue(self._frame)
         self.timeline.set_current_frame(self._frame)
+
+        if self._combo_target_count <= 1:
+            # Grapple/Issen documents deliberately bypass the Just Guard
+            # constructor and do not own its next-action state.  Evaluate the
+            # authored pair directly instead of entering the parent widget's
+            # Just Guard-only frame path.
+            player_root = self.attacker.prepare_sequence_frame(
+                self._frame,
+                self._attacker_start,
+            )
+            enemy_root = self.defender.prepare_sequence_frame(
+                self._frame,
+                self._defender_start,
+            )
+            planar_anchor = np.array(
+                (-enemy_root[0], 0.0, -enemy_root[2]),
+                dtype=np.float32,
+            )
+            player_anchor = planar_anchor.copy()
+            enemy_anchor = planar_anchor.copy()
+            player_anchor[1] = -player_root[1]
+            enemy_anchor[1] = -enemy_root[1]
+            self.attacker.set_anchor_translation(player_anchor)
+            self.defender.set_anchor_translation(enemy_anchor)
+            actor_panes = [
+                ("attacker", self.attacker),
+                ("defender", self.defender),
+            ]
+            if self._counter_grab_mode and self.enemy2.sequence_segments:
+                self.enemy2.prepare_sequence_frame(self._frame, 0.0)
+                self.enemy2.set_world_transform(self._counter_grab_target_world)
+                actor_panes.append(("enemy2", self.enemy2))
+            for role, pane in actor_panes:
+                if self._active_actor_panes.get(role) is not pane:
+                    pane.activate_scene()
+                    self._active_actor_panes[role] = pane
+                pane.render_prepared_frame()
+            return
 
         player_root = self.attacker.prepare_sequence_frame(self._frame, 0.0)
         enemy1_root = self.defender.prepare_sequence_frame(self._frame, 0.0)
@@ -4414,6 +4807,7 @@ def create_wots_issen_preview(handler):
         or not any(kind in lowered for kind in (
             "blockissen",
             "counterissen",
+            "countergrab",
             "chainissen",
             "blowgrap",
             "fatalblow",
