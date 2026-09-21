@@ -18,6 +18,7 @@ from file_handlers.rsz.btable_preview import (
 from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
 from file_handlers.rsz.rsz_file import RszFile
 from file_handlers.rsz.rsz_handler import RszHandler, _registry_filename_for_game
+from file_handlers.rsz.wots_registry import apply_wots_registry_overlay
 from utils.type_registry import TypeRegistry
 
 
@@ -70,6 +71,47 @@ class TestBTableGraph(unittest.TestCase):
     def test_wots_registry_filename_aliases(self):
         self.assertEqual(_registry_filename_for_game("OnimushaWOTS"), "rszoniwots.json")
         self.assertEqual(_registry_filename_for_game("ONIWOTS"), "rszoniwots.json")
+
+    def test_wots_gpu_cloth_retail_layout_overlay(self):
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        )
+        registry = apply_wots_registry_overlay(
+            TypeRegistry(str(registry_path)), "OnimushaWOTS"
+        )
+        info, type_id = registry.find_type_by_name("via.dynamics.GpuCloth")
+        self.assertEqual(type_id, 0x31D3746A)
+        self.assertEqual(info["crc"], "425c28f8")
+        names = [field["name"] for field in info["fields"]]
+        self.assertEqual(len(names), 85)
+        self.assertNotIn("Freeze", names)
+        self.assertNotIn("AutoTransform", names)
+        self.assertEqual(
+            names[names.index("CalculateMode") + 1],
+            "CurrentCalculateMode",
+        )
+        self.assertEqual(
+            names[names.index("VariableFPS") + 1],
+            "SmoothingQueueSize",
+        )
+
+    def test_wots_after_image_retail_layout_overlay(self):
+        registry_path = (
+            Path(__file__).resolve().parents[1]
+            / "resources/data/dumps/rszoniwots.json"
+        )
+        registry = apply_wots_registry_overlay(
+            TypeRegistry(str(registry_path)), "OnimushaWOTS"
+        )
+        info, type_id = registry.find_type_by_name("app.AfterImageController")
+        self.assertEqual(type_id, 0x9EA8D493)
+        self.assertEqual(info["crc"], "bda90b3d")
+        names = [field["name"] for field in info["fields"]]
+        self.assertEqual(
+            names[names.index("_CacheCount") + 1],
+            "_InitialCacheCount",
+        )
 
     def test_wots_context_finds_bundled_registry_without_a_setting(self):
         handler = RszHandler()

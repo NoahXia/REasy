@@ -121,6 +121,7 @@ class MotListPreviewWidget(QWidget):
         viewport_factory: ViewportFactory = ScenePreviewWidget,
         material_parse_in_subprocess: bool = True,
         snapshot_transform: Callable | None = None,
+        character_pfb_controls: bool = True,
     ):
         super().__init__()
         self.handler = handler
@@ -151,6 +152,13 @@ class MotListPreviewWidget(QWidget):
         self._attack_parameter_loaded = False
         root_path = str(getattr(handler, "filepath", "") or handler.model.name)
         self._root_path = root_path
+        self._character_pfb_path = ""
+        if character_pfb_controls:
+            from file_handlers.rsz.wots_character_pfb_target import (
+                inferred_wots_enemy_pfb_path,
+            )
+
+            self._character_pfb_path = inferred_wots_enemy_pfb_path(root_path)
         self._catalog = MotionPreviewCatalog(
             MotionListDocument(root_path, handler.model),
             support.tree_references,
@@ -247,18 +255,50 @@ class MotListPreviewWidget(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self.rig_pane.add_widget(self.rig_label)
-        preset_title = QLabel(self.tr("MODEL PRESET"))
+        preset_title = QLabel(
+            self.tr("CHARACTER PFB")
+            if self._character_pfb_path
+            else self.tr("MODEL PRESET")
+        )
         preset_title.setObjectName("motionInspectorLabel")
         self.rig_pane.add_widget(preset_title)
         self.model_preset_combo = QComboBox(self.rig_pane)
-        for preset in WOTS_MESH_PREVIEW_PRESETS:
-            self.model_preset_combo.addItem(self.tr(preset.label), preset.key)
-        self.model_preset_combo.setToolTip(
-            self.tr("Load all character mesh parts in the selected preview preset")
-        )
+        if self._character_pfb_path:
+            from file_handlers.rsz.wots_character_pfb_target import (
+                discover_wots_character_pfb_paths,
+            )
+
+            self.model_preset_combo.setEditable(True)
+            self.model_preset_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            paths = discover_wots_character_pfb_paths(
+                self.handler,
+                self._root_path,
+            ) or (self._character_pfb_path,)
+            for path in paths:
+                self.model_preset_combo.addItem(path, path)
+            self.model_preset_combo.setToolTip(
+                self.tr(
+                    "Load the enemy Character PFB and assemble its visible body, "
+                    "head, limbs, clothing, and weapon parts"
+                )
+            )
+        else:
+            for preset in WOTS_MESH_PREVIEW_PRESETS:
+                self.model_preset_combo.addItem(self.tr(preset.label), preset.key)
+            self.model_preset_combo.setToolTip(
+                self.tr("Load all character mesh parts in the selected preview preset")
+            )
         self.rig_pane.add_widget(self.model_preset_combo)
-        self.load_preset_button = QPushButton(self.tr("Load Model Preset"))
-        self.load_preset_button.clicked.connect(self._load_model_preset)
+        self.load_preset_button = QPushButton(
+            self.tr("Load PFB")
+            if self._character_pfb_path
+            else self.tr("Load Model Preset")
+        )
+        self.load_preset_button.clicked.connect(
+            self._load_character_pfb
+            if self._character_pfb_path
+            else self._load_model_preset
+        )
         self.rig_pane.add_widget(self.load_preset_button)
         self.load_resource_button = QPushButton(self.tr("Load Mesh Resource…"))
         self.load_resource_button.clicked.connect(self._load_mesh_resource)
@@ -599,6 +639,7 @@ class MotListPreviewWidget(QWidget):
             key = part.material_scope or "target"
             session = MeshMaterialSession(
                 part.handler,
+                explicit_mdf_path=part.explicit_mdf_path,
                 material_scope=part.material_scope,
                 texture_quality=self._materials.texture_quality,
                 parse_in_subprocess=self._material_parse_in_subprocess,
@@ -729,6 +770,45 @@ class MotListPreviewWidget(QWidget):
             self._show_error(
                 self.tr("Could not load model preset: {error}").format(error=exc)
             )
+
+    def _load_character_pfb(self) -> None:
+        resource_path = self.model_preset_combo.currentText().strip()
+        if not resource_path:
+            self._show_error(self.tr("Select a Character PFB first."))
+            return
+        self.load_preset_button.setEnabled(False)
+        try:
+            from file_handlers.rsz.wots_character_pfb_target import (
+                load_wots_character_pfb_target,
+            )
+
+            result = load_wots_character_pfb_target(
+                self.handler,
+                resource_path,
+                self,
+                type_registry=_wots_type_registry(self.handler),
+            )
+            self.set_target(result.target)
+            details = [
+                self.tr("Loaded {count} model part(s) from {path}.").format(
+                    count=len(result.part_paths),
+                    path=result.resource_path,
+                )
+            ]
+            if result.weapon_path:
+                details.append(
+                    self.tr("Weapon: {path} → R_Wep").format(
+                        path=result.weapon_path,
+                    )
+                )
+            details.extend(result.diagnostics)
+            self.rig_label.setText("\n".join(details))
+        except Exception as exc:
+            self._show_error(
+                self.tr("Could not load Character PFB: {error}").format(error=exc)
+            )
+        finally:
+            self.load_preset_button.setEnabled(bool(self._motions))
 
     def _export_gltf(self) -> None:
         motion = self.current_motion

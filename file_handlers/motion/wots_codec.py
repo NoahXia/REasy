@@ -740,10 +740,17 @@ class WotsMotListParser:
         pointers_offset = c.u64(0x10, "MOTLIST pointer table")
         ids_offset = c.u64(0x18, "MOTLIST motion-ID table")
         name_offset = c.u64(0x20, "MOTLIST name")
+        base_path_offset = c.u64(0x28, "MOTLIST base path")
         count = c.u32(0x38, "MOTLIST entry count")
         if count > len(c.data) // 8:
             raise MotionParseError(f"{label}: impossible MOTLIST entry count {count}")
         name, _ = c.utf16_z(name_offset, "MOTLIST name")
+        base_path = None
+        if base_path_offset:
+            base_path, _ = c.utf16_z(base_path_offset, "MOTLIST base path")
+            base_path = base_path.replace("\\", "/").lstrip("/")
+            if not base_path.casefold().startswith("natives/stm/"):
+                base_path = f"natives/stm/{base_path}"
         c.require(pointers_offset, count * 8, "MOTLIST pointer table")
         c.require(ids_offset, count * self.ID_ROW_SIZE, "MOTLIST motion-ID table")
         pointers = [
@@ -823,7 +830,12 @@ class WotsMotListParser:
                     external_path=external_path,
                 )
             )
-        return MotList(name=name, slots=slots, diagnostics=diagnostics)
+        return MotList(
+            name=name,
+            slots=slots,
+            base_motion_list_path=base_path,
+            diagnostics=diagnostics,
+        )
 
 
 class WotsMotionFormatCodec:

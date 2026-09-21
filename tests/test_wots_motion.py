@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import inspect
 import struct
 import tempfile
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,7 +81,11 @@ from file_handlers.rcol.shape_types import Capsule, ShapeType, Sphere
 from file_handlers.rsz.rsz_data_types import ArrayData, GuidData, ObjectData, U64Data
 from file_handlers.rsz.rsz_file import RszFile
 from file_handlers.rsz.wots_interaction_preview import (
+    InteractionDocument,
     InteractionMotionRef,
+    InteractionNextAction,
+    InteractionReaction,
+    WotsInteractionPreviewWidget,
     IssenDocument,
     IssenMotionPhase,
     IssenPattern,
@@ -94,13 +100,22 @@ from file_handlers.rsz.wots_interaction_preview import (
     _break_issen_next_turn_phase,
     _is_break_issen_combo_pattern,
     _issen_pattern_title,
+    _multiple_parry_target_label,
     _player_justguard_followups,
+    multiple_parry_candidates,
+    multiple_parry_player_references,
     parse_wots_action_motion_map,
     parse_wots_interaction_document,
     parse_wots_issen_document,
     parse_wots_next_action_guid_map,
+    parry_transition_frame,
     resolve_wots_grapple_action_phases,
     resolve_wots_justguard_next_actions,
+    shared_grapple_anchor_translations,
+    transition_world_transform,
+)
+from file_handlers.rsz.wots_character_pfb_target import (
+    inferred_wots_enemy_pfb_path,
 )
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
@@ -221,6 +236,35 @@ def _minimal_motlist(payload: bytes, motion_id: int = 42) -> bytes:
     data[0x40:0x4A] = "list".encode("utf-16le") + b"\0\0"
     struct.pack_into("<Q", data, pointer_table, payload_offset)
     data[payload_offset : payload_offset + len(payload)] = payload
+    struct.pack_into("<H", data, ids_offset + 8, motion_id)
+    return bytes(data)
+
+
+def _minimal_inherited_motlist(
+    base_path: str,
+    motion_id: int = 42,
+) -> bytes:
+    name_data = "derived".encode("utf-16le") + b"\0\0"
+    base_data = base_path.encode("utf-16le") + b"\0\0"
+    name_offset = 0x40
+    base_offset = name_offset + len(name_data)
+    pointer_table = (base_offset + len(base_data) + 0xF) & ~0xF
+    ids_offset = pointer_table + 0x10
+    data = bytearray(ids_offset + 72)
+    struct.pack_into("<I4s", data, 0, 1036, b"mlst")
+    struct.pack_into(
+        "<QQQQ",
+        data,
+        0x10,
+        pointer_table,
+        ids_offset,
+        name_offset,
+        base_offset,
+    )
+    struct.pack_into("<I", data, 0x38, 1)
+    data[name_offset : name_offset + len(name_data)] = name_data
+    data[base_offset : base_offset + len(base_data)] = base_data
+    struct.pack_into("<Q", data, pointer_table, 0)
     struct.pack_into("<H", data, ids_offset + 8, motion_id)
     return bytes(data)
 
@@ -376,6 +420,15 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_player_motion_in_enemy_folder_does_not_infer_enemy_pfb(self):
+        self.assertEqual(
+            inferred_wots_enemy_pfb_path(
+                "natives/stm/Motion/Enemy/Em107/00/01/"
+                "plw_Em107_Grapple/plw_Em107_Grapple.motlist.1036"
+            ),
+            "",
+        )
+
     def test_player_justguard_followups_match_runtime_action_params(self):
         followups = {
             item.action_name: item for item in _player_justguard_followups()
@@ -391,11 +444,103 @@ class TestWotsMotion(unittest.TestCase):
         self.assertEqual(finish.reference.bank_id, 20011)
         self.assertEqual(finish.reference.motion_id, 60)
         self.assertTrue(finish.resource_path.endswith("plw_RyoteAttack.motlist"))
-        multiple = followups["Multiple Parry · Repeat Current Reaction"]
+        multiple = followups["Multiple Parry · Runtime Search"]
         self.assertFalse(multiple.reference.available)
         self.assertEqual(multiple.preview_kind, "multiple_parry")
-        self.assertIn("GrappleMotionTable", multiple.diagnostic)
+        self.assertIn("own JustGuard reaction", multiple.diagnostic)
         self.assertEqual(len(followups), 9)
+
+    def test_multiple_parry_candidates_require_complete_parry_after_actions(self):
+        available = InteractionMotionRef(0x09CC2001, 40130, 1)
+        missing = InteractionMotionRef(0xFFFFFFFF, None, None)
+
+        def reaction(*, grapple_type=0, action_name="cParryAttackAfterAction"):
+            transition = InteractionNextAction(
+                1,
+                "guid",
+                action_name,
+                0x09CC282B62DBFDFB,
+                InteractionMotionRef(0x09CC282B62DBFDFB, 40130, 175),
+            )
+            return InteractionReaction(
+                4, 1, (0x09CC2001,), grapple_type, 0, 2 | 8, 0, 0, 1,
+                0, 0, False, False, 22, -1, available, available,
+                available, transition,
+            )
+
+        valid = reaction()
+        block = reaction(grapple_type=1)
+        wrong_action = reaction(action_name="cChargedAttackOneHand")
+        incomplete = replace(valid, attacker_motion=missing)
+        document = InteractionDocument(
+            "fixture.user.3", "Enemy", "Player",
+            (block, valid, wrong_action, incomplete), 1,
+        )
+        self.assertEqual(multiple_parry_candidates(document), ((1, valid),))
+        self.assertIn("REACTION_LEFT", _multiple_parry_target_label(valid))
+        self.assertIn("ACT_01", _multiple_parry_target_label(valid))
+
+    def test_multiple_parry_player_uses_adjust_then_just_guard(self):
+        enemy = InteractionMotionRef(0x09CC2067, 40130, 103)
+        player_adjust = InteractionMotionRef(0x09CC2066, 40130, 102)
+        player_just_guard = InteractionMotionRef(0x09CC2067, 40130, 103)
+        reaction = InteractionReaction(
+            8, 2, (0x09CC2001,), 0, 25, 4, 0, 0, 1,
+            0, 0, False, False, 5, -1, enemy, player_just_guard,
+            player_adjust, None,
+        )
+        document = InteractionDocument(
+            "fixture.user.3", "Enemy", "Player", (reaction,), 1,
+        )
+        self.assertEqual(
+            multiple_parry_player_references(document, reaction),
+            (
+                ("Multiple Parry · ADJUST", player_adjust),
+                ("Multiple Parry · JUST_GUARD", player_just_guard),
+            ),
+        )
+
+    def test_multiple_parry_shared_anchor_has_no_fixed_target_offset(self):
+        player_anchor, target_anchor = shared_grapple_anchor_translations(
+            (3.0, 7.0, -2.0),
+            (0.5, 1.0, 0.25),
+            (-0.75, 4.0, 1.5),
+        )
+        np.testing.assert_allclose(player_anchor, (2.5, 0.0, -2.25))
+        np.testing.assert_allclose(target_anchor, (3.75, 0.0, -3.5))
+
+    def test_multiple_parry_switches_on_authored_success_frame(self):
+        self.assertEqual(parry_transition_frame(25, 160.0, 140.0), 25.0)
+        self.assertEqual(parry_transition_frame(267, 213.0, 148.0), 148.0)
+        self.assertEqual(parry_transition_frame(-1, 50.0, 70.0), 0.0)
+
+    def test_action_transition_preserves_world_position_and_yaw(self):
+        source = np.identity(4, dtype=np.float32)
+        source[3, :3] = (2.0, 0.5, -3.0)
+        yaw = np.identity(4, dtype=np.float32)
+        yaw[0, 0], yaw[0, 2] = 0.0, -1.0
+        yaw[2, 0], yaw[2, 2] = 1.0, 0.0
+        actor = np.identity(4, dtype=np.float32)
+        actor[3, :3] = (4.0, 0.0, 1.0)
+        destination = np.identity(4, dtype=np.float32)
+        destination[3, :3] = (-5.0, 2.0, 8.0)
+        transform = transition_world_transform(source, yaw @ actor, destination)
+        world = source @ yaw @ actor
+        transitioned = destination @ transform
+        np.testing.assert_allclose(transitioned[3, (0, 2)], world[3, (0, 2)])
+        np.testing.assert_allclose(transitioned[2, (0, 2)], world[2, (0, 2)])
+
+    def test_interaction_render_frame_never_resamples_transition_clips(self):
+        source = inspect.getsource(WotsInteractionPreviewWidget.set_frame)
+        self.assertNotIn("transition_transform_to", source)
+        self.assertNotIn("segment_root_matrix", source)
+        self.assertIn("_next_action_transform", source)
+        self.assertIn("_multiple_shared_transform", source)
+        self.assertIn("activate_scene", source)
+        self.assertLess(
+            source.index("prepare_sequence_frame"),
+            source.index("set_world_transform"),
+        )
 
     def test_justguard_next_action_btable_dispatch(self):
         names = {
@@ -631,6 +776,38 @@ class TestWotsMotion(unittest.TestCase):
         self.assertEqual(model.slots[0].payload.value.name, "idle")
         with self.assertRaisesRegex(MotionWriteError, "read-only"):
             codec.write(model)
+
+    def test_v1036_null_slot_inherits_from_declared_base_motlist(self):
+        base_path = "natives/stm/Motion/Enemy/Em100/base.motlist"
+        base_model = WOTS_MOTION_FORMAT_CODEC.parse(
+            _minimal_motlist(_minimal_mot("inherited"), 105),
+            label="base",
+        )
+        derived_model = WOTS_MOTION_FORMAT_CODEC.parse(
+            _minimal_inherited_motlist(
+                "Motion/Enemy/Em100/base.motlist",
+                105,
+            ),
+            label="derived",
+        )
+
+        self.assertEqual(derived_model.base_motion_list_path, base_path)
+        resolution = MotionPreviewResolver(
+            lambda path: (
+                MotionListDocument(base_path, base_model)
+                if path == base_path
+                else None
+            ),
+            WOTS_TREE_MOTION_REFERENCES,
+        ).resolve(MotionListDocument("derived", derived_model))
+
+        self.assertEqual(len(resolution.entries), 1)
+        self.assertEqual(resolution.entries[0].motion_id, 105)
+        self.assertEqual(resolution.entries[0].name, "inherited")
+        self.assertEqual(
+            resolution.entries[0].inheritance_chain,
+            ("derived", base_path),
+        )
 
     def test_direct_v973(self):
         motion = WOTS_MOTION_FORMAT_CODEC.parse_mot(

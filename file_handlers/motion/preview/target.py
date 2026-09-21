@@ -18,6 +18,7 @@ class RigPreviewPart:
     mesh: object
     handler: MeshHandler
     material_scope: str = ""
+    explicit_mdf_path: str = ""
     attachment_joint: str = ""
     weapon_collision_type: int | None = None
 

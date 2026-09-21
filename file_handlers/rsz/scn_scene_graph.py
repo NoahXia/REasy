@@ -17,6 +17,7 @@ from file_handlers.rsz.rsz_data_types import (
     ResourceData,
     StringData,
     StructData,
+    UserDataData,
 )
 from file_handlers.rsz.rsz_file import RszFile
 from utils.resource_file_utils import normalize_resource_path
@@ -480,6 +481,7 @@ class ScnSceneGraphBuilder:
         self._document_source_cache: dict[str, ScnSceneDocument] = {}
         self._type_name_cache: dict[tuple[int, int], str] = {}
         self._type_parent_cache: dict[str, frozenset[str]] = {}
+        self._wots_userdata_cache: dict[str, RszFile | None] = {}
 
     def build(self, root_scn, *, root_path: str | None = None) -> ScnSceneGraph:
         source_path = root_path or getattr(root_scn, "filepath", "") or "<memory>"
@@ -732,6 +734,13 @@ class ScnSceneGraphBuilder:
                 base_world_matrix,
             )
 
+        if self.game_version == "OnimushaWOTS":
+            self._append_wots_montage_renderables(
+                graph,
+                document,
+                document_instance_id,
+            )
+
         if depth >= self.max_depth:
             if document.folder_references:
                 self._warn(
@@ -952,6 +961,90 @@ class ScnSceneGraphBuilder:
                         source_object,
                         component,
                     ),
+                )
+
+    def _append_wots_montage_renderables(
+        self,
+        graph,
+        document,
+        document_instance_id,
+    ) -> None:
+        from .wots_montage_preview import resolve_wots_montage_assembly
+
+        def load_user_data(_owner_rsz, reference: UserDataData):
+            path = str(reference.string or "").strip().rstrip("\0")
+            if not path or self.resource_resolver is None:
+                return None
+            normalized = normalize_scene_path(path)
+            candidates = (
+                (normalized + ".3", normalized)
+                if normalized.casefold().endswith(".user")
+                else (normalized,)
+            )
+            for candidate in candidates:
+                key = candidate.casefold()
+                if key in self._wots_userdata_cache:
+                    cached = self._wots_userdata_cache[key]
+                    if cached is not None:
+                        return cached
+                    continue
+                try:
+                    resolved = self.resource_resolver(candidate, document.document_id)
+                    if resolved is None or resolved.data is None:
+                        self._wots_userdata_cache[key] = None
+                        continue
+                    parsed = RszFile()
+                    parsed.filepath = resolved.path
+                    parsed.game_version = self.game_version
+                    parsed.type_registry = self.type_registry
+                    parsed.read(resolved.data, validate_type_registry=False)
+                    self._wots_userdata_cache[key] = parsed
+                    return parsed
+                except (OSError, TypeError, ValueError):
+                    self._wots_userdata_cache[key] = None
+            return None
+
+        assembly = resolve_wots_montage_assembly(document, load_user_data)
+        for index, part in enumerate(assembly.parts, 1):
+            source_object = part.source_object
+            component = part.source_component
+            self._append_renderable(
+                graph,
+                source_object,
+                component,
+                document_instance_id,
+                normalize_scene_path(part.mesh_path),
+                normalize_scene_path(part.material_path),
+                source_object.document_world_matrix,
+                source_object.world_matrix,
+                source_kind="wots_montage",
+                source_group_instance_id=(part.holder_id << 16) | index,
+                visible_by_default=self._renderable_visible(
+                    document,
+                    source_object,
+                    component,
+                ),
+            )
+        for diagnostic in assembly.diagnostics:
+            if diagnostic.source_object is not None and diagnostic.source_component is not None:
+                self._warn_component(
+                    graph,
+                    diagnostic.code,
+                    diagnostic.message,
+                    document,
+                    document_instance_id,
+                    diagnostic.source_object,
+                    diagnostic.source_component,
+                    diagnostic.path,
+                )
+            else:
+                self._warn(
+                    graph,
+                    diagnostic.code,
+                    diagnostic.message,
+                    document.document_id,
+                    document_instance_id,
+                    path=diagnostic.path,
                 )
 
     @staticmethod

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from file_handlers.motion.motlist_handler import MotListHandler
+from file_handlers.motion.preview.event_timeline import motion_timeline_lanes
 from file_handlers.motion.preview.widget import MotListPreviewWidget
 from file_handlers.motbank.motbank_file import MotbankFile
 from file_handlers.rsz.rsz_file import RszFile
@@ -44,6 +46,10 @@ from ui.scene.scene_preview import ScenePreviewWidget
 from utils.resource_file_utils import resolve_handler_resource_data
 
 from .rsz_data_types import ArrayData, ObjectData
+from .wots_character_pfb_target import (
+    discover_wots_character_pfb_paths,
+    load_wots_character_pfb_target,
+)
 
 
 _ROLE = int(Qt.ItemDataRole.UserRole)
@@ -95,9 +101,79 @@ class _MotionSegment:
     reference: InteractionMotionRef
     start: float
     duration: float
+    root_start_matrix: np.ndarray
+    root_end_matrix: np.ndarray
     root_start: np.ndarray
     root_end: np.ndarray
     root_correction: np.ndarray
+    root_transform: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class _ActorPlacement:
+    """One actor's planar world transform at a state transition."""
+
+    rotation: np.ndarray
+    translation: np.ndarray
+
+
+def _identity_actor_placement() -> _ActorPlacement:
+    return _ActorPlacement(
+        np.identity(3, dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+    )
+
+
+def _root_matrix_from_snapshot(preview) -> np.ndarray:
+    if preview is None or not preview.controller.ready:
+        return np.identity(4, dtype=np.float32)
+    snapshot = preview.controller.sample()
+    rig = preview.controller.rig
+    root_index = next(
+        (
+            index
+            for index, joint in enumerate(rig.joints if rig is not None else ())
+            if joint.parent_index is None
+        ),
+        0,
+    )
+    return np.asarray(
+        snapshot.pose.world_matrices[root_index],
+        dtype=np.float32,
+    ).reshape(4, 4).copy()
+
+
+def _planar_rotation(matrix) -> np.ndarray:
+    source = np.asarray(matrix, dtype=np.float32).reshape(4, 4)
+    forward = np.array((source[2, 0], 0.0, source[2, 2]), dtype=np.float32)
+    length = float(np.linalg.norm(forward))
+    if length <= 1e-6:
+        return np.identity(3, dtype=np.float32)
+    forward /= length
+    right = np.array((forward[2], 0.0, -forward[0]), dtype=np.float32)
+    return np.array((right, (0.0, 1.0, 0.0), forward), dtype=np.float32)
+
+
+def transition_world_transform(
+    source_root,
+    source_transform,
+    destination_root,
+) -> np.ndarray:
+    """Keep world position and yaw when switching to another action clip."""
+    source = np.asarray(source_root, dtype=np.float32).reshape(4, 4)
+    actor = np.asarray(source_transform, dtype=np.float32).reshape(4, 4)
+    destination = np.asarray(destination_root, dtype=np.float32).reshape(4, 4)
+    world = source @ actor
+    source_yaw = _planar_rotation(world)
+    destination_yaw = _planar_rotation(destination)
+    rotation = destination_yaw.T @ source_yaw
+    transform = np.identity(4, dtype=np.float32)
+    transform[:3, :3] = rotation
+    transformed_start = destination[3, :3] @ rotation
+    transform[3, 0] = world[3, 0] - transformed_start[0]
+    transform[3, 1] = -destination[3, 1]
+    transform[3, 2] = world[3, 2] - transformed_start[2]
+    return transform
 
 
 def _transform_motion_snapshot(snapshot, matrix: np.ndarray):
@@ -419,17 +495,137 @@ def _player_justguard_followups() -> tuple[InteractionNextAction, ...]:
         InteractionNextAction(
             0,
             "",
-            "Multiple Parry · Repeat Current Reaction",
+            "Multiple Parry · Runtime Search",
             _INVALID_MOTION_GROUP_ID,
             InteractionMotionRef(_INVALID_MOTION_GROUP_ID, None, None),
             diagnostic=(
-                "Runtime cMultipleParry reuses the selected JustGuard "
-                "GrappleMotionTable. The nearby target placement and repeated "
-                "target selection are simulated."
+                "Runtime searches the initial enemy's multi-grapple partners, "
+                "then uses the selected target's own JustGuard reaction and "
+                "cParryAttackAfterAction."
             ),
             preview_kind="multiple_parry",
         ),
     )
+
+
+def multiple_parry_candidates(
+    document: InteractionDocument,
+) -> tuple[tuple[int, InteractionReaction], ...]:
+    """Return reactions a runtime PARRY partner can contribute.
+
+    ``findMultipleGrappleFromEm`` asks the nearby enemy's current action for a
+    PARRY grapple.  For an offline preview there is no live action state, so we
+    expose every statically complete PARRY result from the opened condition map
+    and let the user choose the state/direction that enemy is assumed to be in.
+    """
+    return tuple(
+        (index, reaction)
+        for index, reaction in enumerate(document.reactions)
+        if reaction.grapple_type == 0
+        and reaction.attacker_motion.available
+        and reaction.defender_motion.available
+        and reaction.next_action is not None
+        and reaction.next_action.action_name == "cParryAttackAfterAction"
+    )
+
+
+def multiple_parry_player_references(
+    document: InteractionDocument,
+    reaction: InteractionReaction,
+) -> tuple[tuple[str, InteractionMotionRef], ...]:
+    """Return the two authored cMultipleJustGuardBase motion states."""
+    references = (
+        (
+            ("Multiple Parry · ADJUST", reaction.defender_start_motion),
+            ("Multiple Parry · JUST_GUARD", reaction.defender_motion),
+        )
+        if document.defender_role == "Player"
+        else (("Multiple Parry · JUST_GUARD", reaction.attacker_motion),)
+        if document.attacker_role == "Player"
+        else ()
+    )
+    return tuple(item for item in references if item[1].available)
+
+
+def _multiple_parry_target_label(reaction: InteractionReaction) -> str:
+    condition = _condition_label(reaction.condition_flags)
+    action = (
+        f"ACT_{reaction.next_action_type:02d}"
+        if reaction.next_action_type > 0
+        else "runtime"
+    )
+    triggers = ", ".join(
+        f"0x{value:016X}" for value in reaction.trigger_groups
+    ) or "no trigger"
+    return (
+        f"Group {reaction.group_index} · Reaction {reaction.reaction_index} · "
+        f"{condition} · {action} · {triggers}"
+    )
+
+
+def _multiple_parry_runtime_rows(
+    reaction: InteractionReaction,
+) -> tuple[tuple[str, str], ...]:
+    transition = reaction.next_action
+    return (
+        ("Multiple Parry SearchType", "PARRY"),
+        (
+            "Runtime Search",
+            "Initial enemy ISearchMultiGrappleAciton → PartnerList",
+        ),
+        (
+            "Runtime Validation",
+            "Every partner; terrain/line clearance uses a 0.2 m probe radius",
+        ),
+        (
+            "Damage Dispatch",
+            "Shared AttackParam is applied independently to every attacker",
+        ),
+        ("Selected Target", _multiple_parry_target_label(reaction)),
+        ("Selected Target Condition", _condition_label(reaction.condition_flags)),
+        ("Selected Target Grapple", reaction.attacker_motion.label),
+        (
+            "Selected Target AfterAction",
+            (
+                f"{transition.action_name} · {transition.reference.label}"
+                if transition is not None
+                else "Runtime unresolved"
+            ),
+        ),
+        (
+            "Placement",
+            "Shared authored Grapple anchor; each actor removes its own root start",
+        ),
+    )
+
+
+def shared_grapple_anchor_translations(
+    continuity_world,
+    player_root_start,
+    target_root_start,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Align two authored clips to one world anchor without a guessed offset."""
+    continuity = np.asarray(continuity_world, dtype=np.float32).reshape(3)
+    player_start = np.asarray(player_root_start, dtype=np.float32).reshape(3)
+    target_start = np.asarray(target_root_start, dtype=np.float32).reshape(3)
+    player_anchor = continuity - player_start
+    target_anchor = continuity - target_start
+    # Character controllers own vertical placement in WOTS.  Root Y is
+    # independently ground-locked by the caller on every sampled frame.
+    player_anchor[1] = 0.0
+    target_anchor[1] = 0.0
+    return player_anchor, target_anchor
+
+
+def parry_transition_frame(
+    source_trigger_frame: int,
+    attacker_duration: float,
+    defender_duration: float,
+) -> float:
+    """Clamp the authored parry-success frame to the playable pair."""
+    duration = max(0.0, min(float(attacker_duration), float(defender_duration)))
+    trigger = float(source_trigger_frame)
+    return min(max(trigger, 0.0), duration)
 
 
 _BREAK_ISSEN_COMBO_ADJUST_GUID = "074b37a4ce154b18a40c017904d10f08"
@@ -1543,8 +1739,11 @@ class InteractionTimeline(QWidget):
         self._source_trigger = 0
         self._attacker_label = "Attacker"
         self._defender_label = "Defender"
+        self._extra_label = ""
         self._attacker_segments: tuple[tuple[str, float, float], ...] = ()
         self._defender_segments: tuple[tuple[str, float, float], ...] = ()
+        self._extra_segments: tuple[tuple[str, float, float], ...] = ()
+        self._extra_end = 0.0
         self.setMinimumHeight(142)
 
     def set_role_labels(self, attacker: str, defender: str) -> None:
@@ -1554,7 +1753,7 @@ class InteractionTimeline(QWidget):
 
     @property
     def end_frame(self) -> float:
-        return max(self._attacker_end, self._defender_end, 1.0)
+        return max(self._attacker_end, self._defender_end, self._extra_end, 1.0)
 
     def configure(
         self,
@@ -1566,6 +1765,8 @@ class InteractionTimeline(QWidget):
         defender_start: float = 0.0,
         attacker_segments: tuple[tuple[str, float, float], ...] = (),
         defender_segments: tuple[tuple[str, float, float], ...] = (),
+        extra_label: str = "",
+        extra_segments: tuple[tuple[str, float, float], ...] = (),
     ) -> None:
         self._attacker_start = max(0.0, float(attacker_start))
         self._attacker_end = max(0.0, float(attacker_end))
@@ -1574,8 +1775,18 @@ class InteractionTimeline(QWidget):
         self._source_trigger = int(source_trigger)
         self._attacker_segments = tuple(attacker_segments)
         self._defender_segments = tuple(defender_segments)
+        self._extra_label = str(extra_label)
+        self._extra_segments = tuple(extra_segments)
+        self._extra_end = max(
+            (float(finish) for _label, _start, finish in self._extra_segments),
+            default=0.0,
+        )
         self.setMinimumHeight(
-            142 if self._attacker_segments or self._defender_segments else 92
+            176
+            if self._extra_segments
+            else 142
+            if self._attacker_segments or self._defender_segments
+            else 92
         )
         self._frame = min(self._frame, self.end_frame)
         self.update()
@@ -1720,11 +1931,26 @@ class InteractionTimeline(QWidget):
             end,
             QColor(83, 159, 104),
         )
+        if self._extra_segments:
+            painter.setPen(palette.text().color())
+            painter.drawText(8, 97, self._extra_label or "Additional Actor")
+            self._draw_segments(
+                painter,
+                self._extra_segments,
+                0.0,
+                self._extra_end,
+                81,
+                left,
+                width,
+                end,
+                QColor(155, 105, 190),
+            )
+        summary_y = 122 if self._extra_segments else 88
         self._draw_segment_summary(
             painter,
             self._attacker_label,
             self._attacker_segments,
-            88,
+            summary_y,
             left,
             width,
         )
@@ -1732,21 +1958,31 @@ class InteractionTimeline(QWidget):
             painter,
             self._defender_label,
             self._defender_segments,
-            108,
+            summary_y + 20,
             left,
             width,
         )
+        if self._extra_segments:
+            self._draw_segment_summary(
+                painter,
+                self._extra_label or "Additional Actor",
+                self._extra_segments,
+                summary_y + 40,
+                left,
+                width,
+            )
 
         tick_step = max(1, int(math.ceil(end / 8.0)))
         painter.setPen(QColor(130, 130, 130))
+        tick_bottom = 174 if self._extra_segments else 136
         for frame in range(0, int(end) + 1, tick_step):
             x = left + round(width * frame / end)
-            painter.drawLine(x, 10, x, 72)
-            painter.drawText(x + 2, 136, str(frame))
+            painter.drawLine(x, 10, x, 104 if self._extra_segments else 72)
+            painter.drawText(x + 2, tick_bottom, str(frame))
 
         current_x = left + round(width * self._frame / end)
         painter.setPen(QPen(QColor(245, 245, 245), 2))
-        painter.drawLine(current_x, 8, current_x, 72)
+        painter.drawLine(current_x, 8, current_x, 104 if self._extra_segments else 72)
         painter.setPen(QColor(236, 166, 45))
         painter.drawText(
             left,
@@ -2057,7 +2293,10 @@ class _ActorMotionPane(QWidget):
         self._sequence_signature: tuple | None = None
         self._active_motion_id: int | None = None
         self._segment_correction = np.zeros(3, dtype=np.float32)
+        self._segment_transform = np.identity(4, dtype=np.float32)
+        self._base_transform = np.identity(4, dtype=np.float32)
         self._world_transform = np.identity(4, dtype=np.float32)
+        self._model_target = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
@@ -2112,6 +2351,19 @@ class _ActorMotionPane(QWidget):
                 self.path_combo.setCurrentIndex(max(0, index))
         self._reload()
 
+    def set_model_target(self, target) -> None:
+        """Use a shared assembled model for this actor's current and future clips."""
+        self._model_target = target
+        if self._preview is None or target is None:
+            return
+        self._preview.set_target(target)
+        current = self._preview.current_entry
+        if current is not None:
+            self.status.setText(
+                f"{self._loaded_path}\n{current.name or current.motion_id}\n"
+                f"{target.label}"
+            )
+
     def seek(self, frame: float) -> None:
         if self._preview is not None:
             self._preview.seek_frame(frame)
@@ -2141,24 +2393,10 @@ class _ActorMotionPane(QWidget):
         return True
 
     def _root_translation(self) -> np.ndarray:
-        preview = self._preview
-        if preview is None or not preview.controller.ready:
-            return np.zeros(3, dtype=np.float32)
-        snapshot = preview.controller.sample()
-        rig = preview.controller.rig
-        root_index = next(
-            (
-                index
-                for index, joint in enumerate(rig.joints if rig is not None else ())
-                if joint.parent_index is None
-            ),
-            0,
-        )
-        matrix = np.asarray(
-            snapshot.pose.world_matrices[root_index],
-            dtype=np.float32,
-        ).reshape(4, 4)
-        return matrix[3, :3].copy()
+        return self._root_matrix()[3, :3].copy()
+
+    def _root_matrix(self) -> np.ndarray:
+        return _root_matrix_from_snapshot(self._preview)
 
     def configure_sequence(
         self,
@@ -2187,37 +2425,51 @@ class _ActorMotionPane(QWidget):
 
         by_label = {label: ref for label, ref in self._references}
         segments = []
-        corrected_end = None
+        corrected_end_matrix = None
+        previous_transform = np.identity(4, dtype=np.float32)
         contiguous_start = 0.0
         for index, label in enumerate(labels):
             reference = by_label.get(label)
             if reference is None or not self._select_reference(reference):
                 continue
             duration = max(0.0, float(self._preview.preview_end_frame))
+            segment_start = starts[index] if index < len(starts) else contiguous_start
+            if index + 1 < len(starts) and starts[index + 1] > segment_start:
+                duration = min(duration, starts[index + 1] - segment_start)
             self._preview.controller.set_frame(0.0)
-            root_start = self._root_translation()
+            root_start_matrix = self._root_matrix()
+            root_start = root_start_matrix[3, :3].copy()
             self._preview.controller.set_frame(duration)
-            root_end = self._root_translation()
-            correction = (
-                np.zeros(3, dtype=np.float32)
-                if corrected_end is None or not preserve_root_continuity
-                else corrected_end - root_start
-            )
-            corrected_end = (
-                root_end + correction
+            root_end_matrix = self._root_matrix()
+            root_end = root_end_matrix[3, :3].copy()
+            root_transform = np.identity(4, dtype=np.float32)
+            if corrected_end_matrix is not None and preserve_root_continuity:
+                root_transform = transition_world_transform(
+                    root_end_matrix_previous,
+                    previous_transform,
+                    root_start_matrix,
+                )
+            correction = root_transform[3, :3].copy()
+            corrected_end_matrix = (
+                root_end_matrix @ root_transform
                 if preserve_root_continuity
                 else None
             )
+            root_end_matrix_previous = root_end_matrix
+            previous_transform = root_transform
             segments.append(_MotionSegment(
                 label,
                 reference,
-                starts[index] if index < len(starts) else contiguous_start,
+                segment_start,
                 duration,
+                root_start_matrix,
+                root_end_matrix,
                 root_start,
                 root_end,
                 correction,
+                root_transform,
             ))
-            contiguous_start += duration
+            contiguous_start = segment_start + duration
         self._sequence = tuple(segments)
         if self._sequence:
             self._select_reference(self._sequence[0].reference)
@@ -2243,31 +2495,113 @@ class _ActorMotionPane(QWidget):
                 break
         self._select_reference(selected.reference)
         self._segment_correction = selected.root_correction.copy()
+        self._segment_transform = selected.root_transform.copy()
+        self._world_transform = self._segment_transform @ self._base_transform
         self._preview.controller.set_frame(local_frame)
-        return self._root_translation() + self._segment_correction
+        root = self._root_matrix() @ self._segment_transform
+        return root[3, :3].copy()
 
     def set_anchor_translation(self, translation) -> None:
-        self._world_transform = np.identity(4, dtype=np.float32)
-        self._world_transform[3, :3] = (
-            self._segment_correction
-            + np.asarray(translation, dtype=np.float32).reshape(3)
-        )
+        self._base_transform = np.identity(4, dtype=np.float32)
+        self._base_transform[3, :3] = np.asarray(
+            translation,
+            dtype=np.float32,
+        ).reshape(3)
+        self._world_transform = self._segment_transform @ self._base_transform
 
     def set_world_transform(self, transform) -> None:
         """Apply a complete row-vector world transform to this actor."""
         value = np.asarray(transform, dtype=np.float32).reshape(4, 4)
         if not np.isfinite(value).all():
             raise ValueError("actor world transform must contain finite values")
-        self._world_transform = value.copy()
+        self._base_transform = value.copy()
+        self._world_transform = self._segment_transform @ self._base_transform
+
+    @property
+    def world_transform(self) -> np.ndarray:
+        return self._world_transform.copy()
+
+    def sequence_transition_transform(
+        self,
+        frame: float,
+        start_frame: float,
+        destination_segment: int = 0,
+    ) -> np.ndarray:
+        """Build a no-pop transform for switching from this actor to a pane."""
+        self.prepare_sequence_frame(frame, start_frame)
+        return self._root_matrix() @ self._world_transform
+
+    def segment_root_matrix(self, index: int = 0, *, at_end: bool = False) -> np.ndarray:
+        if self._preview is None or not self._sequence:
+            return np.identity(4, dtype=np.float32)
+        segment = self._sequence[min(max(0, index), len(self._sequence) - 1)]
+        self._select_reference(segment.reference)
+        self._preview.controller.set_frame(segment.duration if at_end else 0.0)
+        return self._root_matrix()
+
+    def event_transition_frame(self, label: str, event_name: str) -> float | None:
+        """Return the first authored frame for a state-changing MOT event."""
+        if self._preview is None:
+            return None
+        reference = next(
+            (ref for item_label, ref in self._references if item_label == label),
+            None,
+        )
+        if reference is None or not self._select_reference(reference):
+            return None
+        motion = self._preview.current_motion
+        if motion is None:
+            return None
+        frames = []
+        wanted = str(event_name).casefold()
+        for lane in motion_timeline_lanes(motion):
+            if (
+                str(lane.name).casefold() != wanted
+                and str(lane.track_type).casefold() != wanted.replace(" ", "")
+                and wanted not in str(lane.name).casefold()
+            ):
+                continue
+            frames.extend(float(start) for start, _finish in lane.intervals)
+            frames.extend(float(frame) for frame in lane.markers)
+        return min(frames) if frames else None
+
+    def transition_transform_to(
+        self,
+        destination: "_ActorMotionPane",
+        source_frame: float,
+        source_start_frame: float,
+    ) -> np.ndarray:
+        """Derive a destination clip transform from this actor's switch pose."""
+        self.prepare_sequence_frame(source_frame, source_start_frame)
+        destination_start = destination.segment_root_matrix(0)
+        return transition_world_transform(
+            self._root_matrix(),
+            self.world_transform,
+            destination_start,
+        )
 
     def render_prepared_frame(self) -> None:
         if self._preview is not None:
             self._preview._render()
 
+    def activate_scene(self) -> None:
+        """Restore this pane's mesh/rig bindings in a shared actor slot."""
+        if self._preview is None or not self._preview.controller.ready:
+            return
+        # A Main pane and its Follow-up pane intentionally share one actor key.
+        # Their independent renderers cannot observe when the other pane has
+        # replaced that key's geometry and GPU skinning binding, so force one
+        # rebuild only when ownership of the actor slot changes.
+        self._preview._scene_renderer.clear(reset_camera=False)
+        self._preview._render(reset_camera=False)
+
     def _clear_preview(self) -> None:
         self._sequence = ()
         self._sequence_signature = None
         self._active_motion_id = None
+        self._segment_transform = np.identity(4, dtype=np.float32)
+        self._base_transform = np.identity(4, dtype=np.float32)
+        self._world_transform = np.identity(4, dtype=np.float32)
         if self._preview is None:
             return
         self._preview.cleanup()
@@ -2332,6 +2666,7 @@ class _ActorMotionPane(QWidget):
                 # the interaction document while either target is being replaced.
                 material_parse_in_subprocess=False,
                 snapshot_transform=self._transform_snapshot,
+                character_pfb_controls=False,
             )
             preview.setParent(self)
             preview.hide()
@@ -2356,7 +2691,9 @@ class _ActorMotionPane(QWidget):
                 raise ValueError(
                     f"Motion {ref.motion_id} is missing from {resource_path}"
                 )
-            if preset_index >= 0:
+            if self._model_target is not None:
+                preview.set_target(self._model_target)
+            elif preset_index >= 0:
                 preview._load_model_preset()
         except (OSError, ValueError) as exc:
             self._clear_preview()
@@ -2389,6 +2726,7 @@ class WotsInteractionPreviewWidget(QWidget):
         self._attacker_start = 0.0
         self._defender_start = 0.0
         self._next_action_start = 0.0
+        self._multiple_enemy_after_start = 0.0
         self._next_action_role = ""
         self._next_action_label = ""
         self._next_action_transition: InteractionNextAction | None = None
@@ -2398,14 +2736,16 @@ class WotsInteractionPreviewWidget(QWidget):
         self._player_followup_labels: tuple[str, ...] = ()
         self._player_followup_transition: InteractionNextAction | None = None
         self._multiple_parry_active = False
-        self._multiple_enemy_role = (
-            "attacker" if self.document.attacker_role == "Enemy" else "defender"
-        )
-        self._multiple_target_offset = np.array(
-            (0.0, 0.0, 2.5),
-            dtype=np.float32,
-        )
+        self._multiple_target_reaction: InteractionReaction | None = None
         self._configuring_content = False
+        self._next_action_transform: np.ndarray | None = None
+        self._player_followup_transform: np.ndarray | None = None
+        self._multiple_shared_transform: np.ndarray | None = None
+        self._enemy_model_target = None
+        self._active_actor_panes: dict[str, _ActorMotionPane | None] = {
+            "attacker": None,
+            "defender": None,
+        }
         self._mex_maps: dict[str, tuple[dict[int, int], str]] = {}
         self._playing = False
         self._elapsed = QElapsedTimer()
@@ -2485,6 +2825,36 @@ class WotsInteractionPreviewWidget(QWidget):
         banner.setObjectName("motionStatusBar")
         root.addWidget(banner)
 
+        enemy_model_row = QHBoxLayout()
+        enemy_model_row.addWidget(QLabel(self.tr("Enemy Character PFB"), self))
+        self.enemy_pfb_combo = QComboBox(self)
+        self.enemy_pfb_combo.setEditable(True)
+        self.enemy_pfb_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for path in discover_wots_character_pfb_paths(
+            self.handler,
+            self.document.source_path,
+        ):
+            self.enemy_pfb_combo.addItem(path, path)
+        self.enemy_pfb_combo.setToolTip(self.tr(
+            "Choose a WOTS Character PFB. Its visible Montage and Mesh parts "
+            "will be assembled and used by every enemy animation pane."
+        ))
+        enemy_model_row.addWidget(self.enemy_pfb_combo, 1)
+        self.enemy_pfb_browse_button = QPushButton(self.tr("Browse..."), self)
+        self.enemy_pfb_browse_button.clicked.connect(self._browse_enemy_character_pfb)
+        enemy_model_row.addWidget(self.enemy_pfb_browse_button)
+        self.enemy_pfb_load_button = QPushButton(self.tr("Load PFB"), self)
+        self.enemy_pfb_load_button.clicked.connect(self._load_enemy_character_pfb)
+        enemy_model_row.addWidget(self.enemy_pfb_load_button)
+        root.addLayout(enemy_model_row)
+        self.enemy_pfb_status = QLabel(
+            self.tr("Using the built-in enemy model preset."),
+            self,
+        )
+        self.enemy_pfb_status.setWordWrap(True)
+        self.enemy_pfb_status.setObjectName("motionStatusBar")
+        root.addWidget(self.enemy_pfb_status)
+
         body = QSplitter(Qt.Orientation.Horizontal, self)
         self.reaction_tree = QTreeWidget(body)
         self.reaction_tree.setHeaderLabels((self.tr("Reaction"), self.tr("Value")))
@@ -2545,6 +2915,11 @@ class WotsInteractionPreviewWidget(QWidget):
                 None,
             )
             for transition in _player_justguard_followups():
+                if (
+                    transition.preview_kind == "multiple_parry"
+                    and self.document.defender_role != "Player"
+                ):
+                    continue
                 self.player_followup_combo.addItem(
                     transition.action_name,
                     transition,
@@ -2557,6 +2932,22 @@ class WotsInteractionPreviewWidget(QWidget):
                 self._on_player_followup_changed
             )
             controls.addWidget(self.player_followup_combo)
+            controls.addWidget(QLabel(self.tr("Multiple Parry Target"), preview_area))
+            self.multiple_parry_target_combo = QComboBox(preview_area)
+            for reaction_index, reaction in multiple_parry_candidates(self.document):
+                self.multiple_parry_target_combo.addItem(
+                    _multiple_parry_target_label(reaction),
+                    reaction_index,
+                )
+            self.multiple_parry_target_combo.setToolTip(self.tr(
+                "Simulates the PARRY result returned by the nearby enemy's "
+                "current ISearchMultiGrappleAciton implementation."
+            ))
+            self.multiple_parry_target_combo.currentIndexChanged.connect(
+                self._on_multiple_parry_target_changed
+            )
+            self.multiple_parry_target_combo.setVisible(False)
+            controls.addWidget(self.multiple_parry_target_combo)
         self.play_button = QPushButton(self.tr("Play"), preview_area)
         self.play_button.clicked.connect(self.toggle_playback)
         controls.addWidget(self.play_button)
@@ -2598,6 +2989,74 @@ class WotsInteractionPreviewWidget(QWidget):
         self.play_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.play_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.play_shortcut.activated.connect(self.toggle_playback)
+
+    def _enemy_motion_panes(self) -> tuple[_ActorMotionPane, ...]:
+        result = []
+        for name in (
+            "attacker",
+            "defender",
+            "next_action",
+            "multiple_enemy",
+            "enemy2",
+        ):
+            pane = getattr(self, name, None)
+            if (
+                isinstance(pane, _ActorMotionPane)
+                and pane.role.casefold().startswith("enemy")
+                and pane not in result
+            ):
+                result.append(pane)
+        return tuple(result)
+
+    def _browse_enemy_character_pfb(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            self.tr("Select WOTS Character PFB"),
+            "",
+            self.tr("RE Engine Prefab (*.pfb *.pfb.*);;All Files (*.*)"),
+        )
+        if not path:
+            return
+        self.enemy_pfb_combo.setEditText(path)
+        self._load_enemy_character_pfb()
+
+    def _load_enemy_character_pfb(self) -> None:
+        path = self.enemy_pfb_combo.currentText().strip()
+        if not path:
+            self.enemy_pfb_status.setText(self.tr("Select a Character PFB first."))
+            return
+        self.enemy_pfb_load_button.setEnabled(False)
+        self.enemy_pfb_status.setText(self.tr("Loading Character PFB..."))
+        try:
+            result = load_wots_character_pfb_target(self.handler, path, self)
+        except Exception as exc:
+            self.enemy_pfb_status.setText(
+                self.tr("Could not load enemy Character PFB: {error}").format(
+                    error=exc,
+                )
+            )
+            return
+        finally:
+            self.enemy_pfb_load_button.setEnabled(True)
+
+        self._enemy_model_target = result.target
+        for pane in self._enemy_motion_panes():
+            pane.set_model_target(result.target)
+        summary = self.tr("Loaded {count} model part(s) from {path}.").format(
+            count=len(result.part_paths),
+            path=result.resource_path,
+        )
+        if result.weapon_path:
+            summary += "\n" + self.tr("Weapon: {path} → R_Wep").format(
+                path=result.weapon_path,
+            )
+        elif result.weapon_candidates:
+            summary += "\n" + self.tr(
+                "Matching weapon candidates were found but could not be loaded."
+            )
+        if result.diagnostics:
+            summary += "\n" + "\n".join(result.diagnostics)
+        self.enemy_pfb_status.setText(summary)
 
     def _populate_reactions(self) -> None:
         groups = {}
@@ -2690,6 +3149,10 @@ class WotsInteractionPreviewWidget(QWidget):
             self._player_followup_label = ""
             self._player_followup_labels = ()
             self._multiple_parry_active = False
+            self._multiple_target_reaction = None
+            target_combo = getattr(self, "multiple_parry_target_combo", None)
+            if target_combo is not None:
+                target_combo.setVisible(False)
             pane.configure_sequence(())
             if multiple_enemy is not None:
                 multiple_enemy.set_content((), ())
@@ -2697,19 +3160,22 @@ class WotsInteractionPreviewWidget(QWidget):
             return
         self._player_followup_transition = transition
         self._multiple_parry_active = transition.preview_kind == "multiple_parry"
+        target_combo = getattr(self, "multiple_parry_target_combo", None)
+        if target_combo is not None:
+            target_combo.setVisible(self._multiple_parry_active)
         self._player_followup_label = f"Player Follow-up · {transition.action_name}"
         if self._multiple_parry_active and self._current_reaction is not None:
-            reaction = self._current_reaction
-            player_references = (
-                (
-                    ("Multiple Parry · ADJUST", reaction.defender_start_motion),
-                    ("Multiple Parry · JUST_GUARD", reaction.defender_motion),
-                )
-                if self.document.defender_role == "Player"
-                else (("Multiple Parry · JUST_GUARD", reaction.attacker_motion),)
-            )
-            player_references = tuple(
-                item for item in player_references if item[1].available
+            reaction = self._selected_multiple_parry_reaction()
+            self._multiple_target_reaction = reaction
+            if reaction is None:
+                self._player_followup_labels = ()
+                pane.set_content((), ())
+                multiple_enemy.set_content((), ())
+                multiple_enemy.hide()
+                return
+            player_references = multiple_parry_player_references(
+                self.document,
+                reaction,
             )
             self._player_followup_labels = tuple(
                 label for label, _reference in player_references
@@ -2742,21 +3208,68 @@ class WotsInteractionPreviewWidget(QWidget):
             multiple_enemy.set_content((), ())
             multiple_enemy.hide()
             return
-        reaction = self._current_reaction
+        reaction = self._multiple_target_reaction
+        if reaction is None:
+            multiple_enemy.set_content((), ())
+            multiple_enemy.hide()
+            return
         enemy_reference = (
             reaction.attacker_motion
             if self.document.attacker_role == "Enemy"
             else reaction.defender_motion
         )
-        candidates = self._bank_candidates.get(
-            int(enemy_reference.bank_id or -1),
-            (),
-        )
+        transition = self._resolve_next_action(reaction.next_action)
+        self._multiple_target_reaction = replace(reaction, next_action=transition)
+        references = [("Second Enemy · Reaction", enemy_reference)]
+        bank_ids = {int(enemy_reference.bank_id or -1)}
+        if transition is not None and transition.reference.available:
+            references.append((
+                f"Second Enemy · Parry After · {transition.action_name}",
+                transition.reference,
+            ))
+            if transition.reference.bank_id is not None:
+                bank_ids.add(int(transition.reference.bank_id))
+        candidates = tuple(dict.fromkeys(
+            candidate
+            for bank_id in bank_ids
+            for candidate in self._bank_candidates.get(bank_id, ())
+        ))
         multiple_enemy.set_content(
-            (("Nearby Enemy · Reaction", enemy_reference),),
+            tuple(references),
             candidates,
         )
         multiple_enemy.show()
+
+    def _selected_multiple_parry_reaction(self) -> InteractionReaction | None:
+        combo = getattr(self, "multiple_parry_target_combo", None)
+        index = combo.currentData() if combo is not None else None
+        if isinstance(index, int) and 0 <= index < len(self.document.reactions):
+            return self.document.reactions[index]
+        candidates = multiple_parry_candidates(self.document)
+        return candidates[0][1] if candidates else None
+
+    def _on_multiple_parry_target_changed(self, _index: int) -> None:
+        if not hasattr(self, "multiple_enemy") or not self._multiple_parry_active:
+            return
+        self.stop_playback()
+        self._configuring_content = True
+        self._configure_player_followup()
+        self._configuring_content = False
+        self._refresh_interaction_details()
+        self._motion_loaded()
+
+    def _refresh_interaction_details(self) -> None:
+        reaction = self._current_reaction
+        if reaction is None:
+            return
+        transition = self._resolve_next_action(reaction.next_action)
+        rows = interaction_property_rows(
+            self.document,
+            replace(reaction, next_action=transition),
+        )
+        if self._multiple_parry_active and self._multiple_target_reaction is not None:
+            rows += _multiple_parry_runtime_rows(self._multiple_target_reaction)
+        self._set_details(rows)
 
     def _on_player_followup_changed(self, _index: int) -> None:
         if not hasattr(self, "player_followup"):
@@ -2765,6 +3278,7 @@ class WotsInteractionPreviewWidget(QWidget):
         self._configuring_content = True
         self._configure_player_followup()
         self._configuring_content = False
+        self._refresh_interaction_details()
         self._motion_loaded()
 
     def _on_reaction_changed(self, current, _previous) -> None:
@@ -2775,8 +3289,6 @@ class WotsInteractionPreviewWidget(QWidget):
         reaction = self.document.reactions[index]
         self._current_reaction = reaction
         transition = self._resolve_next_action(reaction.next_action)
-        resolved_reaction = replace(reaction, next_action=transition)
-        self._set_details(interaction_property_rows(self.document, resolved_reaction))
         self._next_action_transition = transition
         self._next_action_role = (
             "attacker" if self.document.attacker_role == "Enemy" else "defender"
@@ -2841,6 +3353,7 @@ class WotsInteractionPreviewWidget(QWidget):
         )
         self._configuring_content = False
         self._frame = 0.0
+        self._refresh_interaction_details()
         self._motion_loaded()
 
     def _set_details(self, rows: tuple[tuple[str, str], ...]) -> None:
@@ -2850,9 +3363,58 @@ class WotsInteractionPreviewWidget(QWidget):
             self.details.setItem(row, 1, QTableWidgetItem(value))
         self.details.resizeRowsToContents()
 
+    def _prepare_primary_transition_pose(self, frame: float) -> None:
+        """Place the original pair once so a follow-up can inherit its pose."""
+        attacker_root = self.attacker.prepare_sequence_frame(
+            frame,
+            self._attacker_start,
+        )
+        defender_root = self.defender.prepare_sequence_frame(
+            frame,
+            self._defender_start,
+        )
+        reaction = self._current_reaction
+        fixed_root = (
+            defender_root
+            if reaction is not None and reaction.fixed_object_type == 0
+            else attacker_root
+            if reaction is not None and reaction.fixed_object_type == 1
+            else np.zeros(3, dtype=np.float32)
+        )
+        planar_anchor = np.array(
+            (-fixed_root[0], 0.0, -fixed_root[2]),
+            dtype=np.float32,
+        )
+        attacker_anchor = planar_anchor.copy()
+        defender_anchor = planar_anchor.copy()
+        attacker_anchor[1] = -attacker_root[1]
+        defender_anchor[1] = -defender_root[1]
+        self.attacker.set_anchor_translation(attacker_anchor)
+        self.defender.set_anchor_translation(defender_anchor)
+
+    def _cache_followup_transform(
+        self,
+        destination: _ActorMotionPane,
+        start_frame: float,
+        role: str,
+    ) -> np.ndarray | None:
+        """Sample a transition once; render frames must never switch its MOT."""
+        if not destination.sequence_segments or role not in {"attacker", "defender"}:
+            return None
+        self._prepare_primary_transition_pose(start_frame)
+        source = self.attacker if role == "attacker" else self.defender
+        return source.transition_transform_to(
+            destination,
+            start_frame,
+            self._attacker_start if role == "attacker" else self._defender_start,
+        )
+
     def _motion_loaded(self) -> None:
         if self._configuring_content:
             return
+        self._next_action_transform = None
+        self._player_followup_transform = None
+        self._multiple_shared_transform = None
         reaction = self._current_reaction
         trigger = reaction.trigger_frame if reaction else 0
         self.attacker.configure_sequence(("Main",))
@@ -2865,26 +3427,119 @@ class WotsInteractionPreviewWidget(QWidget):
         self.next_action.configure_sequence(
             (self._next_action_label,) if self._next_action_label else ()
         )
-        self._next_action_start = max(attacker_duration, defender_duration)
+        enemy_pane = (
+            self.attacker
+            if self.document.attacker_role == "Enemy"
+            else self.defender
+        )
+        player_pane = (
+            self.attacker
+            if self.document.attacker_role == "Player"
+            else self.defender
+        )
+        enemy_change_frame = enemy_pane.event_transition_frame(
+            "Main",
+            "Enemy Just Guard Action Change",
+        )
+        enemy_duration = (
+            attacker_duration
+            if self.document.attacker_role == "Enemy"
+            else defender_duration
+        )
+        self._next_action_start = min(
+            max(float(enemy_change_frame), 0.0),
+            enemy_duration,
+        ) if enemy_change_frame is not None else enemy_duration
         self.player_followup.configure_sequence(
             self._player_followup_labels
         )
-        self._player_followup_start = self._next_action_start
-        adjust_duration = (
-            self.player_followup.sequence_segments[0].duration
-            if self._multiple_parry_active
-            and len(self.player_followup.sequence_segments) > 1
-            else 0.0
-        )
+        if self._multiple_parry_active:
+            multiple_window = player_pane.event_transition_frame(
+                "Main",
+                "Just Group Cancel",
+            )
+            player_duration = (
+                attacker_duration
+                if self.document.attacker_role == "Player"
+                else defender_duration
+            )
+            self._player_followup_start = parry_transition_frame(
+                round(multiple_window) if multiple_window is not None else trigger,
+                player_duration,
+                player_duration,
+            )
+        else:
+            self._player_followup_start = max(attacker_duration, defender_duration)
         self.multiple_enemy.configure_sequence(
-            ("Nearby Enemy · Reaction",) if self._multiple_parry_active else (),
-            (adjust_duration,) if self._multiple_parry_active else (),
+            (
+                (
+                    "Second Enemy · Reaction",
+                    *(
+                        (f"Second Enemy · Parry After · "
+                         f"{self._multiple_target_reaction.next_action.action_name}",)
+                        if self._multiple_target_reaction is not None
+                        and self._multiple_target_reaction.next_action is not None
+                        and self._multiple_target_reaction.next_action.reference.available
+                        else ()
+                    ),
+                )
+                if self._multiple_parry_active
+                else ()
+            ),
+            () if self._multiple_parry_active else (),
         )
+        self._multiple_enemy_after_start = 0.0
+        if self._multiple_parry_active and len(self.multiple_enemy.sequence_segments) > 1:
+            reaction_change = self.multiple_enemy.event_transition_frame(
+                "Second Enemy · Reaction",
+                "Enemy Just Guard Action Change",
+            )
+            reaction_duration = self.multiple_enemy.sequence_segments[0].duration
+            self._multiple_enemy_after_start = min(
+                max(float(reaction_change or reaction_duration), 0.0),
+                reaction_duration,
+            )
+            self.multiple_enemy.configure_sequence(
+                tuple(segment.label for segment in self.multiple_enemy.sequence_segments),
+                (0.0, self._multiple_enemy_after_start),
+            )
+        self._next_action_transform = self._cache_followup_transform(
+            self.next_action,
+            self._next_action_start,
+            self._next_action_role,
+        )
+        self._player_followup_transform = self._cache_followup_transform(
+            self.player_followup,
+            self._player_followup_start,
+            self._player_followup_role,
+        )
+        if self._multiple_parry_active:
+            # Player and nearby enemy clips use the same authored Grapple
+            # coordinate frame. Preserve one X/Z/yaw anchor for both, while
+            # each actor remains independently ground-locked at render time.
+            self._multiple_shared_transform = (
+                None
+                if self._player_followup_transform is None
+                else self._player_followup_transform.copy()
+            )
         next_duration = self.next_action.sequence_duration
         player_followup_duration = self.player_followup.sequence_duration
-        multiple_enemy_duration = self.multiple_enemy.sequence_duration
-        attacker_segments = [("Main", 0.0, attacker_duration)]
-        defender_segments = [("Main", 0.0, defender_duration)]
+        attacker_cutoff = attacker_duration
+        defender_cutoff = defender_duration
+        if self._next_action_label:
+            if self._next_action_role == "attacker":
+                attacker_cutoff = min(attacker_cutoff, self._next_action_start)
+            else:
+                defender_cutoff = min(defender_cutoff, self._next_action_start)
+        if self._multiple_parry_active:
+            if self._player_followup_role == "attacker":
+                attacker_cutoff = min(attacker_cutoff, self._player_followup_start)
+            else:
+                defender_cutoff = min(defender_cutoff, self._player_followup_start)
+        attacker_segments = [("Main", 0.0, attacker_cutoff)]
+        defender_segments = [("Main", 0.0, defender_cutoff)]
+        attacker_duration = attacker_cutoff
+        defender_duration = defender_cutoff
         if next_duration > 0.0:
             segment = (
                 self._next_action_label,
@@ -2924,18 +3579,14 @@ class WotsInteractionPreviewWidget(QWidget):
             else:
                 defender_segments.append(segment)
                 defender_duration = max(defender_duration, segment[2])
-        if multiple_enemy_duration > 0.0:
-            segment = (
-                "Multiple Parry · Nearby Enemy",
-                self._player_followup_start + adjust_duration,
-                self._player_followup_start + multiple_enemy_duration,
+        extra_segments = tuple(
+            (
+                segment.label,
+                self._player_followup_start + segment.start,
+                self._player_followup_start + segment.start + segment.duration,
             )
-            if self._multiple_enemy_role == "attacker":
-                attacker_segments.append(segment)
-                attacker_duration = max(attacker_duration, segment[2])
-            else:
-                defender_segments.append(segment)
-                defender_duration = max(defender_duration, segment[2])
+            for segment in self.multiple_enemy.sequence_segments
+        )
         self._attacker_start = 0.0
         self._defender_start = 0.0
         self.timeline.configure(
@@ -2946,6 +3597,8 @@ class WotsInteractionPreviewWidget(QWidget):
             defender_start=self._defender_start,
             attacker_segments=tuple(attacker_segments),
             defender_segments=tuple(defender_segments),
+            extra_label="Second Enemy" if extra_segments else "",
+            extra_segments=extra_segments,
         )
         end = self.timeline.end_frame
         with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
@@ -2961,12 +3614,24 @@ class WotsInteractionPreviewWidget(QWidget):
             self.frame_slider.setValue(round(self._frame * _SLIDER_SCALE))
             self.frame_spin.setValue(self._frame)
         self.timeline.set_current_frame(self._frame)
+        attacker_frame = self._frame
+        defender_frame = self._frame
+        if self._next_action_label:
+            if self._next_action_role == "attacker":
+                attacker_frame = min(attacker_frame, self._next_action_start)
+            else:
+                defender_frame = min(defender_frame, self._next_action_start)
+        if self._multiple_parry_active:
+            if self._player_followup_role == "attacker":
+                attacker_frame = min(attacker_frame, self._player_followup_start)
+            else:
+                defender_frame = min(defender_frame, self._player_followup_start)
         attacker_root = self.attacker.prepare_sequence_frame(
-            self._frame,
+            attacker_frame,
             self._attacker_start,
         )
         defender_root = self.defender.prepare_sequence_frame(
-            self._frame,
+            defender_frame,
             self._defender_start,
         )
         reaction = self._current_reaction
@@ -3000,54 +3665,67 @@ class WotsInteractionPreviewWidget(QWidget):
             "defender": self.defender,
         }
 
-        def activate_followup(pane, start_frame: float, role: str) -> None:
+        def activate_followup(
+            pane,
+            start_frame: float,
+            role: str,
+            cached_transform: np.ndarray | None,
+        ) -> None:
             if (
                 pane is None
                 or not pane.sequence_segments
+                or cached_transform is None
                 or self._frame < start_frame
             ):
                 return
             followup_root = pane.prepare_sequence_frame(self._frame, start_frame)
-            main_root = attacker_root if role == "attacker" else defender_root
-            main_anchor = attacker_anchor if role == "attacker" else defender_anchor
-            action_start = pane.sequence_segments[0].root_start
-            world_start = main_root + main_anchor
-            pane.set_anchor_translation(np.array((
-                world_start[0] - action_start[0],
-                -followup_root[1],
-                world_start[2] - action_start[2],
-            ), dtype=np.float32))
+            transform = cached_transform.copy()
+            transform[3, 1] = -followup_root[1]
+            pane.set_world_transform(transform)
             actor_panes[role] = pane
 
         activate_followup(
             getattr(self, "next_action", None),
             self._next_action_start,
             self._next_action_role,
+            self._next_action_transform,
         )
-        activate_followup(
-            getattr(self, "player_followup", None),
-            self._player_followup_start,
-            self._player_followup_role,
-        )
-        if self._multiple_parry_active and self.multiple_enemy.sequence_segments:
+        if not self._multiple_parry_active:
+            activate_followup(
+                getattr(self, "player_followup", None),
+                self._player_followup_start,
+                self._player_followup_role,
+                self._player_followup_transform,
+            )
+        if (
+            self._multiple_parry_active
+            and self.multiple_enemy.sequence_segments
+            and self._multiple_shared_transform is not None
+        ):
             nearby_root = self.multiple_enemy.prepare_sequence_frame(
                 self._frame,
                 self._player_followup_start,
             )
             player_role = self._player_followup_role
-            player_root = attacker_root if player_role == "attacker" else defender_root
-            player_anchor = (
-                attacker_anchor if player_role == "attacker" else defender_anchor
+            followup_root = self.player_followup.prepare_sequence_frame(
+                self._frame,
+                self._player_followup_start,
             )
-            target = player_root + player_anchor + self._multiple_target_offset
-            self.multiple_enemy.set_anchor_translation(np.array((
-                target[0] - nearby_root[0],
-                -nearby_root[1],
-                target[2] - nearby_root[2],
-            ), dtype=np.float32))
+            player_transform = self._multiple_shared_transform.copy()
+            target_transform = self._multiple_shared_transform.copy()
+            # The two clips share one authored X/Z frame and yaw. Character
+            # controllers still ground-lock each participant independently.
+            player_transform[3, 1] = -followup_root[1]
+            target_transform[3, 1] = -nearby_root[1]
+            self.player_followup.set_world_transform(player_transform)
+            self.multiple_enemy.set_world_transform(target_transform)
+            actor_panes[player_role] = self.player_followup
             self.multiple_enemy.render_prepared_frame()
-        actor_panes["attacker"].render_prepared_frame()
-        actor_panes["defender"].render_prepared_frame()
+        for role, pane in actor_panes.items():
+            if self._active_actor_panes.get(role) is not pane:
+                pane.activate_scene()
+                self._active_actor_panes[role] = pane
+            pane.render_prepared_frame()
 
     def toggle_playback(self) -> None:
         if self._playing:
@@ -3128,6 +3806,7 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         self._combo_first_target = np.zeros(3, dtype=np.float32)
         self._combo_second_target = np.zeros(3, dtype=np.float32)
         self._combo_transition_transform = np.identity(4, dtype=np.float32)
+        self._enemy_model_target = None
         self._configuring_content = False
         bank_ids = {
             int(phase.reference.bank_id)
@@ -3494,6 +4173,7 @@ class WotsIssenPreviewWidget(WotsInteractionPreviewWidget):
         with QSignalBlocker(self.frame_slider), QSignalBlocker(self.frame_spin):
             self.frame_slider.setRange(0, round(end * _SLIDER_SCALE))
             self.frame_spin.setRange(0.0, end)
+        self._active_actor_panes = {"attacker": None, "defender": None}
         self.set_frame(min(self._frame, end))
 
     def _configure_break_issen_combo(self) -> None:
