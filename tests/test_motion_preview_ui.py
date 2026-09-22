@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -95,6 +95,38 @@ class TestMotionPreviewUi(unittest.TestCase):
         self.assertIs(widget._target, target)
         self.assertEqual(widget._target_material_sessions, {})
         self.assertIn("Material unavailable for Body: bad MDF", diagnostics)
+
+    def test_selected_animation_export_excludes_mesh_materials_and_textures(self):
+        widget = MotListPreviewWidget.__new__(MotListPreviewWidget)
+        QWidget.__init__(widget)
+        motion = SimpleNamespace(name="Attack")
+        rig = object()
+        profile = object()
+        widget.controller = SimpleNamespace(rig=rig, ready=True)
+        widget.evaluation_profile = profile
+
+        with (
+            patch.object(
+                MotListPreviewWidget,
+                "current_motion",
+                new_callable=PropertyMock,
+                return_value=motion,
+            ),
+            patch(
+                "file_handlers.motion.preview.widget.QFileDialog.getSaveFileName",
+                return_value=("attack.glb", "glTF Binary (*.glb)"),
+            ),
+            patch("file_handlers.gltf_export.export_gltf", return_value="attack.glb") as export,
+            patch("file_handlers.motion.preview.widget.QMessageBox.information"),
+        ):
+            widget._export_gltf()
+
+        export.assert_called_once_with(
+            "attack.glb",
+            rig=rig,
+            motion=motion,
+            evaluation_profile=profile,
+        )
 
 
 if __name__ == "__main__":

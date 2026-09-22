@@ -873,25 +873,11 @@ class MotListPreviewWidget(QWidget):
         try:
             from file_handlers.gltf_export import export_gltf
 
-            mesh = None
-            if not self._using_source_rig and self._target is not None:
-                mesh = self._target.mesh
             result = export_gltf(
                 path,
-                mesh=mesh,
                 rig=rig,
                 motion=motion,
                 evaluation_profile=self.evaluation_profile,
-                material_handler=(
-                    self._target.handler
-                    if mesh is not None and self._target is not None
-                    else None
-                ),
-                resolved_mdf=(
-                    self._target_material_session.resolved_mdf
-                    if mesh is not None and self._target_material_session is not None
-                    else None
-                ),
             )
             QMessageBox.information(
                 self,
