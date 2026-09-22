@@ -8,6 +8,7 @@ modified copies, which breaks modding workflows.
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,6 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from file_handlers.pak.utils import any_pak_modded
-from tests.test_pak_mod_detection import _write_pak
 from ui.pak_browser_dialog import PakBrowserDialog
 from ui.project_manager import manager as manager_module
 from ui.project_manager.manager import ProjectManager
@@ -26,6 +26,16 @@ BANNER_TEXT = (
     "⚠ Modded PAKs detected in the game folder (mod payloads or invalidated "
     "entries). Please disable your mods and rescan."
 )
+
+
+def _write_pak(path, hashes):
+    """Write the minimal unencrypted v4 PAK table needed by these tests."""
+    with open(path, "wb") as stream:
+        stream.write(struct.pack("<IBBHII", 0x414B504B, 4, 0, 0, len(hashes), 0))
+        for combined in hashes:
+            lower = combined & 0xFFFFFFFF
+            upper = (combined >> 32) & 0xFFFFFFFF
+            stream.write(struct.pack("<IIqqqqq", lower, upper, 0, 0, 0, 0, 0))
 
 
 def _pak(directory, name, hashes):
