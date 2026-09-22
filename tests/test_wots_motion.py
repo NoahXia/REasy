@@ -60,6 +60,7 @@ from file_handlers.motion.preview.attack_collision import (
     active_attack_collisions,
     attack_collision_detail_sections,
     attack_collision_geometry_diagnostic,
+    attack_rcol_references_from_character_pfb,
     attack_rcol_resource_candidates,
     collision_type_label,
     load_attack_collision_resource,
@@ -122,6 +123,7 @@ from file_handlers.rsz.wots_interaction_preview import (
 from file_handlers.rsz.wots_character_pfb_target import (
     _preferred_weapon_attachment_joint,
     inferred_wots_enemy_pfb_path,
+    wots_weapon_attack_rcol_references,
 )
 from utils.hash_util import murmur3_hash
 from utils.resource_file_utils import ResourceResolutionContext
@@ -426,6 +428,40 @@ class _PakReader:
 
 
 class TestWotsMotion(unittest.TestCase):
+    def test_gimmick_pfb_maps_weapon_mesh_to_attack_rcol(self):
+        pfb_strings = (
+            "Art/Model/Item/it0/it070_1010/it070_1010_00.mesh\0"
+            "GameDesign/Gimmick/Gm800/Gm800_024/Collision/"
+            "Gm800_024_Attack.rcol\0"
+        ).encode("utf-16-le")
+
+        self.assertEqual(
+            wots_weapon_attack_rcol_references(
+                pfb_strings,
+                "natives/stm/art/model/item/it0/it070_1010/"
+                "it070_1010_00.mesh.260209350",
+            ),
+            (
+                "natives/stm/GameDesign/Gimmick/Gm800/Gm800_024/Collision/"
+                "Gm800_024_Attack.rcol.37",
+            ),
+        )
+
+    def test_character_pfb_recovers_inherited_attack_rcol(self):
+        pfb_strings = (
+            "Other/Resource.user\0"
+            "GameDesign/Action/Enemy/Em100/00/Collision/Collider/"
+            "Em100_00_Attack.rcol\0"
+        ).encode("utf-16-le")
+
+        self.assertEqual(
+            attack_rcol_references_from_character_pfb(pfb_strings),
+            (
+                "natives/stm/GameDesign/Action/Enemy/Em100/00/Collision/"
+                "Collider/Em100_00_Attack.rcol.37",
+            ),
+        )
+
     def test_character_pfb_weapon_attachment_uses_available_socket(self):
         hand_only = Rig((RigJoint("root"), RigJoint("R_Hand", 0)))
         weapon_socket = Rig((RigJoint("root"), RigJoint("R_Wep", 0)))

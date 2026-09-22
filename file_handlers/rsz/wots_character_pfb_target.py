@@ -168,6 +168,108 @@ def discover_wots_character_weapon_paths(
     return tuple(sorted(dict.fromkeys(matches), key=str.casefold))
 
 
+def wots_weapon_attack_rcol_references(
+    prefab_data: bytes,
+    weapon_mesh_path: str,
+) -> tuple[str, ...]:
+    """Return Gimmick Attack RCOLs when a PFB owns the selected weapon mesh."""
+    if not prefab_data or not weapon_mesh_path:
+        return ()
+    text = prefab_data.decode("utf-16-le", errors="ignore")
+    normalized_weapon = normalize_resource_path(weapon_mesh_path)
+    normalized_weapon = re.sub(r"\.\d+$", "", normalized_weapon)
+    normalized_weapon = re.sub(
+        r"^natives/(?:stm|x64)/",
+        "",
+        normalized_weapon,
+        flags=re.IGNORECASE,
+    )
+    if normalized_weapon.casefold() not in text.replace("\\", "/").casefold():
+        return ()
+    matches = re.findall(
+        r"GameDesign/Gimmick/[A-Za-z0-9_./-]+?_Attack\.rcol",
+        text,
+        re.IGNORECASE,
+    )
+    result = []
+    seen = set()
+    for match in matches:
+        path = f"natives/stm/{match}.37"
+        key = path.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return tuple(result)
+
+
+def discover_wots_weapon_attack_rcol_paths(
+    owner_handler,
+    weapon_mesh_path: str,
+) -> tuple[str, ...]:
+    """Resolve the Gimmick Attack RCOL authored for a Character PFB weapon."""
+    context = resource_context_for_handler(owner_handler)
+    candidates: dict[str, str] = {}
+
+    def add(value: str) -> None:
+        path = normalize_resource_path(value)
+        lowered = path.casefold()
+        if (
+            lowered.startswith("natives/stm/gamedesign/gimmick/_prefab/gm800_")
+            and ".pfb." in lowered
+        ):
+            candidates.setdefault(lowered, path)
+
+    reader = getattr(context, "pak_cached_reader", None) if context else None
+    if reader is not None and bool(getattr(reader, "cache_ready", False)):
+        try:
+            known = (
+                reader.cached_known_paths()
+                if callable(getattr(reader, "cached_known_paths", None))
+                else reader.cached_paths(include_unknown=False)
+            )
+            for path in known:
+                add(str(path))
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+
+    for root_value in (
+        getattr(context, "project_dir", "") if context else "",
+        getattr(context, "unpacked_dir", "") if context else "",
+    ):
+        if not root_value:
+            continue
+        folder = Path(root_value) / "natives/stm/GameDesign/Gimmick/_Prefab"
+        if not folder.is_dir():
+            continue
+        try:
+            for item in folder.iterdir():
+                if item.is_file():
+                    add(f"natives/stm/GameDesign/Gimmick/_Prefab/{item.name}")
+        except OSError:
+            pass
+
+    result = []
+    seen = set()
+    for prefab_path in sorted(candidates.values(), key=str.casefold):
+        hit = resolve_handler_resource_data(
+            owner_handler,
+            prefab_path,
+            allow_selection_dialog=False,
+        )
+        if hit is None:
+            continue
+        _resolved_path, data = hit
+        for rcol_path in wots_weapon_attack_rcol_references(
+            data,
+            weapon_mesh_path,
+        ):
+            key = rcol_path.casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(rcol_path)
+    return tuple(result)
+
+
 def _renderable_label(graph, renderable) -> tuple[str, str]:
     document = graph.documents.get(renderable.source_object_id.document_id)
     source_object = (

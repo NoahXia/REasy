@@ -297,24 +297,93 @@ def attack_rcol_resource_candidates(anchor_path: str) -> tuple[str, ...]:
     )
 
 
+def _character_pfb_path(anchor_path: str) -> str:
+    normalized = str(anchor_path or "").replace("\\", "/")
+    match = re.search(
+        r"(?:^|/)motion/enemy/(em\d+)/(\d{2})(?:/|$)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    actor = match.group(1)
+    variant = match.group(2)
+    return (
+        "natives/stm/GameDesign/Action/Enemy/_Prefab/Character/"
+        f"{actor}_{variant}.pfb.18"
+    )
+
+
+def attack_rcol_references_from_character_pfb(data: bytes) -> tuple[str, ...]:
+    """Recover inherited enemy Attack RCOL references from a Character PFB."""
+    if not data:
+        return ()
+    text = data.decode("utf-16-le", errors="ignore")
+    matches = re.findall(
+        r"GameDesign/Action/Enemy/[A-Za-z0-9_./-]+?_Attack\.rcol",
+        text,
+        re.IGNORECASE,
+    )
+    result = []
+    seen = set()
+    for match in matches:
+        path = f"natives/stm/{match}.37"
+        key = path.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return tuple(result)
+
+
+def _inherited_attack_rcol_candidates(
+    anchor_path: str,
+    resource_loader,
+) -> tuple[str, ...]:
+    pfb_path = _character_pfb_path(anchor_path)
+    if not pfb_path:
+        return ()
+    hit = resource_loader(pfb_path)
+    if hit is None:
+        return ()
+    _resolved_path, data = hit
+    return attack_rcol_references_from_character_pfb(data)
+
+
 def load_attack_collision_source(
     anchor_path: str,
     resource_loader,
     *,
     type_registry=None,
 ) -> tuple[AttackCollisionSource | None, tuple[str, ...]]:
-    candidates = attack_rcol_resource_candidates(anchor_path)
+    candidates = list(attack_rcol_resource_candidates(anchor_path))
     if not candidates:
         return None, ()
     diagnostics: list[str] = []
+    attempted = set()
     for candidate in candidates:
+        attempted.add(candidate.casefold())
         source, error = load_attack_collision_resource(
             candidate,
             resource_loader,
             type_registry=type_registry,
         )
         if source is not None:
-            return source, tuple(diagnostics)
+            return source, ()
+        diagnostics.extend(error)
+    for candidate in _inherited_attack_rcol_candidates(
+        anchor_path,
+        resource_loader,
+    ):
+        if candidate.casefold() in attempted:
+            continue
+        attempted.add(candidate.casefold())
+        source, error = load_attack_collision_resource(
+            candidate,
+            resource_loader,
+            type_registry=type_registry,
+        )
+        if source is not None:
+            return source, ()
         diagnostics.extend(error)
     return None, tuple(diagnostics)
 

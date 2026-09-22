@@ -807,7 +807,31 @@ class MotListPreviewWidget(QWidget):
                 self,
                 type_registry=_wots_type_registry(self.handler),
             )
-            material_diagnostics = self.set_target(result.target)
+            weapon_sources = {}
+            weapon_diagnostics = []
+            if result.weapon_path:
+                from file_handlers.rsz.wots_character_pfb_target import (
+                    discover_wots_weapon_attack_rcol_paths,
+                )
+
+                for attack_path in discover_wots_weapon_attack_rcol_paths(
+                    self.handler,
+                    result.weapon_path,
+                ):
+                    source, diagnostics = load_attack_collision_resource(
+                        attack_path,
+                        self._catalog.resources.resource_data,
+                        type_registry=_wots_type_registry(self.handler),
+                    )
+                    weapon_diagnostics.extend(diagnostics)
+                    if source is not None:
+                        weapon_sources[2] = source
+                        break
+            material_diagnostics = self.set_target(
+                result.target,
+                weapon_attack_sources=weapon_sources,
+                weapon_attack_diagnostics=tuple(weapon_diagnostics),
+            )
             details = [
                 self.tr("Loaded {count} model part(s) from {path}.").format(
                     count=len(result.part_paths),
@@ -898,36 +922,43 @@ class MotListPreviewWidget(QWidget):
         except (ValueError, RuntimeError) as exc:
             self._clear_scene(str(exc), clear_timeline=False)
             return
-        status = self._status_text(snapshot)
+        status, details = self._status_text_and_details(snapshot)
         self.event_timeline.set_current_frame(snapshot.frame)
         if status != self.status_label.text():
             self.status_label.setText(status)
+        if details != self.status_label.toolTip():
+            self.status_label.setToolTip(details)
 
     def _status_text(self, snapshot) -> str:
+        return self._status_text_and_details(snapshot)[0]
+
+    def _status_text_and_details(self, snapshot) -> tuple[str, str]:
+        """Build a compact status line and keep verbose diagnostics in a tooltip."""
         messages = snapshot_status_messages(
             snapshot,
             self.controller.frames_per_second,
             self.tr,
         )
+        details = []
         if any(abs(weight - 1.0) > 1e-4 for weight in snapshot.node_weights):
-            messages.append(self.tr("Orange joints have non-unit MOT weights."))
+            details.append(self.tr("Orange joints have non-unit MOT weights."))
         motion = self.current_motion
         entry = self.current_entry
         if entry is not None and entry.origin is PreviewMotionOrigin.INHERITED:
-            messages.append(
+            details.append(
                 self.tr("Motion payload inherited from {path}.").format(
                     path=entry.source_path
                 )
             )
         if motion is not None and motion.character_path:
-            messages.append(
+            details.append(
                 self.tr(
                     "Character/JMAP expressions are not evaluated in this skeleton preview."
                 )
             )
-        messages.extend(snapshot_diagnostic_messages(snapshot))
-        messages.extend(self._scene_renderer._part_diagnostics)
-        messages.extend(self._catalog.messages)
+        details.extend(snapshot_diagnostic_messages(snapshot))
+        details.extend(self._scene_renderer._part_diagnostics)
+        details.extend(self._catalog.messages)
         collision_status = self._scene_renderer.attack_collision_status(
             motion,
             snapshot.frame,
@@ -935,10 +966,17 @@ class MotListPreviewWidget(QWidget):
         if collision_status:
             messages.append(collision_status)
         if collision_status and self._attack_collision_diagnostics:
-            messages.extend(self._attack_collision_diagnostics)
+            details.extend(self._attack_collision_diagnostics)
         if collision_status and self._weapon_attack_collision_diagnostics:
-            messages.extend(self._weapon_attack_collision_diagnostics)
-        return "  ".join(messages)
+            details.extend(self._weapon_attack_collision_diagnostics)
+        details = list(dict.fromkeys(message for message in details if message))
+        if details:
+            messages.append(
+                self.tr("Details: {count} · hover to inspect").format(
+                    count=len(details)
+                )
+            )
+        return "  ".join(messages), "\n".join(details)
 
     def _mesh_deformation_targets(self):
         if self._target is None:
@@ -960,6 +998,7 @@ class MotListPreviewWidget(QWidget):
         return tuple(targets)
 
     def _show_error(self, message: str) -> None:
+        self.status_label.setToolTip("")
         self.status_label.setText(message)
 
     def _clear_scene(self, message: str, *, clear_timeline: bool = True) -> None:
@@ -967,6 +1006,7 @@ class MotListPreviewWidget(QWidget):
         if clear_timeline:
             self.event_timeline.clear()
         self._scene_renderer.clear(reset_camera=True)
+        self.status_label.setToolTip("")
         self.status_label.setText(message)
 
     def _on_render_failure(self, message: str) -> None:
