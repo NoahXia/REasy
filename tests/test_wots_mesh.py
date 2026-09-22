@@ -15,6 +15,7 @@ from file_handlers.mesh.mesh_file import (
     MeshFile,
     MeshMainVersion,
     _decode_skin_weights,
+    _decode_wots_extended_skin_weights,
     get_mesh_version,
 )
 from file_handlers.mesh.material_resolver import (
@@ -170,18 +171,40 @@ class TestWotsMesh(unittest.TestCase):
             np.asarray([90, 60, 45, 30, 20, 10], dtype=np.float32) / 255.0,
         )
 
-    def test_wots_face_stream_uses_marked_eight_influence_layout(self):
-        indices = (238, 52, 34, 207, 142, 12, 64, 203)
-        raw_weights = (48, 45, 33, 29, 29, 17, 12, 11)
-        raw = struct.pack("<8B8B", *indices, *raw_weights)
-        decoded = _decode_skin_weights(
-            memoryview(raw), 1, MeshMainVersion.ONIMUSHA_WOTS_1010
+    def test_wots_face_stream_uses_twelve_influence_layout(self):
+        primary_indices = (144, 124, 112, 182, 126, 74)
+        extra_indices = (75, 115, 129, 106, 66, 122)
+
+        def pack_indices(indices):
+            return struct.pack(
+                "<II",
+                indices[0] | (indices[1] << 10) | (indices[2] << 20),
+                indices[3] | (indices[4] << 10) | (indices[5] << 20),
+            )
+
+        primary_weights = (74, 72, 64, 25, 8, 3, 2, 2)
+        extra_weights = (2, 1, 1, 1, 0, 0, 0, 0)
+        primary = pack_indices(primary_indices) + bytes(primary_weights)
+        extra = pack_indices(extra_indices) + bytes(extra_weights)
+        decoded = _decode_wots_extended_skin_weights(
+            memoryview(primary),
+            memoryview(extra),
+            1,
+            deform_limit=1024,
         )
-        self.assertEqual(decoded.influence_count, 8)
-        self.assertEqual(list(decoded.deform_indices), list(indices))
+        self.assertEqual(decoded.influence_count, 12)
+        self.assertEqual(
+            list(decoded.deform_indices),
+            list(primary_indices + extra_indices),
+        )
+        expected_weights = (
+            primary_weights
+            + extra_weights[:3]
+            + (sum(extra_weights[3:6]),)
+        )
         np.testing.assert_allclose(
             decoded.weights,
-            np.asarray(raw_weights, dtype=np.float32) / 255.0,
+            np.asarray(expected_weights, dtype=np.float32) / 255.0,
         )
 
     def test_wots_packed_hair_stream_ignores_high_marker_bits(self):

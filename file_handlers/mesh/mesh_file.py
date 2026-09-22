@@ -353,19 +353,7 @@ def _decode_skin_weights(
         )
     records = np.frombuffer(data, dtype=np.uint8).reshape(vertex_count, 16)
     packed = records[:, :8].copy().view("<u4").reshape(vertex_count, 2)
-    # WOTS can mix both encodings in one MESH. Ordinary/body and hair streams
-    # use six packed 10-bit indices. Facial streams retain eight byte-sized
-    # indices. They are identified by both active final weight lanes and the
-    # 0b11 marker pairs. The marker alone is insufficient because real packed
-    # hair streams set those high pairs as well.
-    wots_eight_influence = (
-        version == MeshMainVersion.ONIMUSHA_WOTS_1010
-        and vertex_count > 0
-        and np.any(records[:, 14:16])
-        and np.all((packed >> 30) == 0x3)
-    )
-    if influence_count == 8 or wots_eight_influence:
-        influence_count = 8
+    if influence_count == 8:
         decoded_indices = records[:, :8].astype(np.uint16)
     else:
         decoded_indices = np.empty((vertex_count, 6), dtype=np.uint16)
@@ -414,6 +402,82 @@ def _decode_skin_weights(
     return SkinWeightBuffer(influence_count, deform_indices, weights)
 
 
+def _decode_wots_extended_skin_weights(
+    primary_data: memoryview,
+    extra_data: memoryview,
+    vertex_count: int,
+    *,
+    deform_limit: int,
+) -> SkinWeightBuffer:
+    """Decode the twelve-influence WOTS facial skinning layout.
+
+    WOTS supplies two packed R10G10B10A2 index pairs (six deform indices)
+    in each 16-byte stream.  The primary stream also supplies the first
+    eight weights.  The extra stream supplies another three explicit
+    weights; the vertex shader reconstructs the twelfth weight as the
+    residual to one.  The remaining bytes in the extra stream preserve the
+    quantized components whose sum forms that residual.
+    """
+
+    expected_size = vertex_count * 16
+    if len(primary_data) != expected_size or len(extra_data) != expected_size:
+        raise ValueError(
+            "WOTS extended skin-weight streams do not match the vertex count"
+        )
+
+    primary = np.frombuffer(primary_data, dtype=np.uint8).reshape(vertex_count, 16)
+    extra = np.frombuffer(extra_data, dtype=np.uint8).reshape(vertex_count, 16)
+
+    def packed_indices(records: np.ndarray) -> np.ndarray:
+        packed = records[:, :8].copy().view("<u4").reshape(vertex_count, 2)
+        indices = np.empty((vertex_count, 6), dtype=np.uint16)
+        indices[:, 0] = packed[:, 0] & 0x3FF
+        indices[:, 1] = (packed[:, 0] >> 10) & 0x3FF
+        indices[:, 2] = (packed[:, 0] >> 20) & 0x3FF
+        indices[:, 3] = packed[:, 1] & 0x3FF
+        indices[:, 4] = (packed[:, 1] >> 10) & 0x3FF
+        indices[:, 5] = (packed[:, 1] >> 20) & 0x3FF
+        return indices
+
+    decoded_indices = np.concatenate(
+        (packed_indices(primary), packed_indices(extra)),
+        axis=1,
+    )
+    explicit_bytes = np.concatenate(
+        (primary[:, 8:16], extra[:, 8:11]),
+        axis=1,
+    ).astype(np.uint16)
+    explicit_totals = explicit_bytes.sum(axis=1, dtype=np.uint16)
+    if np.any(explicit_totals > 255):
+        bad = int(explicit_totals[explicit_totals > 255][0])
+        raise ValueError(
+            f"WOTS extended skin weights exceed the quantized total: {bad}"
+        )
+    residual_bytes = (255 - explicit_totals).reshape(-1, 1)
+    encoded_residual = extra[:, 11:14].sum(axis=1, dtype=np.uint16).reshape(-1, 1)
+    if np.any(encoded_residual != residual_bytes) or np.any(extra[:, 14:16]):
+        raise ValueError("Unsupported WOTS extended skin-weight tail encoding")
+    decoded_weights = np.concatenate(
+        (explicit_bytes, residual_bytes),
+        axis=1,
+    ).astype(np.float32) / 255.0
+
+    active = decoded_weights > 0.0
+    invalid = active & (decoded_indices >= deform_limit)
+    if np.any(invalid):
+        bad = int(decoded_indices[invalid][0])
+        raise ValueError(
+            f"Skin-weight deform index {bad} exceeds remap count "
+            f"{deform_limit}"
+        )
+
+    deform_indices = array("H")
+    deform_indices.frombytes(decoded_indices.astype("<u2", copy=False).tobytes())
+    weights = array("f")
+    weights.frombytes(decoded_weights.astype("<f4", copy=False).tobytes())
+    return SkinWeightBuffer(12, deform_indices, weights)
+
+
 def _resolve_wots_skin_weight_layout(
     payload: MeshBufferPayload,
     deform_limit: int,
@@ -424,29 +488,43 @@ def _resolve_wots_skin_weight_layout(
     if version != MeshMainVersion.ONIMUSHA_WOTS_1010 or deform_limit <= 0:
         return
     vertex_count = len(payload.positions) // 3
+    streams: dict[VertexBufferType, memoryview] = {}
     for index, header in enumerate(payload.buffer_headers):
-        attribute = {
-            VertexBufferType.BoneWeights: "skin_weights",
-            VertexBufferType.ExtraWeights: "extra_skin_weights",
-        }.get(header.type)
-        if attribute is None:
+        if header.type not in {
+            VertexBufferType.BoneWeights,
+            VertexBufferType.ExtraWeights,
+        }:
             continue
         end = (
             payload.buffer_headers[index + 1].offset
             if index < len(payload.buffer_headers) - 1
             else header.offset + header.size * vertex_count
         )
-        data = memoryview(payload.vertex_bytes)[header.offset:end]
-        setattr(
-            payload,
-            attribute,
-            _decode_skin_weights(
-                data,
-                vertex_count,
-                version,
-                deform_limit=deform_limit,
-            ),
+        streams[header.type] = memoryview(payload.vertex_bytes)[header.offset:end]
+
+    primary = streams.get(VertexBufferType.BoneWeights)
+    extra = streams.get(VertexBufferType.ExtraWeights)
+    if primary is None:
+        payload.skin_weights = None
+        payload.extra_skin_weights = None
+        return
+    if extra is not None:
+        payload.skin_weights = _decode_wots_extended_skin_weights(
+            primary,
+            extra,
+            vertex_count,
+            deform_limit=deform_limit,
         )
+        payload.extra_skin_weights = None
+        return
+
+    payload.skin_weights = _decode_skin_weights(
+        primary,
+        vertex_count,
+        version,
+        deform_limit=deform_limit,
+    )
+    payload.extra_skin_weights = None
 
 
 def _decode_vertex_attributes(
@@ -477,9 +555,11 @@ def _decode_vertex_attributes(
         elif header.type == VertexBufferType.Colors:
             payload.colors = unpack_colors(data)
         elif header.type == VertexBufferType.BoneWeights:
-            payload.skin_weights = _decode_skin_weights(data, vert_count, version)
+            if version != MeshMainVersion.ONIMUSHA_WOTS_1010:
+                payload.skin_weights = _decode_skin_weights(data, vert_count, version)
         elif header.type == VertexBufferType.ExtraWeights:
-            payload.extra_skin_weights = _decode_skin_weights(data, vert_count, version)
+            if version != MeshMainVersion.ONIMUSHA_WOTS_1010:
+                payload.extra_skin_weights = _decode_skin_weights(data, vert_count, version)
 
 
 @dataclass
