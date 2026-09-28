@@ -68,6 +68,8 @@ from .resolution import (
 )
 from .renderer import MotionPreviewRenderer
 from .support_registry import entity_motion_support_for_format
+from .event_defaults import missing_event_fields
+from ..profiles import WOTS_PROFILE
 from .target import (
     RigPreviewTarget,
     WOTS_MESH_PREVIEW_PRESETS,
@@ -516,6 +518,16 @@ class MotListPreviewWidget(QWidget):
         if selection is None:
             self.event_details.set_event(None)
             return
+        is_wots = self.handler.motlist_file.codec.profile == WOTS_PROFILE
+        registry = _wots_type_registry(self.handler) if is_wots else None
+        default_rows = missing_event_fields(
+            selection.track_type, selection.properties, registry,
+            game="wots" if is_wots else "",
+        )
+        default_sections = (
+            (EventDetailSection(self.tr("Defaults"), default_rows, defaults=True),)
+            if default_rows else ()
+        )
         event = selected_attack_collision(
             selection.track_type,
             selection.properties,
@@ -524,7 +536,7 @@ class MotListPreviewWidget(QWidget):
             selection.end_frame,
         )
         if event is None:
-            self.event_details.set_event(selection)
+            self.event_details.set_event(selection, default_sections)
             return
 
         if event.track_type == "AttackCollision_Wp":
@@ -563,7 +575,7 @@ class MotListPreviewWidget(QWidget):
         ))
         self.event_details.set_event(
             selection,
-            tuple(EventDetailSection(title, rows) for title, rows in section_data),
+            default_sections + tuple(EventDetailSection(title, rows) for title, rows in section_data),
         )
 
     def _load_current_motion(self, *, reset_camera: bool) -> None:

@@ -71,6 +71,7 @@ class TimelineEventSelection:
 class EventDetailSection:
     title: str
     rows: tuple[tuple[str, str], ...]
+    defaults: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1086,7 +1087,8 @@ class MotionEventDetailsWidget(QWidget):
         self.properties.setAlternatingRowColors(True)
         self.properties.setRootIsDecorated(True)
         header = self.properties.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(0, 220)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.properties, 1)
 
@@ -1112,6 +1114,7 @@ class MotionEventDetailsWidget(QWidget):
         self.description.setVisible(bool(selection.description))
         for prop in selection.properties:
             self._add_property(None, prop)
+        collapsed = []
         for section in sections:
             if not section.rows:
                 continue
@@ -1121,9 +1124,48 @@ class MotionEventDetailsWidget(QWidget):
             section_item.setFont(0, section_font)
             section_item.setExpanded(True)
             self.properties.addTopLevelItem(section_item)
-            for name, value in section.rows:
-                section_item.addChild(QTreeWidgetItem((name, value)))
+            if section.defaults:
+                known = [(n, v) for n, v in section.rows if not v.startswith("Default unresolved")]
+                unknown = [(n, v) for n, v in section.rows if v.startswith("Default unresolved")]
+                section_item.setText(0, self.tr("Defaults"))
+                section_item.setText(1, str(len(known)))
+                section_item.setToolTip(0, self.tr("Read-only defaults for properties not stored in this clip. Hover a value for its source."))
+                self._add_default_rows(section_item, known)
+                collapsed.append(section_item)
+                if unknown:
+                    unknown_item = QTreeWidgetItem((self.tr("Unresolved"), str(len(unknown))))
+                    self.properties.addTopLevelItem(unknown_item)
+                    self._add_default_rows(unknown_item, unknown)
+                    collapsed.append(unknown_item)
+            else:
+                for name, value in section.rows:
+                    section_item.addChild(QTreeWidgetItem((name, value)))
         self.properties.expandAll()
+        for item in collapsed:
+            item.setExpanded(False)
+        self.properties.horizontalScrollBar().setValue(0)
+
+    def _add_default_rows(self, root, rows):
+        branches = {}
+        for path, detail in rows:
+            parts = path.split(".")
+            parent = root
+            for index, part in enumerate(parts[:-1]):
+                key = tuple(parts[:index + 1])
+                if key not in branches:
+                    branch = QTreeWidgetItem((part, ""))
+                    parent.addChild(branch)
+                    branches[key] = branch
+                parent = branches[key]
+            value = detail.split(" — ", 1)[0]
+            if detail.startswith("Default unresolved"):
+                value = self.tr("Unknown")
+            elif "; reset-after samples:" in detail:
+                value += " *"
+            item = QTreeWidgetItem((parts[-1], value))
+            item.setToolTip(0, path)
+            item.setToolTip(1, detail)
+            parent.addChild(item)
 
     def _add_property(
         self,
